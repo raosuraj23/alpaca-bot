@@ -1,0 +1,89 @@
+# memory-preferences.md — Context Retention Instructions
+# What Claude must track and restore across sessions.
+
+## Purpose
+
+This file tells Claude what state to reconstruct at the start of every session.
+Before writing any code or analysis, Claude must ask: "What do I already know?"
+and consult this file to avoid re-discovering API schemas, re-debugging known
+issues, or re-running settled architectural decisions.
+
+---
+
+## 1. API Schema Discoveries
+
+Record findings here as they are confirmed through live testing or official docs.
+Do not rely on training knowledge alone — Alpaca's API changes.
+
+### Alpaca REST API (confirmed fields)
+
+GET /v2/account            → AccountModel (equity, buying_power, pattern_day_trader)
+GET /v2/positions          → List[PositionModel] (symbol, qty, avg_entry_price, unrealized_pl)
+POST /v2/orders            → OrderResult (id, status, filled_qty, filled_avg_price)
+GET /v2/stocks/{symbol}/bars → BarModel (t, o, h, l, c, v, vw, n)
+
+### Alpaca WebSocket (confirmed stream topics)
+trades.{symbol}            → real-time trade ticks
+quotes.{symbol}            → bid/ask quotes
+bars.{symbol}              → per-minute OHLCV
+
+### Anthropic API (confirmed behavior)
+Input token savings: aggregated indicator summary saves ~95% tokens vs raw bars.
+claude-haiku:   <1s latency, sufficient for sentiment binary classification.
+claude-sonnet:  ~3-5s latency, required for strategy code generation.
+Structured output: use response_format + Pydantic model validation.
+
+---
+
+## 2. Ongoing Bugs & Known Issues
+
+Track active bugs here. Close them with a date and resolution.
+
+| ID   | Module          | Description                              | Status   | Resolution |
+|------|-----------------|------------------------------------------|----------|------------|
+| B001 | execution/retry | Alpaca 429 not caught as rate-limit exc  | OPEN     | —          |
+| B002 | ingestion/feed  | WebSocket drops on market close (4pm ET) | OPEN     | —          |
+
+Add new entries as discovered. Never silently work around a bug without logging it.
+
+---
+
+## 3. Strategy Backtest Results Log
+
+Every backtest run must be recorded here before a strategy is considered for
+promotion to paper trading.
+
+| Strategy         | Symbol  | Period          | Sharpe | Max DD | Calmar | Win% | Status        |
+|------------------|---------|-----------------|--------|--------|--------|------|---------------|
+| MomentumEquity   | SPY     | 2020-01–2022-12 | 1.42   | -14.2% | 0.98   | 54%  | Paper (active)|
+| MeanReversionEQ  | QQQ     | 2021-01–2023-06 | 0.87   | -19.8% | 0.44   | 49%  | Rejected      |
+
+Note: "Rejected" strategies must have a documented reason (e.g., "max DD exceeds
+15% threshold in rules/security-and-risk.md").
+
+---
+
+## 4. Architectural Decisions Log (ADL)
+
+Record major design decisions that must not be re-litigated without cause.
+
+| Date       | Decision                                              | Rationale                                          |
+|------------|-------------------------------------------------------|----------------------------------------------------|
+| [DATE]     | Python over TypeScript                                | Quant ecosystem, alpaca-py, vectorbt               |
+| [DATE]     | Pydantic v2 over dataclasses                          | Validators, JSON schema, LLM output parsing        |
+| [DATE]     | Streamlit for dashboard (not FastAPI frontend)        | Speed to value; not a customer-facing product      |
+| [DATE]     | SQLite locally, PostgreSQL in cloud (SQLAlchemy 2.0)  | Zero-migration-cost env var swap                   |
+
+---
+
+## 5. Session Restore Protocol
+
+At the start of every session, Claude should:
+1. Read this file.
+2. Ask if any bugs in section 2 have been resolved since last session.
+3. Confirm which strategy is currently active in paper trading (section 3).
+4. Check if any new API schema behaviors have been observed (section 1).
+5. Proceed with the user's current task using this context.
+
+Claude must not re-propose rejected strategies or re-debate closed ADL entries
+unless the user explicitly asks to revisit them.

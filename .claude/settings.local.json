@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Skill(code-review:code-review)",
+      "Skill(code-review:code-review:*)",
+      "Bash(xargs grep:*)",
+      "Bash(python -m pip show numpy alpaca-trade-api alpaca-py)",
+      "Bash(python -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python -c \"import numpy; print\\(f'numpy version: {numpy.__version__}'\\)\")",
+      "Bash(xargs cat:*)",
+      "Bash(cat d:/Projects/alpaca-bot/venv/Lib/site-packages/pandas*/METADATA)"
+    ]
+  }
+}

@@ -1,26 +1,58 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-panel: var(--panel);
+  --color-panel-muted: var(--panel-muted);
+  --color-border: var(--border);
+  --color-neon-green: var(--neon-green);
+  --color-neon-red: var(--neon-red);
+  --color-kraken-purple: var(--kraken-purple);
+  --color-kraken-light: var(--kraken-light);
+  
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  /* Kraken Dark Theme Tokens */
+  --background: hsl(255, 30%, 6%);
+  --panel: hsl(255, 20%, 10%);
+  --panel-muted: hsl(255, 15%, 15%);
+  --foreground: hsl(210, 20%, 95%);
+  --muted-foreground: hsl(250, 10%, 65%);
+  --border: hsla(255, 40%, 40%, 0.15);
+  
+  /* Accents */
+  --kraken-purple: hsl(264, 80%, 65%);
+  --kraken-light: hsl(264, 80%, 75%);
+  --neon-green: hsl(150, 80%, 45%);
+  --neon-red: hsl(350, 80%, 60%);
 }
 
 body {
-  background: var(--background);
+  background-color: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar {
+  width: 2px;
+  height: 2px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--panel-muted);
+  border-radius: 1px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--kraken-purple);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
