@@ -38,8 +38,7 @@ Alpaca Quant Bot is a multi-agent quantitative trading system with an institutio
 
 11. **Security non-negotiables.** Never hardcode API keys. All credentials come from `.env` via pydantic-settings. Never enable Alpaca Transfer/Withdrawal permissions. See `MASTER_INSTRUCTIONS.md` and `.claude/rules/security-and-risk.md` for full rules.
 
-
-12. backend can be stored in UTC but front end should display in locale timezone
+12. **Timezone rule (mandatory).** All timestamps are stored and transmitted from the backend in UTC. The frontend **must** convert every UTC timestamp to the user's local timezone before display — use `new Date(utcMs).toLocaleString()`, `.toLocaleTimeString()`, or `.toLocaleDateString()`. Raw UTC strings (e.g. `2024-01-15T10:00:00Z`) must never be shown to the user. This applies to: trade timestamps, order submission times, reflection logs, ledger entries, PnL calendar dates, and any ISO timestamp field from the API.
 
 
 ---

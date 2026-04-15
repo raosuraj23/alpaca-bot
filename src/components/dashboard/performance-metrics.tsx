@@ -2,88 +2,268 @@
 
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Activity, BarChart3, PieChart, ShieldAlert } from 'lucide-react';
+import { BarChart3, PieChart, ShieldAlert, TrendingUp, TrendingDown, Activity } from 'lucide-react';
+import { ResponsiveLine } from '@nivo/line';
 import { useTradingStore } from '@/hooks/useTradingStream';
 
 // ---------------------------------------------------------------------------
-// PnL Calendar Heatmap (12-week GitHub-style grid)
+// PnL Calendar Heatmap — drill-down: Day / Week / Month / Year
 // ---------------------------------------------------------------------------
 
-function PnLCalendar({ history }: { history: [number, number][] }) {
-  const WEEKS = 12;
-  const DAYS  = 7;
-  const CELL  = 12;
-  const GAP   = 2;
+type CalendarView = 'day' | 'week' | 'month' | 'year';
 
+const DAY_NAMES  = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function cellColor(pnl: number | null, max: number): string {
+  if (pnl === null) return 'hsla(255,15%,15%,0.8)';
+  if (pnl === 0)    return 'hsla(250,10%,20%,0.8)';
+  const intensity = Math.min(Math.abs(pnl) / (max || 1), 1);
+  if (pnl > 0) return `hsla(150,${60 + intensity * 20}%,${20 + intensity * 18}%,1)`;
+  return `hsla(350,${55 + intensity * 25}%,${22 + intensity * 18}%,1)`;
+}
+
+function PnLCalendar({ history }: { history: [number, number][] }) {
+  const [view, setView] = React.useState<CalendarView>('month');
+
+  // Build daily PnL map: localDateKey → pnl
   const dailyPnl = React.useMemo(() => {
-    if (!history || history.length < 2) return new Map<string, number>();
     const map = new Map<string, number>();
+    if (!history || history.length < 2) return map;
     for (let i = 1; i < history.length; i++) {
-      const pnl = (history[i][1] ?? 0) - (history[i - 1][1] ?? 0);
+      const pnl  = (history[i][1] ?? 0) - (history[i - 1][1] ?? 0);
       const date = new Date(history[i][0]);
-      const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-      map.set(key, pnl);
+      const key  = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+      map.set(key, (map.get(key) ?? 0) + pnl);
     }
     return map;
   }, [history]);
 
-  const cells = React.useMemo(() => {
-    const result: { key: string; pnl: number | null; label: string }[] = [];
-    const today = new Date();
-    const startDate = new Date(today);
-    startDate.setDate(today.getDate() - WEEKS * DAYS + 1);
-    for (let d = 0; d < WEEKS * DAYS; d++) {
-      const date = new Date(startDate);
-      date.setDate(startDate.getDate() + d);
-      const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-      const label = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      result.push({ key, pnl: dailyPnl.get(key) ?? null, label });
+  // Build hourly PnL map for day view
+  const hourlyPnl = React.useMemo(() => {
+    const map = new Map<string, number>(); // key: YYYY-MM-DD-HH
+    if (!history || history.length < 2) return map;
+    for (let i = 1; i < history.length; i++) {
+      const pnl  = (history[i][1] ?? 0) - (history[i - 1][1] ?? 0);
+      const date = new Date(history[i][0]);
+      const key  = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}-${String(date.getHours()).padStart(2,'0')}`;
+      map.set(key, (map.get(key) ?? 0) + pnl);
     }
-    return result;
+    return map;
+  }, [history]);
+
+  const today = React.useMemo(() => new Date(), []);
+
+  // ── DAY VIEW: 24 hourly bars for today ────────────────────────────────────
+  const dayCells = React.useMemo(() => {
+    const datePrefix = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+    return Array.from({ length: 24 }, (_, h) => {
+      const key = `${datePrefix}-${String(h).padStart(2,'0')}`;
+      return { hour: h, pnl: hourlyPnl.get(key) ?? null };
+    });
+  }, [hourlyPnl, today]);
+
+  // ── WEEK VIEW: last 7 days ────────────────────────────────────────────────
+  const weekCells = React.useMemo(() => {
+    return Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(today);
+      d.setDate(today.getDate() - 6 + i);
+      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      return { date: d, key, pnl: dailyPnl.get(key) ?? null };
+    });
+  }, [dailyPnl, today]);
+
+  // ── MONTH VIEW: calendar grid for current month ───────────────────────────
+  const monthCells = React.useMemo(() => {
+    const year  = today.getFullYear();
+    const month = today.getMonth();
+    const firstDay    = new Date(year, month, 1).getDay(); // 0=Sun
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const cells: { date: Date | null; key: string; pnl: number | null }[] = [];
+    // leading blanks
+    for (let i = 0; i < firstDay; i++) cells.push({ date: null, key: `blank-${i}`, pnl: null });
+    for (let d = 1; d <= daysInMonth; d++) {
+      const date = new Date(year, month, d);
+      const key  = `${year}-${String(month+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      cells.push({ date, key, pnl: dailyPnl.get(key) ?? null });
+    }
+    return cells;
+  }, [dailyPnl, today]);
+
+  // ── YEAR VIEW: 12-month aggregates ────────────────────────────────────────
+  const yearCells = React.useMemo(() => {
+    const year = today.getFullYear();
+    return Array.from({ length: 12 }, (_, m) => {
+      let total = 0;
+      const days = new Date(year, m + 1, 0).getDate();
+      for (let d = 1; d <= days; d++) {
+        const key = `${year}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+        total += dailyPnl.get(key) ?? 0;
+      }
+      return { month: m, pnl: total !== 0 ? total : null };
+    });
+  }, [dailyPnl, today]);
+
+  const maxAbs = React.useMemo(() => {
+    let m = 0.001;
+    dailyPnl.forEach(v => { if (Math.abs(v) > m) m = Math.abs(v); });
+    return m;
   }, [dailyPnl]);
 
-  const cellColor = (pnl: number | null) => {
-    if (pnl === null) return 'var(--panel-muted)';
-    if (pnl >  50) return 'hsl(150,80%,35%)';
-    if (pnl >   0) return 'hsl(150,60%,25%)';
-    if (pnl === 0) return 'hsl(250,10%,25%)';
-    if (pnl >  -50) return 'hsl(350,60%,30%)';
-    return 'hsl(350,80%,40%)';
-  };
-
-  const W = WEEKS * (CELL + GAP);
-  const H = DAYS  * (CELL + GAP);
+  const VIEW_LABELS: Record<CalendarView, string> = { day: 'Day', week: 'Week', month: 'Month', year: 'Year' };
 
   return (
-    <div className="flex flex-col gap-1">
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: `${H + 4}px` }}>
-        {cells.map(({ key, pnl, label }, i) => {
-          const col = Math.floor(i / DAYS);
-          const row = i % DAYS;
-          const x = col * (CELL + GAP);
-          const y = row * (CELL + GAP);
-          return (
-            <g key={key}>
-              <rect
-                x={x} y={y} width={CELL} height={CELL}
-                fill={cellColor(pnl)}
-                rx={1}
-              >
-                <title>{label}{pnl !== null ? ` — ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : ' — no data'}</title>
-              </rect>
-            </g>
-          );
-        })}
-      </svg>
-      <div className="flex justify-between text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-50">
-        <span>12 weeks ago</span>
-        <div className="flex items-center gap-1">
-          {['hsl(350,80%,40%)', 'hsl(350,60%,30%)', 'hsl(250,10%,25%)', 'hsl(150,60%,25%)', 'hsl(150,80%,35%)'].map((c, i) => (
-            <span key={i} style={{ background: c, display: 'inline-block', width: 10, height: 10, borderRadius: 1 }} />
-          ))}
-          <span>loss → profit</span>
+    <div className="flex flex-col gap-3">
+      {/* Drill-down selector */}
+      <div className="flex items-center gap-1">
+        {(['day','week','month','year'] as CalendarView[]).map(v => (
+          <button
+            key={v}
+            onClick={() => setView(v)}
+            className={`px-2.5 py-0.5 text-xs font-mono rounded-sm border transition-colors ${
+              view === v
+                ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20'
+                : 'border-[var(--border)] text-[var(--muted-foreground)] hover:border-[var(--kraken-purple)]/40'
+            }`}
+          >
+            {VIEW_LABELS[v]}
+          </button>
+        ))}
+        <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40 tabular-nums">
+          {view === 'day'   && today.toLocaleDateString()}
+          {view === 'week'  && 'Last 7 days'}
+          {view === 'month' && `${MONTH_NAMES[today.getMonth()]} ${today.getFullYear()}`}
+          {view === 'year'  && String(today.getFullYear())}
+        </span>
+      </div>
+
+      {/* ── DAY: 24 hour bars ── */}
+      {view === 'day' && (
+        <div className="flex gap-1 items-end h-16">
+          {dayCells.map(({ hour, pnl }) => {
+            const maxH = Math.max(...dayCells.map(c => Math.abs(c.pnl ?? 0)), 0.001);
+            const h    = pnl !== null ? Math.max((Math.abs(pnl) / maxH) * 100, 4) : 4;
+            return (
+              <div key={hour} className="flex-1 flex flex-col items-center group">
+                <div
+                  className="w-full rounded-t-sm transition-all duration-200 group-hover:brightness-125"
+                  style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
+                >
+                  <title>{String(hour).padStart(2,'0')}:00{pnl != null ? ` — ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : ''}</title>
+                </div>
+                {hour % 6 === 0 && (
+                  <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 mt-1">
+                    {String(hour).padStart(2,'0')}
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
-        <span>today</span>
+      )}
+
+      {/* ── WEEK: 7 day bars with labels ── */}
+      {view === 'week' && (
+        <div className="flex gap-2 items-end h-20">
+          {weekCells.map(({ date, pnl }) => {
+            const maxH = Math.max(...weekCells.map(c => Math.abs(c.pnl ?? 0)), 0.001);
+            const h    = pnl !== null ? Math.max((Math.abs(pnl) / maxH) * 100, 4) : 6;
+            const isToday = date.toDateString() === today.toDateString();
+            return (
+              <div key={date.toISOString()} className="flex-1 flex flex-col items-center group cursor-default">
+                {pnl !== null && (
+                  <span className={`text-xs font-mono tabular-nums mb-1 opacity-0 group-hover:opacity-100 transition-opacity ${pnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                    {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
+                  </span>
+                )}
+                <div className="w-full flex-1 flex items-end">
+                  <div
+                    className={`w-full rounded-t-sm transition-all duration-300 group-hover:brightness-125 ${isToday ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
+                    style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
+                  />
+                </div>
+                <div className="mt-1.5 text-center">
+                  <div className={`text-xs font-mono ${isToday ? 'text-[var(--kraken-light)] font-bold' : 'text-[var(--muted-foreground)] opacity-60'}`}>
+                    {DAY_NAMES[date.getDay()]}
+                  </div>
+                  <div className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">
+                    {date.getDate()}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── MONTH: calendar grid ── */}
+      {view === 'month' && (
+        <div>
+          {/* Day-of-week headers */}
+          <div className="grid grid-cols-7 mb-1">
+            {DAY_NAMES.map(d => (
+              <div key={d} className="text-xs font-mono text-center text-[var(--muted-foreground)] opacity-40 py-0.5">{d}</div>
+            ))}
+          </div>
+          <div className="grid grid-cols-7 gap-0.5">
+            {monthCells.map(({ date, key, pnl }) => {
+              if (!date) return <div key={key} />;
+              const isToday = date.toDateString() === today.toDateString();
+              return (
+                <div
+                  key={key}
+                  title={`${date.toLocaleDateString()}${pnl != null ? ` — ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : ''}`}
+                  className={`aspect-square rounded-sm flex items-center justify-center cursor-default group transition-all hover:scale-110 ${isToday ? 'ring-1 ring-[var(--kraken-purple)]' : ''}`}
+                  style={{ background: cellColor(pnl, maxAbs) }}
+                >
+                  <span className={`text-xs font-mono tabular-nums leading-none ${isToday ? 'text-[var(--kraken-light)] font-bold' : 'text-[var(--foreground)] opacity-60'}`}>
+                    {date.getDate()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── YEAR: 12 month bars ── */}
+      {view === 'year' && (
+        <div className="flex gap-2 items-end h-20">
+          {yearCells.map(({ month, pnl }) => {
+            const maxH = Math.max(...yearCells.map(c => Math.abs(c.pnl ?? 0)), 0.001);
+            const h    = pnl !== null ? Math.max((Math.abs(pnl) / maxH) * 100, 4) : 4;
+            const isCurrent = month === today.getMonth();
+            return (
+              <div key={month} className="flex-1 flex flex-col items-center group cursor-default">
+                {pnl !== null && (
+                  <span className={`text-xs font-mono tabular-nums mb-1 opacity-0 group-hover:opacity-100 transition-opacity ${(pnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                    {(pnl ?? 0) >= 0 ? '+' : ''}${(pnl ?? 0).toFixed(2)}
+                  </span>
+                )}
+                <div className="w-full flex-1 flex items-end">
+                  <div
+                    className={`w-full rounded-t-sm transition-all duration-300 group-hover:brightness-125 ${isCurrent ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
+                    style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
+                  />
+                </div>
+                <div className={`mt-1.5 text-xs font-mono ${isCurrent ? 'text-[var(--kraken-light)] font-bold' : 'text-[var(--muted-foreground)] opacity-50'}`}>
+                  {MONTH_NAMES[month]}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Legend */}
+      <div className="flex items-center justify-between text-xs font-mono text-[var(--muted-foreground)] opacity-40">
+        <span>loss</span>
+        <div className="flex items-center gap-0.5">
+          {['hsl(350,80%,38%)', 'hsl(350,60%,28%)', 'hsla(255,15%,15%,0.8)', 'hsl(150,65%,25%)', 'hsl(150,80%,33%)'].map((c, i) => (
+            <span key={i} style={{ background: c, display: 'inline-block', width: 14, height: 8, borderRadius: 1 }} />
+          ))}
+        </div>
+        <span>profit</span>
       </div>
     </div>
   );
@@ -93,12 +273,21 @@ function PnLCalendar({ history }: { history: [number, number][] }) {
 // LLM Cost vs Cumulative PnL — dual-line SVG chart
 // ---------------------------------------------------------------------------
 
+interface LLMDailyRow {
+  date:     string;
+  pnl_usd:  number;
+  cost_usd: number;
+  ratio:    number | null;
+}
+
 interface LLMCostData {
-  has_data: boolean;
-  cumulative_cost: [number, number][];
-  cumulative_pnl:  [number, number][];
-  total_cost_usd?: number;
-  total_pnl_usd?:  number;
+  has_data:          boolean;
+  cumulative_cost:   [number, number][];
+  cumulative_pnl:    [number, number][];
+  daily_rows?:       LLMDailyRow[];
+  total_cost_usd?:   number;
+  total_pnl_usd?:    number;
+  cumulative_ratio?: number | null;
 }
 
 function LLMCostChart({ data }: { data: LLMCostData }) {
@@ -171,99 +360,169 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
                 strokeLinejoin="round" strokeLinecap="round" strokeDasharray="6,3" />
         )}
       </svg>
+      {/* Legend */}
       <div className="flex items-center gap-4 text-xs font-mono tabular-nums text-[var(--muted-foreground)]">
         <div className="flex items-center gap-1">
           <span className="inline-block w-6 h-0.5 bg-[var(--neon-green)]" />
-          <span>Cumulative PnL {data.total_pnl_usd !== undefined ? `$${data.total_pnl_usd.toFixed(2)}` : ''}</span>
+          <span>PnL {data.total_pnl_usd !== undefined ? `$${data.total_pnl_usd.toFixed(2)}` : ''}</span>
         </div>
         <div className="flex items-center gap-1">
           <span className="inline-block w-5 border-t-2 border-dashed border-[var(--neon-red)]" />
           <span>LLM Cost ${(data.total_cost_usd ?? 0).toFixed(4)}</span>
         </div>
+        {data.cumulative_ratio != null && (
+          <div className="ml-auto flex items-center gap-1">
+            <span className="text-[var(--muted-foreground)] opacity-60">Efficiency:</span>
+            <span className={`font-bold ${data.cumulative_ratio >= 1 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+              {data.cumulative_ratio.toFixed(1)}x
+            </span>
+          </div>
+        )}
       </div>
+
+      {/* Daily breakdown table */}
+      {data.daily_rows && data.daily_rows.length > 0 && (
+        <div className="mt-2 overflow-y-auto max-h-[120px] rounded-sm border border-[var(--border)]">
+          <table className="w-full text-xs tabular-nums font-mono">
+            <thead className="sticky top-0 bg-[var(--panel-muted)]">
+              <tr className="text-[var(--muted-foreground)] border-b border-[var(--border)]">
+                <th className="py-1 px-2 text-left font-medium">Date</th>
+                <th className="py-1 px-2 text-right font-medium">Day PnL</th>
+                <th className="py-1 px-2 text-right font-medium">LLM Cost</th>
+                <th className="py-1 px-2 text-right font-medium">Ratio</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[var(--border)]/30">
+              {[...data.daily_rows].reverse().map(row => (
+                <tr key={row.date} className="hover:bg-[var(--panel-muted)] transition-colors">
+                  <td className="py-1 px-2 text-[var(--muted-foreground)]">
+                    {new Date(row.date + 'T00:00:00').toLocaleDateString()}
+                  </td>
+                  <td className={`py-1 px-2 text-right ${row.pnl_usd >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                    {row.pnl_usd >= 0 ? '+' : ''}${row.pnl_usd.toFixed(2)}
+                  </td>
+                  <td className="py-1 px-2 text-right text-[var(--muted-foreground)]">
+                    ${row.cost_usd.toFixed(4)}
+                  </td>
+                  <td className={`py-1 px-2 text-right font-bold ${
+                    row.ratio == null ? 'text-[var(--muted-foreground)]'
+                      : row.ratio >= 1 ? 'text-[var(--neon-green)]'
+                      : 'text-[var(--neon-red)]'
+                  }`}>
+                    {row.ratio != null ? `${row.ratio.toFixed(1)}x` : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic SVG Equity Curve
+// Nivo P&L Curve — Robinhood/TradingView style
 // ---------------------------------------------------------------------------
 
-function EquityCurve({ history }: { history: [number, number][] }) {
-  const W = 600;
-  const H = 200;
+function PnLCurve({ history, netPnl }: { history: [number, number][]; netPnl: number }) {
+  const isUp = netPnl >= 0;
+  const lineColor = isUp ? 'hsl(150,80%,45%)' : 'hsl(350,80%,60%)';
 
   if (!history || history.length < 2) {
     return (
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <Activity className="w-8 h-8 text-[var(--muted-foreground)] opacity-20 mb-3" />
-        <div className="text-sm font-bold text-[var(--muted-foreground)] uppercase tracking-widest opacity-80">
-          Awaiting Executions
-        </div>
-        <div className="text-xs text-[var(--muted-foreground)] opacity-50 mt-1 uppercase">
-          Portfolio History is Empty
+      <div className="flex flex-col items-center justify-center h-full gap-2">
+        <BarChart3 className="w-8 h-8 text-[var(--muted-foreground)] opacity-15" />
+        <div className="text-xs text-[var(--muted-foreground)] opacity-50 uppercase tracking-widest">
+          Awaiting trade executions
         </div>
       </div>
     );
   }
 
-  const values = history.map(([, v]) => v).filter(v => v != null && !isNaN(v));
-  const minY = Math.min(...values);
-  const maxY = Math.max(...values);
-  const rangeY = maxY - minY || 1;
+  // Pass Date objects — Nivo format:'native' requires real Date, not strings.
+  // JavaScript Date always displays in local timezone, so UTC→local is automatic.
+  const nivoData = [{
+    id: 'pnl',
+    data: history.map(([ts, val]) => ({
+      x: new Date(ts),   // Date object: local time for display
+      y: val,
+    })),
+  }];
 
-  const LABEL_W = 56; // reserved px on right for Y-axis labels
-  const chartW  = W - LABEL_W;
+  const values = history.map(([, v]) => v);
+  const minVal = Math.min(...values);
+  const maxVal = Math.max(...values);
+  const padding = (maxVal - minVal) * 0.1 || 1;
 
-  const points: [number, number][] = history.map(([, v], i) => [
-    (i / (history.length - 1)) * chartW,
-    H - ((v - minY) / rangeY) * H * 0.85 - H * 0.05,
-  ]);
+  const fmtY = (v: number) =>
+    v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v <= -1000 ? `-$${(Math.abs(v) / 1000).toFixed(1)}k` : `$${v.toFixed(0)}`;
 
-  const linePath = points.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x},${y}`).join(' ');
-  const areaPath = `${linePath} L${chartW},${H} L0,${H} Z`;
-
-  const fmt = (v: number) =>
-    v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : `$${v.toFixed(0)}`;
-
-  // Y-axis: top (max), mid, bottom (min)
-  const yLabels = [
-    { v: maxY, y: H * 0.05 },
-    { v: (minY + maxY) / 2, y: H * 0.5 },
-    { v: minY, y: H * 0.9 },
-  ];
+  const fmtTime = (d: Date) => {
+    if (!(d instanceof Date) || isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
 
   return (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      preserveAspectRatio="none"
-      className="absolute inset-0 w-full h-full"
-    >
-      <defs>
-        <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--kraken-purple)" stopOpacity="0.45" />
-          <stop offset="100%" stopColor="var(--kraken-purple)" stopOpacity="0.0" />
-        </linearGradient>
-      </defs>
-      {/* Horizontal guide lines */}
-      {yLabels.map(({ y }, i) => (
-        <line key={i} x1={0} y1={y} x2={chartW} y2={y}
-              stroke="hsla(255,40%,40%,0.12)" strokeWidth="1" />
-      ))}
-      <path d={areaPath} fill="url(#eqGrad)" />
-      <path d={linePath} fill="none" stroke="var(--kraken-purple)" strokeWidth="2.5"
-            strokeLinejoin="round" strokeLinecap="round" />
-      {/* Y-axis labels — rendered at fixed pixel size so they don't scale */}
-      {yLabels.map(({ v, y }, i) => (
-        <text key={i}
-          x={chartW + 4} y={y + 4}
-          fontSize="10" fill="hsla(250,10%,65%,0.8)"
-          fontFamily="monospace"
-        >
-          {fmt(v)}
-        </text>
-      ))}
-    </svg>
+    <ResponsiveLine
+      data={nivoData}
+      margin={{ top: 10, right: 16, bottom: 28, left: 56 }}
+      xScale={{ type: 'time', format: 'native', precision: 'minute' }}
+      yScale={{ type: 'linear', min: minVal - padding, max: maxVal + padding }}
+      axisBottom={{
+        tickValues: 5,
+        tickSize: 0,
+        tickPadding: 6,
+        format: (v: Date) => fmtTime(v),
+      }}
+      axisLeft={{
+        tickSize: 0,
+        tickPadding: 8,
+        tickValues: 4,
+        format: (v: number) => fmtY(v),
+      }}
+      enableGridX={false}
+      gridYValues={4}
+      theme={{
+        axis: {
+          ticks: { text: { fill: 'hsla(250,10%,65%,0.6)', fontSize: 9, fontFamily: 'monospace' } },
+        },
+        grid: { line: { stroke: 'hsla(255,40%,40%,0.10)', strokeWidth: 1 } },
+        crosshair: { line: { stroke: 'hsla(255,40%,70%,0.4)', strokeWidth: 1, strokeDasharray: '4 4' } },
+        tooltip: {
+          container: {
+            background: 'hsl(255,20%,10%)',
+            border: '1px solid hsla(255,40%,40%,0.3)',
+            borderRadius: 2,
+            padding: '4px 8px',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            color: 'hsl(210,20%,95%)',
+          },
+        },
+      }}
+      colors={[lineColor]}
+      lineWidth={2}
+      enablePoints={false}
+      enableArea={true}
+      areaOpacity={0.12}
+      useMesh={true}
+      crosshairType="x"
+      tooltip={({ point }) => {
+        const d = point.data.x as Date;
+        const localTime = d instanceof Date && !isNaN(d.getTime())
+          ? d.toLocaleString()
+          : String(point.data.xFormatted);
+        return (
+          <div className="text-xs font-mono tabular-nums">
+            <span className="opacity-60 mr-2">{localTime}</span>
+            <span style={{ color: lineColor }} className="font-bold">
+              ${Number(point.data.y).toFixed(2)}
+            </span>
+          </div>
+        );
+      }}
+    />
   );
 }
 
@@ -284,8 +543,6 @@ export function PerformanceMetrics() {
 
   const [period, setPeriod] = React.useState<Period>('1M');
   const [perfData, setPerfData] = React.useState(performance);
-  const [returnBuckets, setReturnBuckets] = React.useState<{ label: string; count: number; pct: number }[]>([]);
-  const [returnsHasData, setReturnsHasData] = React.useState(false);
   const [llmCostData, setLlmCostData] = React.useState<LLMCostData>({
     has_data: false, cumulative_cost: [], cumulative_pnl: [],
   });
@@ -306,24 +563,15 @@ export function PerformanceMetrics() {
   }, [performance]);
 
   React.useEffect(() => {
-    const loadReturns = () =>
-      fetch('http://localhost:8000/api/analytics/returns')
+    const load = () =>
+      fetch(`http://localhost:8000/api/analytics/llm-cost?period=${period}`)
         .then(r => r.ok ? r.json() : null)
-        .then(d => {
-          if (d?.has_data) { setReturnBuckets(d.buckets); setReturnsHasData(true); }
-        })
+        .then(d => { if (d) setLlmCostData(d); })
         .catch(() => {});
-    loadReturns();
-    const interval = setInterval(loadReturns, 60_000); // refresh every 60s
+    load();
+    const interval = setInterval(load, 60_000);
     return () => clearInterval(interval);
-  }, []);
-
-  React.useEffect(() => {
-    fetch('http://localhost:8000/api/analytics/llm-cost')
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d) setLlmCostData(d); })
-      .catch(() => {});
-  }, []);
+  }, [period]);
 
   const drawdown    = perfData.drawdown ?? riskStatus?.drawdown_pct ?? 0;
   const killActive  = riskStatus?.triggered ?? false;
@@ -395,6 +643,18 @@ export function PerformanceMetrics() {
       sub: 'vs. Last Session',
       c: (todayPnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
     },
+    {
+      label: 'PnL / LLM Cost',
+      value: llmCostData.cumulative_ratio != null
+        ? `${llmCostData.cumulative_ratio.toFixed(1)}x`
+        : '—',
+      sub: `${period} efficiency ratio`,
+      c: (llmCostData.cumulative_ratio ?? 0) >= 1
+        ? 'text-[var(--neon-green)]'
+        : llmCostData.cumulative_ratio != null
+          ? 'text-[var(--neon-red)]'
+          : 'text-[var(--muted-foreground)]',
+    },
   ];
 
   return (
@@ -409,7 +669,7 @@ export function PerformanceMetrics() {
       )}
 
       {/* KPI Grid */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 shrink-0">
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 shrink-0">
         {kpis.map((kpi, i) => (
           <Card key={i} className="bg-[var(--panel)]/80">
             <CardContent className="p-3 flex flex-col justify-center text-center sm:text-left">
@@ -427,161 +687,221 @@ export function PerformanceMetrics() {
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 shrink-0 h-[350px]">
-        {/* Live Equity Curve */}
-        <Card className="lg:col-span-2 flex flex-col">
-          <CardHeader className="border-b border-[var(--border)] py-3 px-4 flex flex-row items-center justify-between bg-gradient-to-b from-[var(--panel-muted)] to-transparent">
-            <div className="flex items-center space-x-2">
-              <Activity className="w-4 h-4 text-[var(--kraken-purple)]" />
-              <CardTitle className="text-xs tracking-wider uppercase font-bold text-[var(--kraken-light)]">
-                Live Equity Trajectory
+      {/* ── Row 1: P&L Curve — Robinhood/TradingView style ── */}
+      <Card className="shrink-0 flex flex-col h-[280px]">
+        <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between shrink-0">
+          <div className="flex items-center gap-3">
+            {(perfData.net_pnl ?? 0) >= 0
+              ? <TrendingUp className="w-4 h-4 text-[var(--neon-green)]" />
+              : <TrendingDown className="w-4 h-4 text-[var(--neon-red)]" />
+            }
+            <div className="flex flex-col">
+              <CardTitle className="text-xs tracking-wider uppercase font-semibold text-[var(--muted-foreground)]">
+                Net P&amp;L
               </CardTitle>
+              <span className={`text-lg font-mono tabular-nums font-bold leading-tight ${(perfData.net_pnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                {(perfData.net_pnl ?? 0) >= 0 ? '+' : ''}${(perfData.net_pnl ?? 0).toFixed(2)}
+              </span>
             </div>
-            <div className="flex items-center space-x-1">
-              {PERIODS.map(p => (
-                <button
-                  key={p}
-                  onClick={() => setPeriod(p)}
-                  className={`px-2 py-0.5 text-xs font-mono rounded-sm border transition-colors ${
-                    period === p
-                      ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20'
-                      : 'border-[var(--border)] text-[var(--muted-foreground)] hover:border-[var(--kraken-purple)]/50'
-                  }`}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-          </CardHeader>
-          <CardContent className="flex-1 p-0 relative bg-[var(--background)] overflow-hidden">
-            <EquityCurve history={perfData.history as [number, number][]} />
-          </CardContent>
-        </Card>
+          </div>
+          {/* Period selector — drives P&L curve, returns, AND LLM cost */}
+          <div className="flex items-center gap-1">
+            {PERIODS.map(p => (
+              <button
+                key={p}
+                onClick={() => setPeriod(p)}
+                className={`px-2.5 py-1 text-xs font-mono rounded-sm border transition-colors ${
+                  period === p
+                    ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20'
+                    : 'border-[var(--border)] text-[var(--muted-foreground)] hover:border-[var(--kraken-purple)]/40 hover:text-[var(--foreground)]'
+                }`}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+        </CardHeader>
+        <CardContent className="flex-1 p-0 bg-[var(--background)]">
+          <PnLCurve
+            history={perfData.history as [number, number][]}
+            netPnl={perfData.net_pnl ?? 0}
+          />
+        </CardContent>
+      </Card>
 
-        {/* Strategy Attribution — real per-bot yield */}
-        <Card className="flex flex-col">
-          <CardHeader className="border-b border-[var(--border)] py-3 px-4 flex flex-row items-center font-bold">
+      {/* ── Row 2: Strategy Attribution + Bot Performance Matrix ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 shrink-0">
+
+        {/* Strategy Attribution — bar width = signal activity; color = yield sign */}
+        <Card className="flex flex-col h-[220px]">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
             <PieChart className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
             <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
               Strategy Attribution
             </CardTitle>
           </CardHeader>
-          <CardContent className="flex-1 p-4 flex flex-col space-y-4 overflow-y-auto">
+          <CardContent className="flex-1 p-3 flex flex-col gap-2.5 overflow-y-auto">
             {bots.length === 0 ? (
               <div className="text-xs text-[var(--muted-foreground)] opacity-50 italic">
                 Connecting to strategy engine...
               </div>
-            ) : bots.map((bot: any, i: number) => {
-              const colors = [
-                'bg-[var(--kraken-purple)]',
-                'bg-[var(--neon-green)]',
-                'bg-[var(--kraken-light)]',
-              ];
-              const maxYield = Math.max(...bots.map((b: any) => Math.abs(b.yield24h ?? 0)), 0.001);
-              const ratio = Math.abs((bot.yield24h ?? 0) / maxYield) * 100;
-              const isPositive = (bot.yield24h ?? 0) >= 0;
+            ) : bots.map((bot: any) => {
+              // Use signal count for bar width — meaningful even before first sell
+              const maxSignals = Math.max(...bots.map((b: any) => b.signalCount ?? 0), 1);
+              const barWidth   = ((bot.signalCount ?? 0) / maxSignals) * 100;
+              const hasYield   = (bot.yield24h ?? 0) !== 0;
+              const isPos      = (bot.yield24h ?? 0) >= 0;
+              const fillRate   = (bot.signalCount ?? 0) > 0
+                ? Math.round(((bot.fillCount ?? 0) / (bot.signalCount ?? 1)) * 100)
+                : null;
               return (
-                <div key={bot.id} className="space-y-1.5">
-                  <div className="flex justify-between text-xs font-bold">
-                    <div className="flex items-center gap-1.5">
-                      <span className={`w-1.5 h-1.5 rounded-full ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)] shadow-[0_0_6px_var(--neon-green)]' : 'bg-[var(--muted-foreground)]'}`} />
-                      <span className="text-[var(--foreground)]">{bot.name}</span>
+                <div key={bot.id} className="space-y-0.5">
+                  <div className="flex justify-between items-center text-xs">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        bot.status === 'ACTIVE'
+                          ? 'bg-[var(--neon-green)] shadow-[0_0_4px_var(--neon-green)]'
+                          : 'bg-[var(--muted-foreground)]'
+                      }`} />
+                      <span className="font-semibold text-[var(--foreground)] truncate">{bot.name}</span>
+                      {bot.assetClass && bot.assetClass !== 'CRYPTO' && (
+                        <span className="text-xs text-[var(--muted-foreground)] opacity-40 shrink-0">{bot.assetClass}</span>
+                      )}
                     </div>
-                    <span className={`font-mono ${isPositive ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-                      {isPositive ? '+' : ''}${(bot.yield24h ?? 0).toFixed(2)}
-                    </span>
+                    <div className="flex items-center gap-2 font-mono tabular-nums shrink-0 ml-2">
+                      <span className="text-[var(--muted-foreground)] opacity-50 text-xs">
+                        {bot.signalCount ?? 0}s {fillRate != null ? `· ${fillRate}%` : ''}
+                      </span>
+                      <span className={`font-bold text-xs ${hasYield ? (isPos ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]') : 'text-[var(--muted-foreground)] opacity-40'}`}>
+                        {hasYield ? `${isPos ? '+' : ''}$${Math.abs(bot.yield24h ?? 0).toFixed(2)}` : 'no fills'}
+                      </span>
+                    </div>
                   </div>
-                  <div className="h-1.5 w-full bg-[var(--background)] rounded-full overflow-hidden">
+                  <div className="h-1 w-full bg-[var(--background)] overflow-hidden rounded-sm">
                     <div
-                      className={`h-full ${colors[i % colors.length]} transition-all duration-700 ${isPositive ? 'shadow-[0_0_8px_currentColor]' : 'opacity-50'}`}
-                      style={{ width: `${Math.max(ratio, 4)}%` }}
+                      className="h-full transition-all duration-700"
+                      style={{
+                        width: `${Math.max(barWidth, barWidth > 0 ? 3 : 0)}%`,
+                        background: bot.status !== 'ACTIVE'
+                          ? 'hsla(250,10%,50%,0.3)'
+                          : hasYield
+                            ? (isPos ? 'var(--neon-green)' : 'var(--neon-red)')
+                            : 'var(--kraken-purple)',
+                      }}
                     />
-                  </div>
-                  <div className="text-xs text-[var(--muted-foreground)] font-mono">
-                    {bot.signalCount ?? 0} signals · {bot.fillCount ?? 0} fills
                   </div>
                 </div>
               );
             })}
           </CardContent>
         </Card>
+
+        {/* Bot Performance Matrix — replaces Slippage Distribution */}
+        <Card className="flex flex-col h-[220px]">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
+            <Activity className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              Bot Performance Matrix
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex-1 overflow-y-auto p-0">
+            {bots.length === 0 ? (
+              <div className="flex items-center justify-center h-full text-xs text-[var(--muted-foreground)] opacity-40">
+                Connecting...
+              </div>
+            ) : (
+              <table className="w-full text-xs tabular-nums font-mono">
+                <thead className="sticky top-0 bg-[var(--panel-muted)] text-[var(--muted-foreground)] border-b border-[var(--border)]">
+                  <tr>
+                    <th className="text-left font-medium p-2 pl-3">Bot</th>
+                    <th className="text-center font-medium p-2">Status</th>
+                    <th className="text-right font-medium p-2">Signals</th>
+                    <th className="text-right font-medium p-2">Fill %</th>
+                    <th className="text-right font-medium p-2 pr-3">Yield</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--border)]/30">
+                  {bots.map((bot: any) => {
+                    const fillRate = (bot.signalCount ?? 0) > 0
+                      ? ((bot.fillCount ?? 0) / (bot.signalCount ?? 1) * 100).toFixed(0)
+                      : '—';
+                    const yield24h = bot.yield24h ?? 0;
+                    const isPos = yield24h >= 0;
+                    return (
+                      <tr key={bot.id} className="hover:bg-[var(--panel-muted)] transition-colors">
+                        <td className="p-2 pl-3 font-sans font-semibold text-[var(--foreground)] truncate max-w-[100px]">
+                          {bot.name}
+                        </td>
+                        <td className="p-2 text-center">
+                          <span className={`inline-flex items-center gap-1 text-xs font-sans ${
+                            bot.status === 'ACTIVE' ? 'text-[var(--neon-green)]' : 'text-[var(--muted-foreground)]'
+                          }`}>
+                            <span className={`w-1 h-1 rounded-full ${
+                              bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)]' : 'bg-[var(--muted-foreground)]'
+                            }`} />
+                            {bot.status === 'ACTIVE' ? 'ON' : 'OFF'}
+                          </span>
+                        </td>
+                        <td className="p-2 text-right text-[var(--foreground)]">
+                          {(bot.signalCount ?? 0).toLocaleString()}
+                        </td>
+                        <td className="p-2 text-right text-[var(--foreground)]">
+                          {fillRate}{fillRate !== '—' ? '%' : ''}
+                        </td>
+                        <td className={`p-2 pr-3 text-right font-bold ${
+                          yield24h !== 0 ? (isPos ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]') : 'text-[var(--muted-foreground)] opacity-40'
+                        }`}>
+                          {yield24h !== 0 ? `${isPos ? '+' : ''}$${yield24h.toFixed(2)}` : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
-      {/* Slippage Distribution */}
-      <Card className="shrink-0 h-[220px] flex flex-col">
-        <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between">
-          <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)] flex items-center">
-            <BarChart3 className="w-4 h-4 mr-2" /> Slippage Distribution
-          </CardTitle>
-          {returnsHasData && (
-            <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-60">bps per fill</span>
-          )}
-        </CardHeader>
-        <CardContent className="flex-1 p-4 flex items-end justify-between space-x-1 lg:space-x-2">
-          {returnsHasData ? returnBuckets.map((bucket, i) => {
-            const maxPct = Math.max(...returnBuckets.map(b => b.pct), 1);
-            const height = Math.max((bucket.pct / maxPct) * 100, 2);
-            const isNeg = bucket.label.startsWith('-');
-            const isZero = bucket.label === '+0bps';
-            return (
-              <div key={i} className="flex-1 flex flex-col items-center group cursor-crosshair">
-                <div className="text-xs font-mono opacity-0 group-hover:opacity-100 mb-1 transition-opacity text-[var(--kraken-light)]">
-                  {bucket.count}
-                </div>
-                <div
-                  className={`w-full rounded-t-sm transition-all duration-300 group-hover:brightness-150 ${
-                    isNeg ? 'bg-[var(--neon-green)]/60' : isZero ? 'bg-[var(--muted-foreground)]' : 'bg-[var(--neon-red)]/50'
-                  }`}
-                  style={{ height: `${height}%` }}
-                />
-                <div className="text-xs font-mono mt-1 text-[var(--muted-foreground)] opacity-50 group-hover:opacity-100 hidden sm:block">
-                  {bucket.label}
-                </div>
-              </div>
-            );
-          }) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-              <BarChart3 className="w-8 h-8 text-[var(--muted-foreground)] opacity-20 mb-2" />
-              <div className="text-xs text-[var(--muted-foreground)] opacity-50 uppercase tracking-widest">
-                Awaiting Fills
-              </div>
-              <div className="text-xs text-[var(--muted-foreground)] opacity-30 mt-1">
-                Populates after first execution
-              </div>
+      {/* ── Row 3: PnL Calendar + LLM Cost vs PnL ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 shrink-0">
+
+        {/* PnL Calendar Heatmap */}
+        <Card className="flex flex-col">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 shrink-0">
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              PnL Calendar
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-4">
+            <PnLCalendar history={perfData.history as [number, number][]} />
+          </CardContent>
+        </Card>
+
+        {/* LLM Cost vs PnL — period-driven */}
+        <Card className="flex flex-col">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between shrink-0">
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              LLM Cost vs PnL
+            </CardTitle>
+            <div className="flex items-center gap-2 text-xs font-mono tabular-nums">
+              {llmCostData.cumulative_ratio != null && (
+                <span className={`font-bold ${llmCostData.cumulative_ratio >= 1 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                  {llmCostData.cumulative_ratio.toFixed(1)}x efficiency
+                </span>
+              )}
+              {llmCostData.has_data && (
+                <span className="text-[var(--muted-foreground)] opacity-60">
+                  ${(llmCostData.total_cost_usd ?? 0).toFixed(4)} spent
+                </span>
+              )}
             </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* PnL Calendar Heatmap */}
-      <Card className="shrink-0 flex flex-col">
-        <CardHeader className="border-b border-[var(--border)] py-2.5 px-4">
-          <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
-            Daily PnL Calendar (12w)
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="p-4">
-          <PnLCalendar history={perfData.history as [number, number][]} />
-        </CardContent>
-      </Card>
-
-      {/* LLM Cost vs PnL */}
-      <Card className="shrink-0 flex flex-col">
-        <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between">
-          <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
-            LLM Cost vs Cumulative PnL
-          </CardTitle>
-          {llmCostData.has_data && (
-            <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60">
-              net: {((llmCostData.total_pnl_usd ?? 0) - (llmCostData.total_cost_usd ?? 0)) >= 0 ? '+' : ''}
-              ${((llmCostData.total_pnl_usd ?? 0) - (llmCostData.total_cost_usd ?? 0)).toFixed(2)}
-            </span>
-          )}
-        </CardHeader>
-        <CardContent className="p-4 h-[180px]">
-          <LLMCostChart data={llmCostData} />
-        </CardContent>
-      </Card>
+          </CardHeader>
+          <CardContent className="p-3 flex flex-col gap-2">
+            <LLMCostChart data={llmCostData} />
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

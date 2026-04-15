@@ -457,6 +457,17 @@ export function useTradingEngine() {
       useTradingStore.getState().fetchLedger();
     }, 60_000); // 60s — execution ledger from DB
 
+    // Poll bots + performance every 60s so strategy attribution + status stays current
+    const pollBots = setInterval(() => {
+      Promise.all([
+        fetch('http://localhost:8000/api/bots').then(r => r.ok ? r.json() : null),
+        fetch('http://localhost:8000/api/performance').then(r => r.ok ? r.json() : null),
+      ]).then(([bots, perf]) => {
+        if (Array.isArray(bots) && bots.length > 0) useTradingStore.setState({ bots });
+        if (perf) useTradingStore.setState({ performance: perf });
+      }).catch(() => {});
+    }, 60_000); // 60s
+
     // Poll watchlist scanner results every 5 min (matches backend scan cadence)
     const pollWatchlist = setInterval(() => {
       fetch('http://localhost:8000/api/watchlist')
@@ -477,6 +488,7 @@ export function useTradingEngine() {
       clearTimeout(retry);
       clearInterval(pollPositions);
       clearInterval(pollLedger);
+      clearInterval(pollBots);
       clearInterval(pollWatchlist);
       if (retryTimer.current) clearTimeout(retryTimer.current);
       wsRef.current?.close();

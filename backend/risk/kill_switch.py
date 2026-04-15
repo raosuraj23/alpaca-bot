@@ -37,15 +37,21 @@ class KillSwitch:
         return datetime.now(timezone.utc).timetuple().tm_yday
 
     def _maybe_reset_day(self, current_equity: float):
-        """Resets start-of-day equity at midnight UTC."""
+        """Resets start-of-day equity at midnight UTC.
+        Auto-clears drawdown-triggered halts on a new day (fresh session = fresh limit).
+        Manual halts (reason prefixed 'MANUAL:') persist until operator explicitly resumes.
+        """
         today = self._today_utc()
         if self._day_anchor != today:
-            logger.info("[KILL SWITCH] New trading day detected — resetting SOD equity to $%.2f", current_equity)
+            logger.info("[KILL SWITCH] New trading day — resetting SOD equity to $%.2f", current_equity)
             self.start_of_day_equity = current_equity
             self._day_anchor = today
             self._drawdown_pct = 0.0
-            # Do NOT reset `triggered` here — a manual halt persists day-over-day
-            # until explicitly resumed by operator.
+            # Auto-clear drawdown triggers on new day; keep manual halts locked.
+            if self.triggered and not (self.triggered_reason or "").startswith("MANUAL"):
+                logger.info("[KILL SWITCH] Drawdown halt auto-cleared for new trading day")
+                self.triggered = False
+                self.triggered_reason = None
 
     # ------------------------------------------------------------------
     # Portfolio-Level Gate

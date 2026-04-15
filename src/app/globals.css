@@ -36,7 +36,36 @@ body {
   color: var(--foreground);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Subtle scanline texture — reinforces terminal depth without obscuring content */
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    hsla(255, 40%, 100%, 0.015) 3px,
+    hsla(255, 40%, 100%, 0.015) 4px
+  );
 }
+
+/* Refined glow pulse for LIVE indicator */
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 4px var(--neon-green); }
+  50%       { opacity: 0.4; box-shadow: 0 0 8px var(--neon-green); }
+}
+.animate-live {
+  animation: live-pulse 2s ease-in-out infinite;
+}
+
+/* Number flash animations for ValueTicker */
+@keyframes flash-green {
+  0%   { color: var(--neon-green); }
+  100% { color: inherit; }
+}
+@keyframes flash-red {
+  0%   { color: var(--neon-red); }
+  100% { color: inherit; }
+}
+.flash-green { animation: flash-green 300ms ease-out forwards; }
+.flash-red   { animation: flash-red   300ms ease-out forwards; }
 
 ::-webkit-scrollbar {
   width: 2px;
