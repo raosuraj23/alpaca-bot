@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { useTradingEngine, useTradingStore } from '@/hooks/useTradingStream';
-import { Activity, LayoutDashboard, BarChart3, LineChart, Cpu, History } from 'lucide-react';
+import { Activity, LayoutDashboard, BarChart3, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // Views
@@ -99,8 +99,8 @@ export default function AppShell() {
              <TabButton active={activeTab === 'PERFORMANCE'} onClick={() => setActiveTab('PERFORMANCE')} icon={<LineChart />}>Analysis</TabButton>
              <TabButton active={activeTab === 'STRATEGIES'} onClick={() => setActiveTab('STRATEGIES')} icon={<Cpu />}>Bots</TabButton>
              <TabButton active={activeTab === 'BACKTEST'} onClick={() => setActiveTab('BACKTEST')} icon={<History />}>Tests</TabButton>
-             <TabButton active={activeTab === 'LEDGER'} onClick={() => setActiveTab('LEDGER')} icon={<BarChart3 />}>Ledger</TabButton>
-             <TabButton active={activeTab === 'REFLECTIONS'} onClick={() => setActiveTab('REFLECTIONS')} icon={<BarChart3 />}>Brain</TabButton>
+             <TabButton active={activeTab === 'LEDGER'} onClick={() => setActiveTab('LEDGER')} icon={<BookOpen />}>Ledger</TabButton>
+             <TabButton active={activeTab === 'REFLECTIONS'} onClick={() => setActiveTab('REFLECTIONS')} icon={<BrainCircuit />}>Brain</TabButton>
           </nav>
         </div>
 
@@ -111,15 +111,18 @@ export default function AppShell() {
             <span className="text-[var(--foreground)]">{activeSymbol}</span>
           </div>
 
-          <div className="flex items-center space-x-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-[var(--neon-green)] animate-pulse shadow-[0_0_5px_currentColor]" />
-            <span className="text-[var(--muted-foreground)]">LIVE</span>
+          <div className="flex items-center gap-1.5">
+            <div className="w-1.5 h-1.5 rounded-full bg-[var(--neon-green)] animate-live" />
+            <span className="text-[var(--neon-green)] font-bold text-xs tracking-widest">LIVE</span>
           </div>
-          
-          <div className="flex items-center space-x-1 border border-[var(--kraken-purple)]/30 bg-[var(--kraken-purple)]/5 px-2 py-1 rounded-sm shadow-[0_0_10px_rgba(139,92,246,0.1)]">
-            <span className="text-[var(--kraken-light)] font-bold">TOTAL EQUITY</span>
-            <span className="text-[var(--foreground)] ml-2">
-               {accountEquity !== null ? `$${accountEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'SYNCING...'}
+
+          <div className="flex flex-col items-end border-l border-[var(--border)] pl-4 ml-1">
+            <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-widest leading-none mb-0.5">Total Equity</span>
+            <span className="text-sm font-mono tabular-nums font-bold text-[var(--foreground)] leading-none">
+              {accountEquity !== null
+                ? `$${accountEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                : <span className="text-[var(--muted-foreground)] opacity-50 text-xs">SYNCING...</span>
+              }
             </span>
           </div>
 
@@ -151,19 +154,20 @@ function TabButton({ active, onClick, children, icon }: { active: boolean, onCli
   return (
     <button
       onClick={onClick}
-      className={`relative px-4 py-1.5 text-xs font-semibold tracking-wide transition-colors flex items-center space-x-2 rounded-t-sm
-        ${active ? 'text-white' : 'text-[var(--muted-foreground)] hover:text-[var(--kraken-light)] hover:bg-[var(--panel-muted)]'}
+      className={`relative px-3 py-1.5 text-xs font-semibold tracking-wider uppercase transition-colors flex items-center gap-1.5 rounded-sm
+        ${active
+          ? 'text-[var(--kraken-light)] bg-[var(--kraken-purple)]/10'
+          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--panel-muted)]'
+        }
       `}
     >
-      <span className="w-3.5 h-3.5 opacity-80">{icon}</span>
+      <span className="w-3 h-3 shrink-0 opacity-75">{icon}</span>
       <span>{children}</span>
-      
-      {/* Active Indicator Underline */}
       {active && (
-         <motion.div 
-           layoutId="activeTabUnderline"
-           className="absolute bottom-[-13px] left-0 right-0 h-0.5 bg-[var(--kraken-purple)] shadow-[0_0_8px_rgba(139,92,246,0.8)]"
-         />
+        <motion.div
+          layoutId="activeTabUnderline"
+          className="absolute bottom-0 left-2 right-2 h-px bg-[var(--kraken-purple)] shadow-[0_0_6px_rgba(139,92,246,0.9)]"
+        />
       )}
     </button>
   );

@@ -36,6 +36,7 @@ trading_client = None
 # so that uvicorn hot-reload doesn't leave stale connections open against the
 # Alpaca paper account's 1-connection limit, which causes the 429 spam loop.
 _stream_task: Optional[asyncio.Task] = None
+_stock_stream_task: Optional[asyncio.Task] = None
 _ai_reflection_task: Optional[asyncio.Task] = None
 _reflection_engine = None  # ReflectionEngine instance, initialized at startup
 
@@ -544,69 +545,103 @@ async def get_return_distribution():
 
 
 @app.get("/api/analytics/llm-cost")
-async def get_llm_cost():
+async def get_llm_cost(period: str = "1M"):
     """
-    Returns dual time-series for the LLM Cost vs PnL chart:
-      - cumulative_cost: [[timestamp_ms, cumulative_usd], ...]
-      - cumulative_pnl:  [[timestamp_ms, cumulative_pnl_usd], ...]
-    Both series share the same time axis (daily resolution).
+    Returns LLM Cost vs PnL analytics, filtered by period (1D|1W|1M|YTD).
+
+    Response:
+      - cumulative_cost:  [[ts_ms, running_total_usd], ...]
+      - cumulative_pnl:   [[ts_ms, portfolio_profit_loss_usd], ...]
+      - daily_rows:       [{date, pnl_usd, cost_usd, ratio}] — daily breakdown
+      - total_cost_usd, total_pnl_usd, cumulative_ratio — top-level KPIs
+    All timestamps in the response are UTC epoch ms; frontend converts to locale.
     """
+    from datetime import datetime, timedelta, timezone
+
+    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180}
+    days_back   = period_days.get(period.upper(), 30)
+    cutoff      = datetime.now(timezone.utc) - timedelta(days=days_back)
+
+    alpaca_period_map = {
+        "1D": ("1D", "1Min"), "1W": ("1W", "1H"), "1M": ("1M", "1D"), "YTD": ("6M", "1D"),
+    }
+    alpaca_period, alpaca_tf = alpaca_period_map.get(period.upper(), ("1M", "1D"))
+
     try:
         from db.database import _get_session_factory
-        from db.models import LLMUsage, ExecutionRecord
+        from db.models import LLMUsage
         from sqlalchemy import select
 
         async with _get_session_factory()() as session:
             cost_rows = (await session.execute(
                 select(LLMUsage.timestamp, LLMUsage.cost_usd)
+                .where(LLMUsage.timestamp >= cutoff)
                 .order_by(LLMUsage.timestamp)
             )).fetchall()
 
-            exec_rows = (await session.execute(
-                select(ExecutionRecord.timestamp, ExecutionRecord.fill_price)
-                .where(ExecutionRecord.status == "FILLED")
-                .where(ExecutionRecord.fill_price > 0)
-                .order_by(ExecutionRecord.timestamp)
-            )).fetchall()
+        # Aggregate LLM costs by UTC date for daily table
+        daily_cost: dict[str, float] = {}
+        for ts, cost in cost_rows:
+            if ts:
+                day = ts.strftime("%Y-%m-%d")
+                daily_cost[day] = daily_cost.get(day, 0.0) + (cost or 0.0)
 
-        if not cost_rows and not exec_rows:
-            return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": []}
-
-        # Build cumulative LLM cost series
+        # Cumulative cost series (epoch ms, running total)
         cum_cost = 0.0
         cost_series: list[list] = []
         for ts, cost in cost_rows:
-            cum_cost += cost or 0
-            cost_series.append([int(ts.timestamp() * 1000) if ts else 0, round(cum_cost, 6)])
+            if ts:
+                cum_cost += cost or 0
+                cost_series.append([int(ts.timestamp() * 1000), round(cum_cost, 6)])
 
-        # Build cumulative PnL series from Alpaca portfolio history (1W, daily bars)
+        # Fetch portfolio daily PnL from Alpaca
         pnl_series: list[list] = []
+        daily_pnl:  dict[str, float] = {}
         cum_pnl = 0.0
         try:
-            hist = trading_client.get(
-                "/account/portfolio/history",
-                {"period": "1W", "timeframe": "1D"},
-            )
-            timestamps = hist.get("timestamp") or []
-            profit_loss = hist.get("profit_loss") or []
-            for i, ts in enumerate(timestamps):
-                if i < len(profit_loss) and profit_loss[i] is not None:
-                    cum_pnl = profit_loss[i]
-                    pnl_series.append([ts * 1000, round(cum_pnl, 2)])
+            if trading_client:
+                hist        = trading_client.get("/account/portfolio/history",
+                                                 {"period": alpaca_period, "timeframe": alpaca_tf})
+                timestamps  = hist.get("timestamp") or []
+                profit_loss = hist.get("profit_loss") or []
+                for i, ts_epoch in enumerate(timestamps):
+                    if i < len(profit_loss) and profit_loss[i] is not None:
+                        cum_pnl = profit_loss[i]
+                        pnl_series.append([ts_epoch * 1000, round(cum_pnl, 2)])
+                        # Only map to calendar date for daily-bar timeframes
+                        if alpaca_tf == "1D":
+                            day = datetime.utcfromtimestamp(ts_epoch).strftime("%Y-%m-%d")
+                            daily_pnl[day] = round(profit_loss[i], 2)
         except Exception as pnl_err:
-            logger.debug("[ANALYTICS] portfolio history for llm-cost chart: %s", pnl_err)
+            logger.debug("[ANALYTICS] portfolio history: %s", pnl_err)
+
+        # Daily breakdown table — union of all dates that have cost or PnL
+        all_days   = sorted(set(list(daily_cost.keys()) + list(daily_pnl.keys())))
+        daily_rows = []
+        for day in all_days:
+            pnl_d  = daily_pnl.get(day, 0.0)
+            cost_d = daily_cost.get(day, 0.0)
+            ratio  = round(pnl_d / cost_d, 2) if cost_d > 0 else None
+            daily_rows.append({"date": day, "pnl_usd": round(pnl_d, 2),
+                                "cost_usd": round(cost_d, 6), "ratio": ratio})
+
+        total_cost       = sum(r["cost_usd"] for r in daily_rows)
+        cumulative_ratio = round(cum_pnl / total_cost, 2) if total_cost > 0 else None
 
         return {
-            "has_data": bool(cost_series or pnl_series),
-            "cumulative_cost": cost_series,
-            "cumulative_pnl":  pnl_series,
-            "total_cost_usd":  round(cum_cost, 6),
-            "total_pnl_usd":   round(cum_pnl, 2),
+            "has_data":         bool(cost_series or pnl_series),
+            "cumulative_cost":  cost_series,
+            "cumulative_pnl":   pnl_series,
+            "daily_rows":       daily_rows[-30:],   # cap at 30 days for chart rendering
+            "total_cost_usd":   round(total_cost, 6),
+            "total_pnl_usd":    round(cum_pnl, 2),
+            "cumulative_ratio": cumulative_ratio,   # total PnL ÷ total LLM spend
         }
 
     except Exception as e:
         logger.error("[ANALYTICS] llm-cost failed: %s", e)
-        return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": []}
+        return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": [],
+                "daily_rows": [], "cumulative_ratio": None}
 
 
 async def reflection_generator():
@@ -888,11 +923,15 @@ async def stream_manager():
                                 key = (signal['bot'], symbol)
                                 if approved['action'] == 'BUY':
                                     _entry_prices[key] = exec_result.fill_price
+                                    _persist_entry_prices(_entry_prices)
                                     master_engine.update_yield(signal['bot'], 0.0)
+                                    master_engine.notify_fill(signal['bot'], symbol, 'BUY', exec_result.fill_price)
                                 else:
                                     entry = _entry_prices.pop(key, exec_result.fill_price)
+                                    _persist_entry_prices(_entry_prices)
                                     realized_pnl = (exec_result.fill_price - entry) * exec_result.qty
                                     master_engine.update_yield(signal['bot'], realized_pnl)
+                                    master_engine.notify_fill(signal['bot'], symbol, 'SELL')
                                 _push_log(
                                     f"[EXECUTION] FILLED #{exec_result.order_id[:8]} — "
                                     f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
@@ -979,6 +1018,112 @@ async def stream_manager():
     _push_log("[STREAM] \u274c Stream suspended after max retries. Restart backend to reconnect.")
 
 
+EQUITY_STREAM_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+
+async def equity_stream_manager():
+    """
+    Manages the Alpaca StockDataStream for US equity symbols.
+    Feeds bars into master_engine just like the crypto stream, but only
+    routes to EQUITY and OPTIONS strategy bots via asset-class routing in process_tick().
+    Runs in parallel with stream_manager(); equity market hours are enforced inside
+    each strategy's analyze() — no need to gate here.
+    """
+    from strategy.equity_algorithms import _is_market_hours
+    backoff = 10
+    max_backoff = 120
+    attempts = 0
+    max_attempts = 15
+
+    while attempts < max_attempts:
+        try:
+            from alpaca.data.live import StockDataStream
+            stock_stream = StockDataStream(ALPACA_API_KEY, ALPACA_API_SECRET)
+
+            async def equity_bar_callback(bar):
+                price  = float(bar.close)
+                symbol = bar.symbol
+                market_buffer.ingest_bar(symbol, bar)
+                await broadcast({"type": "TICK", "data": {
+                    "symbol": symbol, "price": price,
+                    "volume": bar.volume, "timestamp": bar.timestamp.isoformat()
+                }})
+                signal_price = price
+                for signal in master_engine.process_tick(symbol, price):
+                    meta_str = ", ".join(f"{k}={v}" for k, v in signal.get("meta", {}).items())
+                    _push_log(
+                        f"[{signal['bot'].upper()}] {signal['action']} signal on {symbol} "
+                        f"@ ${price:,.2f} (conf: {signal['confidence']}) {meta_str}"
+                    )
+                    equity_bal = 0.0
+                    try:
+                        if trading_client:
+                            equity_bal = float(trading_client.get_account().equity)
+                    except Exception:
+                        pass
+                    from risk.kill_switch import global_kill_switch
+                    global_kill_switch.evaluate_portfolio(equity_bal)
+                    approved = risk_agent.process(signal, equity_bal)
+                    if approved:
+                        _push_log(
+                            f"[RISK AGENT] \u2713 Approved {approved['action']} {symbol} "
+                            f"qty={approved['qty']:.6f} notional=${approved.get('notional', 0):.2f}"
+                        )
+                        if trading_client:
+                            exec_result = execution_agent.execute(approved, signal_price=signal_price)
+                            if exec_result:
+                                key = (signal['bot'], symbol)
+                                if approved['action'] == 'BUY':
+                                    _entry_prices[key] = exec_result.fill_price
+                                    _persist_entry_prices(_entry_prices)
+                                    master_engine.update_yield(signal['bot'], 0.0)
+                                    master_engine.notify_fill(signal['bot'], symbol, 'BUY', exec_result.fill_price)
+                                else:
+                                    entry = _entry_prices.pop(key, exec_result.fill_price)
+                                    _persist_entry_prices(_entry_prices)
+                                    realized_pnl = (exec_result.fill_price - entry) * exec_result.qty
+                                    master_engine.update_yield(signal['bot'], realized_pnl)
+                                    master_engine.notify_fill(signal['bot'], symbol, 'SELL')
+                                _push_log(
+                                    f"[EXECUTION] FILLED #{exec_result.order_id[:8]} \u2014 "
+                                    f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
+                                    f"fill=${exec_result.fill_price:.2f}"
+                                )
+                    else:
+                        _push_log(f"[RISK AGENT] \u2717 Blocked {signal['action']} {symbol} \u2014 risk gate rejected.")
+
+            stock_stream.subscribe_bars(equity_bar_callback, *EQUITY_STREAM_SYMBOLS)
+            logger.info("[EQUITY STREAM] Starting Alpaca StockDataStream for %s", EQUITY_STREAM_SYMBOLS)
+            _push_log("[EQUITY STREAM] Connecting to Alpaca equity data stream...")
+
+            import concurrent.futures
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = loop.run_in_executor(executor, stock_stream.run)
+                try:
+                    await future
+                except concurrent.futures.CancelledError:
+                    stock_stream.stop()
+                    return
+
+            logger.info("[EQUITY STREAM] Stream ended, reconnecting...")
+            backoff = 10
+            attempts = 0
+
+        except asyncio.CancelledError:
+            logger.info("[EQUITY STREAM] Task cancelled cleanly.")
+            return
+
+        except Exception as e:
+            attempts += 1
+            logger.warning("[EQUITY STREAM] Error (attempt %d/%d): %s", attempts, max_attempts, e)
+            _push_log(f"[EQUITY STREAM] Error \u2014 retrying in {backoff}s ({attempts}/{max_attempts})...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    logger.error("[EQUITY STREAM] Max reconnect attempts reached. Equity stream suspended.")
+    _push_log("[EQUITY STREAM] \u274c Equity stream suspended after max retries.")
+
+
 async def broadcast(message: dict):
     if not connected_clients:
         return
@@ -1020,6 +1165,85 @@ def _get_positions_for_reflection() -> list:
         return []
 
 
+@app.get("/api/analytics/realized-pnl")
+async def get_realized_pnl():
+    """
+    Pairs BUY → SELL ExecutionRecords (via SignalRecord join) to compute realized P&L per trade.
+    Returns a list of closed trades with entry price, exit price, qty, and net P&L.
+    Falls back to in-memory _entry_prices for any currently open positions.
+    """
+    from db.database import AsyncSessionLocal
+    from db.models import ExecutionRecord, SignalRecord
+    from sqlalchemy import select, and_
+
+    try:
+        async with AsyncSessionLocal() as session:
+            # Load all filled execution records joined to their signal for action + strategy + symbol
+            stmt = (
+                select(
+                    ExecutionRecord.id,
+                    ExecutionRecord.fill_price,
+                    ExecutionRecord.timestamp,
+                    SignalRecord.strategy,
+                    SignalRecord.symbol,
+                    SignalRecord.action,
+                    SignalRecord.confidence,
+                )
+                .join(SignalRecord, ExecutionRecord.signal_id == SignalRecord.id)
+                .where(ExecutionRecord.status == "FILLED")
+                .order_by(SignalRecord.strategy, SignalRecord.symbol, ExecutionRecord.timestamp)
+            )
+            rows = (await session.execute(stmt)).all()
+
+        # Group by (strategy, symbol) and pair BUY → SELL in order
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for row in rows:
+            groups[(row.strategy, row.symbol)].append(row)
+
+        trades = []
+        for (strategy, symbol), group_rows in groups.items():
+            buy_stack = []
+            for row in group_rows:
+                if row.action == "BUY":
+                    buy_stack.append(row)
+                elif row.action == "SELL" and buy_stack:
+                    buy_row = buy_stack.pop(0)
+                    pnl = (row.fill_price - buy_row.fill_price)  # per-unit; qty not stored yet
+                    trades.append({
+                        "strategy":    strategy,
+                        "symbol":      symbol,
+                        "entry_price": round(buy_row.fill_price, 4),
+                        "exit_price":  round(row.fill_price, 4),
+                        "pnl_per_unit": round(pnl, 4),
+                        "entry_time":  buy_row.timestamp.isoformat() if buy_row.timestamp else None,
+                        "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
+                        "confidence":  round(buy_row.confidence or 0, 3),
+                    })
+
+        # Add currently open positions from in-memory dict
+        open_positions = [
+            {
+                "strategy": bot,
+                "symbol": sym,
+                "entry_price": round(price, 4),
+                "exit_price": None,
+                "pnl_per_unit": None,
+                "entry_time": None,
+                "exit_time": None,
+                "confidence": None,
+                "open": True,
+            }
+            for (bot, sym), price in _entry_prices.items()
+        ]
+
+        return {"trades": trades, "open_positions": open_positions, "total_closed": len(trades)}
+
+    except Exception as e:
+        logger.error("[REALIZED PNL] %s", e)
+        return {"trades": [], "open_positions": [], "total_closed": 0, "error": str(e)}
+
+
 @app.get("/api/strategy/states")
 def get_strategy_states():
     """Returns current internal indicator state for all active strategies.
@@ -1029,7 +1253,36 @@ def get_strategy_states():
 
 _scanner_agent = None
 _scanner_task: Optional[asyncio.Task] = None
-_entry_prices: dict[tuple, float] = {}  # (bot_id, symbol) → BUY fill price for PnL tracking
+_ENTRY_PRICES_FILE = os.path.join(os.path.dirname(__file__), "_entry_prices.json")
+
+def _load_entry_prices() -> dict[tuple, float]:
+    """Restores entry prices from disk so restarts don't lose open-position cost basis."""
+    try:
+        with open(_ENTRY_PRICES_FILE, "r") as f:
+            raw: dict[str, float] = json.load(f)
+        result = {}
+        for k, v in raw.items():
+            parts = k.split("|", 1)
+            if len(parts) == 2:
+                result[(parts[0], parts[1])] = float(v)
+        logger.info("[ENTRY PRICES] Restored %d open positions from disk", len(result))
+        return result
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("[ENTRY PRICES] Failed to restore from disk: %s", e)
+        return {}
+
+def _persist_entry_prices(entry_prices: dict[tuple, float]):
+    """Writes current entry-price map to disk after every fill."""
+    try:
+        raw = {f"{bot}|{sym}": price for (bot, sym), price in entry_prices.items()}
+        with open(_ENTRY_PRICES_FILE, "w") as f:
+            json.dump(raw, f)
+    except Exception as e:
+        logger.warning("[ENTRY PRICES] Failed to persist to disk: %s", e)
+
+_entry_prices: dict[tuple, float] = _load_entry_prices()  # (bot_id, symbol) → BUY fill price
 
 
 @app.get("/api/watchlist")
@@ -1038,6 +1291,104 @@ def get_watchlist():
     if _scanner_agent is None:
         return []
     return _scanner_agent.get_last_results()
+
+
+@app.get("/api/market/pulse")
+def get_market_pulse():
+    """
+    Returns a price snapshot for major market symbols across indices, FX proxies, and crypto.
+    Used by the MarketPulse sentiment panel on the Desk tab.
+    Returns: list of {symbol, name, price, change_pct, category}
+    """
+    results = []
+
+    # ── Equity / Index ETFs ─────────────────────────────────────────────────
+    INDEX_SYMBOLS = ["SPY", "QQQ", "DIA", "IWM", "VIX"]
+    INDEX_NAMES = {"SPY": "S&P 500", "QQQ": "NASDAQ 100", "DIA": "Dow Jones",
+                   "IWM": "Russell 2000", "VIX": "VIX"}
+    if ALPACA_API_KEY:
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            snap_req = StockSnapshotRequest(symbol_or_symbols=INDEX_SYMBOLS)
+            snaps = stock_client.get_stock_snapshot(snap_req)
+            for sym in INDEX_SYMBOLS:
+                snap = snaps.get(sym)
+                if snap and snap.latest_trade:
+                    price = float(snap.latest_trade.price)
+                    # daily change from daily_bar open if available
+                    change_pct = 0.0
+                    if snap.daily_bar:
+                        open_px = float(snap.daily_bar.open)
+                        change_pct = ((price - open_px) / open_px * 100) if open_px else 0.0
+                    results.append({
+                        "symbol": sym,
+                        "name": INDEX_NAMES.get(sym, sym),
+                        "price": round(price, 2),
+                        "change_pct": round(change_pct, 3),
+                        "category": "indices",
+                    })
+        except Exception as e:
+            logger.warning("[MARKET PULSE] Equity snapshots failed: %s", e)
+
+    # ── Crypto ─────────────────────────────────────────────────────────────
+    CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
+    CRYPTO_NAMES = {"BTC/USD": "Bitcoin", "ETH/USD": "Ethereum", "SOL/USD": "Solana"}
+    if ALPACA_API_KEY:
+        try:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoSnapshotRequest
+            crypto_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            snap_req = CryptoSnapshotRequest(symbol_or_symbols=CRYPTO_SYMBOLS)
+            snaps = crypto_client.get_crypto_snapshot(snap_req)
+            for sym in CRYPTO_SYMBOLS:
+                snap = snaps.get(sym)
+                if snap and snap.latest_trade:
+                    price = float(snap.latest_trade.price)
+                    change_pct = 0.0
+                    if snap.daily_bar:
+                        open_px = float(snap.daily_bar.open)
+                        change_pct = ((price - open_px) / open_px * 100) if open_px else 0.0
+                    results.append({
+                        "symbol": sym,
+                        "name": CRYPTO_NAMES.get(sym, sym),
+                        "price": round(price, 4 if price < 10 else 2),
+                        "change_pct": round(change_pct, 3),
+                        "category": "crypto",
+                    })
+        except Exception as e:
+            logger.warning("[MARKET PULSE] Crypto snapshots failed: %s", e)
+
+    # ── FX via ratio ETFs (Alpaca doesn't stream spot FX) ──────────────────
+    FX_SYMBOLS = ["UUP", "FXE", "FXB"]
+    FX_NAMES = {"UUP": "USD Index", "FXE": "EUR/USD", "FXB": "GBP/USD"}
+    if ALPACA_API_KEY and FX_SYMBOLS:
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            snap_req = StockSnapshotRequest(symbol_or_symbols=FX_SYMBOLS)
+            snaps = stock_client.get_stock_snapshot(snap_req)
+            for sym in FX_SYMBOLS:
+                snap = snaps.get(sym)
+                if snap and snap.latest_trade:
+                    price = float(snap.latest_trade.price)
+                    change_pct = 0.0
+                    if snap.daily_bar:
+                        open_px = float(snap.daily_bar.open)
+                        change_pct = ((price - open_px) / open_px * 100) if open_px else 0.0
+                    results.append({
+                        "symbol": sym,
+                        "name": FX_NAMES.get(sym, sym),
+                        "price": round(price, 2),
+                        "change_pct": round(change_pct, 3),
+                        "category": "fx",
+                    })
+        except Exception as e:
+            logger.warning("[MARKET PULSE] FX snapshots failed: %s", e)
+
+    return results
 
 
 @app.post("/api/watchlist/scan")
@@ -1049,9 +1400,118 @@ async def trigger_scan():
     return {"status": "ok", "results": results}
 
 
+# ==========================================
+# MARKET NEWS + HAIKU COMMENTARY
+# ==========================================
+
+# In-memory commentary cache {generated_at: float, text: str}
+_commentary_cache: dict = {"generated_at": 0.0, "text": None}
+_COMMENTARY_TTL = 1800  # 30 minutes
+
+
+@app.get("/api/market/news")
+def get_market_news(symbols: str = "BTC,ETH,SPY,QQQ,AAPL"):
+    """
+    Returns latest news headlines from Alpaca's News API.
+    symbols: comma-separated list of tickers (without /USD suffix).
+    """
+    if not ALPACA_API_KEY:
+        return []
+    try:
+        import requests as _req
+        sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        resp = _req.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": ",".join(sym_list), "limit": 20, "sort": "desc"},
+            headers={
+                "APCA-API-KEY-ID": ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+            },
+            timeout=8,
+        )
+        if not resp.ok:
+            logger.warning("[NEWS] Alpaca news returned %s", resp.status_code)
+            return []
+        data = resp.json()
+        articles = data.get("news", [])
+        return [
+            {
+                "id":        a.get("id"),
+                "headline":  a.get("headline"),
+                "summary":   a.get("summary", ""),
+                "source":    a.get("source"),
+                "url":       a.get("url"),
+                "symbols":   a.get("symbols", []),
+                "published": a.get("created_at"),
+            }
+            for a in articles
+        ]
+    except Exception as e:
+        logger.warning("[NEWS] %s", e)
+        return []
+
+
+@app.get("/api/market/commentary")
+async def get_market_commentary(force: bool = False):
+    """
+    Returns a cached Claude Haiku market commentary (refreshed every 30 min).
+    Pass ?force=true to regenerate immediately.
+    Covers: macro sentiment, crypto, equities, open positions, watchlist.
+    """
+    global _commentary_cache
+
+    now = time.time()
+    if not force and _commentary_cache["text"] and (now - _commentary_cache["generated_at"]) < _COMMENTARY_TTL:
+        return {"text": _commentary_cache["text"], "generated_at": _commentary_cache["generated_at"], "cached": True}
+
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        return {"text": None, "error": "ANTHROPIC_API_KEY not set"}
+
+    # Gather context: bot states + positions
+    try:
+        bot_states = master_engine.get_bot_states()
+        bot_summary = ", ".join(
+            f"{b['name']} ({b['status']}, yield24h=${b['yield24h']:.2f})"
+            for b in bot_states
+        )
+        pos_list = []
+        if trading_client:
+            try:
+                raw_pos = trading_client.get_all_positions()
+                pos_list = [f"{p.symbol} {p.side} qty={p.qty} unrealPnL=${p.unrealized_pl}" for p in raw_pos]
+            except Exception:
+                pass
+        pos_summary = ", ".join(pos_list) if pos_list else "No open positions"
+
+        prompt = (
+            f"You are a quantitative trading analyst. Provide a concise, data-driven market commentary in 3-4 short paragraphs covering:\n"
+            f"1. Overall macro sentiment (risk-on/risk-off, key market levels)\n"
+            f"2. Crypto market (BTC, ETH, SOL trends)\n"
+            f"3. Equities outlook (SPY, QQQ, sector rotation)\n"
+            f"4. Portfolio focus: Active strategies: {bot_summary}. Positions: {pos_summary}\n\n"
+            f"Be concise, use specific numbers where relevant, and give actionable insights. "
+            f"Avoid generic disclaimers. Write for a quantitative trader."
+        )
+
+        from anthropic import Anthropic
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = msg.content[0].text if msg.content else None
+        _commentary_cache = {"generated_at": now, "text": text}
+        return {"text": text, "generated_at": now, "cached": False}
+    except Exception as e:
+        logger.error("[COMMENTARY] %s", e)
+        return {"text": None, "error": str(e)}
+
+
 @app.on_event("startup")
 async def startup_event():
-    global _stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
+    global _stream_task, _stock_stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
     from db.database import init_db
     await init_db()
     _get_log_queue()
@@ -1060,6 +1520,7 @@ async def startup_event():
     _push_log("[SYSTEM] Trading Engine Online — initializing stream...")
     if ALPACA_API_KEY and ALPACA_API_SECRET:
         _stream_task = asyncio.create_task(stream_manager())
+        _stock_stream_task = asyncio.create_task(equity_stream_manager())
 
     # Start the reflection engine
     from agents.reflection_engine import ReflectionEngine
@@ -1082,8 +1543,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _stream_task, _ai_reflection_task, _scanner_task
-    for task in (_stream_task, _ai_reflection_task, _scanner_task):
+    global _stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task
+    for task in (_stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task):
         if task and not task.done():
             task.cancel()
             try:

@@ -11,7 +11,20 @@ type Tab = 'positions' | 'orders' | 'history';
 export function PositionsTable() {
   const positions    = useTradingStore(s => s.positions);
   const recentTrades = useTradingStore(s => s.recentTrades);
+  const ledgerTrades = useTradingStore(s => s.ledgerTrades);
   const performance  = useTradingStore(s => s.performance);
+
+  // Build a realized-PnL lookup from ledger: keyed by Alpaca order_id (first 8 chars)
+  // Ledger rows have fill_price + slippage from the execution agent — we can derive
+  // an approximate per-trade PnL once the backend supplies a paired entry_price.
+  // For now we store slippage_bps (observable) and leave pnl as null until paired.
+  const ledgerByOrderId = React.useMemo(() => {
+    const map = new Map<string, { slippage_bps: number | null; confidence: number | null }>();
+    for (const r of ledgerTrades) {
+      if (r.order_id) map.set(r.order_id, { slippage_bps: r.slippage_bps ?? null, confidence: r.confidence ?? null });
+    }
+    return map;
+  }, [ledgerTrades]);
 
   const [activeTab, setActiveTab] = React.useState<Tab>('positions');
 
@@ -128,25 +141,44 @@ export function PositionsTable() {
                 <th className="font-medium p-2 text-center">Side</th>
                 <th className="font-medium p-2 text-right">Qty</th>
                 <th className="font-medium p-2 text-right">Fill Price</th>
+                <th className="font-medium p-2 text-right">Realized P&amp;L</th>
+                <th className="font-medium p-2 text-right">Slip (bps)</th>
                 <th className="font-medium p-2 pr-4 text-right">Time</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border)]/30">
               {history.length === 0 ? (
-                <tr><td colSpan={5} className="p-4 text-center text-[var(--muted-foreground)]">No trade history</td></tr>
-              ) : history.map((o) => (
-                <tr key={o.id} className="hover:bg-[var(--panel-muted)] transition-colors">
-                  <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{o.symbol}</td>
-                  <td className="p-2 text-center">
-                    <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{o.side}</Badge>
-                  </td>
-                  <td className="p-2 text-right font-mono">{o.size.toFixed(4)}</td>
-                  <td className="p-2 text-right font-mono font-bold text-[var(--foreground)]">${o.price.toFixed(2)}</td>
-                  <td className="p-2 pr-4 text-right text-[var(--muted-foreground)]">
-                    {new Date(o.timestamp).toLocaleString()}
-                  </td>
-                </tr>
-              ))}
+                <tr><td colSpan={7} className="p-4 text-center text-[var(--muted-foreground)]">No trade history</td></tr>
+              ) : history.map((o) => {
+                const ledger = ledgerByOrderId.get(o.id.slice(0, 8));
+                // Realized PnL: available once backend supplies it; show slippage_bps as proxy
+                const slipBps = ledger?.slippage_bps;
+                return (
+                  <tr key={o.id} className="hover:bg-[var(--panel-muted)] transition-colors">
+                    <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{o.symbol}</td>
+                    <td className="p-2 text-center">
+                      <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{o.side}</Badge>
+                    </td>
+                    <td className="p-2 text-right font-mono">{o.size.toFixed(4)}</td>
+                    <td className="p-2 text-right font-mono font-bold text-[var(--foreground)]">${o.price.toFixed(2)}</td>
+                    <td className="p-2 text-right font-mono text-[var(--muted-foreground)]">
+                      {/* Realized PnL requires paired position cost basis — not yet in order feed */}
+                      —
+                    </td>
+                    <td className={`p-2 text-right font-mono ${
+                      slipBps == null ? 'text-[var(--muted-foreground)]'
+                        : slipBps < 0 ? 'text-[var(--neon-green)]'
+                        : slipBps > 5 ? 'text-[var(--neon-red)]'
+                        : 'text-[var(--foreground)]'
+                    }`}>
+                      {slipBps != null ? `${slipBps > 0 ? '+' : ''}${slipBps.toFixed(1)}` : '—'}
+                    </td>
+                    <td className="p-2 pr-4 text-right text-[var(--muted-foreground)]">
+                      {new Date(o.timestamp).toLocaleString()}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

@@ -1,9 +1,12 @@
 """
 Trading Strategy Algorithms
 ============================
-Three distinct algorithmic strategies, each implementing a different
-trading paradigm. All strategies are stateful (maintain rolling windows
-in memory) and are designed to be called on every price tick.
+Three distinct algorithmic strategies for CRYPTO assets, each implementing a different
+trading paradigm. All strategies are stateful (maintain rolling windows in memory) and
+are designed to be called on every price tick.
+
+Position-state tracking: each strategy tracks a per-symbol position state (FLAT/LONG)
+to prevent naked SELL signals when no position is held.
 
 Signal schema emitted by analyze():
   {
@@ -17,14 +20,19 @@ Signal schema emitted by analyze():
 """
 
 import math
-import random
 import logging
 from collections import deque
 
 logger = logging.getLogger(__name__)
 
+# Position states
+FLAT = "FLAT"
+LONG = "LONG"
+
 
 class BaseStrategy:
+    asset_class: str = "CRYPTO"  # Override in equity/options subclasses
+
     def __init__(self, bot_id: str, name: str, allocation: int, algo_type: str):
         self.id = bot_id
         self.name = name
@@ -34,6 +42,8 @@ class BaseStrategy:
         self.yield24h = 0.0
         self.signal_count = 0
         self.fill_count = 0
+        # Per-symbol position state: FLAT means no position held
+        self._position_state: dict[str, str] = {}
 
     def analyze(self, symbol: str, price: float) -> dict | None:
         """Must be overridden by child classes to emit signal dicts."""
@@ -48,6 +58,19 @@ class BaseStrategy:
         self.yield24h = round(self.yield24h + pnl_delta, 4)
         self.fill_count += 1
 
+    def notify_fill(self, symbol: str, action: str):
+        """Called by the execution pipeline after a confirmed fill to update position state."""
+        if action == "BUY":
+            self._position_state[symbol] = LONG
+        elif action == "SELL":
+            self._position_state[symbol] = FLAT
+
+    def _is_long(self, symbol: str) -> bool:
+        return self._position_state.get(symbol, FLAT) == LONG
+
+    def _is_flat(self, symbol: str) -> bool:
+        return self._position_state.get(symbol, FLAT) == FLAT
+
 
 # ---------------------------------------------------------------------------
 # Strategy 1: Momentum Alpha (EMA Crossover)
@@ -61,8 +84,8 @@ class MomentumStrategy(BaseStrategy):
     - EMA-long  (α=0.05, approx 39-period): slow trend anchor
 
     Signal logic:
-      BUY  when short_ema crosses above long_ema by > 0.2% (bullish breakout)
-      SELL when short_ema crosses below long_ema by > 0.2% (bearish breakout)
+      BUY  when short_ema crosses above long_ema by > 0.2% AND position is FLAT
+      SELL when short_ema crosses below long_ema by > 0.2% AND position is LONG
 
     Confidence is scaled by the magnitude of the crossover spread.
     """
@@ -88,7 +111,7 @@ class MomentumStrategy(BaseStrategy):
         spread = (short - long_) / long_  # positive = bullish
 
         signal = None
-        if spread > 0.002 and self._last_cross.get(symbol) != "BUY":
+        if spread > 0.002 and self._last_cross.get(symbol) != "BUY" and self._is_flat(symbol):
             self._last_cross[symbol] = "BUY"
             confidence = min(0.99, 0.70 + abs(spread) * 10)
             signal = {
@@ -96,7 +119,7 @@ class MomentumStrategy(BaseStrategy):
                 "confidence": round(confidence, 3), "price": price,
                 "meta": {"ema_short": round(short, 2), "ema_long": round(long_, 2), "spread_pct": round(spread * 100, 4)}
             }
-        elif spread < -0.002 and self._last_cross.get(symbol) != "SELL":
+        elif spread < -0.002 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
             self._last_cross[symbol] = "SELL"
             confidence = min(0.99, 0.70 + abs(spread) * 10)
             signal = {
@@ -126,6 +149,7 @@ class MomentumStrategy(BaseStrategy):
             "spread_pct": round(spread * 100, 4),
             "bias": bias,
             "last_cross": self._last_cross.get(symbol, "NONE"),
+            "position_state": self._position_state.get(symbol, FLAT),
             "near_crossover": abs(spread) < 0.003,
         }
 
@@ -145,8 +169,8 @@ class StatArbStrategy(BaseStrategy):
       - Lower band = SMA - 2σ
 
     Signal logic:
-      BUY  when price < lower band (oversold — expect mean reversion up)
-      SELL when price > upper band (overbought — expect mean reversion down)
+      BUY  when price < lower band AND position is FLAT
+      SELL when price > upper band AND position is LONG
 
     Confidence is proportional to how far price has deviated beyond the band:
       conf = 0.65 + min(0.30, deviation_σ * 0.15)
@@ -181,7 +205,7 @@ class StatArbStrategy(BaseStrategy):
         sma, upper, lower = self._bollinger(self._prices[symbol])
 
         signal = None
-        if price < lower and self._last_signal.get(symbol) != "BUY":
+        if price < lower and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
             deviation_sigma = (lower - price) / max((upper - lower) / 4, 0.001)
             confidence = min(0.95, 0.65 + deviation_sigma * 0.15)
             self._last_signal[symbol] = "BUY"
@@ -191,7 +215,7 @@ class StatArbStrategy(BaseStrategy):
                 "meta": {"sma": round(sma, 2), "upper": round(upper, 2),
                          "lower": round(lower, 2), "deviation_σ": round(deviation_sigma, 3)}
             }
-        elif price > upper and self._last_signal.get(symbol) != "SELL":
+        elif price > upper and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
             deviation_sigma = (price - upper) / max((upper - lower) / 4, 0.001)
             confidence = min(0.95, 0.65 + deviation_sigma * 0.15)
             self._last_signal[symbol] = "SELL"
@@ -225,6 +249,7 @@ class StatArbStrategy(BaseStrategy):
             "lower_band": round(lower, 2),
             "position_in_band_pct": position_pct,
             "zone": zone,
+            "position_state": self._position_state.get(symbol, FLAT),
             "last_signal": self._last_signal.get(symbol, "NONE"),
         }
 
@@ -239,25 +264,24 @@ class HighFrequencyStrategy(BaseStrategy):
 
     Tracks last N prices per symbol. Signal logic:
       - Compute the rolling 3-tick momentum: (current - prev3) / prev3
-      - If momentum > +THRESHOLD (upward velocity)  → BUY
-      - If momentum < -THRESHOLD (downward velocity) → SELL
+      - If momentum > +THRESHOLD AND position is FLAT → BUY
+      - If momentum < -THRESHOLD AND position is LONG → SELL
+      - Stop-loss: if price moves 0.5% against entry → forced SELL
       - Fires at most once per COOLDOWN ticks per symbol (rate-limit)
 
-    This strategy is aggressive and should remain HALTED until manually
-    activated by the operator via the orchestrator or dashboard.
-
-    Confidence is derived from momentum magnitude.
+    Starts ACTIVE with 25% allocation. Position-aware to prevent naked SELLs.
     """
 
-    MOMENTUM_WINDOW = 3       # look-back ticks
-    MOMENTUM_THRESHOLD = 0.0003  # 0.03% move in 3 ticks triggers signal
-    COOLDOWN_TICKS = 5        # minimum ticks between signals per symbol
+    MOMENTUM_WINDOW = 3            # look-back ticks
+    MOMENTUM_THRESHOLD = 0.0003   # 0.03% move in 3 ticks triggers signal
+    COOLDOWN_TICKS = 5             # minimum ticks between signals per symbol
+    STOP_LOSS_PCT = 0.005          # 0.5% adverse move forces SELL exit
 
     def __init__(self, bot_id="hft-sniper", name="HFT Sniper", allocation=25):
-        super().__init__(bot_id, name, 0, "Micro-Scalp Momentum")  # allocation=0 → starts HALTED
-        self.status = "HALTED"
+        super().__init__(bot_id, name, allocation, "Micro-Scalp Momentum")
         self._prices: dict[str, deque] = {}
-        self._cooldown: dict[str, int] = {}  # ticks since last signal
+        self._cooldown: dict[str, int] = {}   # ticks since last signal
+        self._entry_price: dict[str, float] = {}  # entry price for stop-loss tracking
 
     def analyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self._prices:
@@ -270,6 +294,22 @@ class HighFrequencyStrategy(BaseStrategy):
         if len(self._prices[symbol]) < self.MOMENTUM_WINDOW + 1:
             return None
 
+        # -- Stop-loss check (fires even during cooldown) --
+        if self._is_long(symbol) and symbol in self._entry_price:
+            entry = self._entry_price[symbol]
+            adverse_move = (entry - price) / entry  # positive = price fell
+            if adverse_move >= self.STOP_LOSS_PCT:
+                self._cooldown[symbol] = self.COOLDOWN_TICKS
+                self.signal_count += 1
+                logger.warning("[HFT] STOP-LOSS triggered on %s: entry=%.4f current=%.4f move=%.3f%%",
+                               symbol, entry, price, adverse_move * 100)
+                return {
+                    "bot": self.id, "symbol": symbol, "action": "SELL",
+                    "confidence": 0.99, "price": price,
+                    "meta": {"trigger": "stop_loss", "entry_price": round(entry, 4),
+                             "adverse_move_pct": round(adverse_move * 100, 4)}
+                }
+
         if self._cooldown[symbol] > 0:
             return None
 
@@ -278,7 +318,7 @@ class HighFrequencyStrategy(BaseStrategy):
         momentum = (price - prev) / prev if prev != 0 else 0.0
 
         signal = None
-        if momentum > self.MOMENTUM_THRESHOLD:
+        if momentum > self.MOMENTUM_THRESHOLD and self._is_flat(symbol):
             confidence = min(0.92, 0.60 + abs(momentum) * 500)
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "BUY",
@@ -288,7 +328,7 @@ class HighFrequencyStrategy(BaseStrategy):
             }
             self._cooldown[symbol] = self.COOLDOWN_TICKS
 
-        elif momentum < -self.MOMENTUM_THRESHOLD:
+        elif momentum < -self.MOMENTUM_THRESHOLD and self._is_long(symbol):
             confidence = min(0.92, 0.60 + abs(momentum) * 500)
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "SELL",
@@ -304,17 +344,32 @@ class HighFrequencyStrategy(BaseStrategy):
                          symbol, signal["action"], signal["confidence"], momentum * 100)
         return signal
 
+    def notify_fill(self, symbol: str, action: str):
+        """Override to also track entry price for stop-loss."""
+        super().notify_fill(symbol, action)
+        # Entry price is set externally by the execution pipeline via set_entry_price()
+        if action == "SELL" and symbol in self._entry_price:
+            del self._entry_price[symbol]
+
+    def set_entry_price(self, symbol: str, price: float):
+        """Called by execution pipeline after a confirmed BUY fill."""
+        self._entry_price[symbol] = price
+
     def get_state(self, symbol: str) -> dict | None:
         if symbol not in self._prices or len(self._prices[symbol]) < self.MOMENTUM_WINDOW + 1:
-            return {"strategy": self.id, "name": self.name, "status": "HALTED"}
+            return {"strategy": self.id, "name": self.name, "status": self.status,
+                    "warming_up": True}
         prices_list = list(self._prices[symbol])
         prev = prices_list[0]
         current = prices_list[-1]
         momentum = (current - prev) / prev if prev else 0
+        entry = self._entry_price.get(symbol)
         return {
             "strategy": self.id,
             "name": self.name,
             "status": self.status,
             "momentum_pct": round(momentum * 100, 5),
             "cooldown_remaining": self._cooldown.get(symbol, 0),
+            "position_state": self._position_state.get(symbol, FLAT),
+            "entry_price": round(entry, 4) if entry else None,
         }

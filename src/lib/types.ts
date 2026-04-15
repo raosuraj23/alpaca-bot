@@ -81,6 +81,12 @@ export interface StrategyBot {
   yield24h: number;
   /** Strategy algorithm type */
   algo: string;
+  /** Asset class this bot trades */
+  assetClass?: 'CRYPTO' | 'EQUITY' | 'OPTIONS';
+  /** Total signals emitted */
+  signalCount?: number;
+  /** Total confirmed fills */
+  fillCount?: number;
   /** Number of trades executed today */
   tradesToday?: number;
 }
