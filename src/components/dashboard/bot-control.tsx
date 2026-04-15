@@ -40,7 +40,9 @@ export function BotControl() {
           )}
           {logs.map((log, i) => {
             const color = log.includes('[SYSTEM]') || log.includes('[STREAM]') ? 'text-blue-400'
-              : log.includes('[EXECUTION]') || log.includes('FILLED') ? 'text-[var(--neon-green)]'
+              : log.includes('[EXECUTION]') && log.includes('FILLED') ? 'text-[var(--neon-green)]'
+              : log.includes('[EXECUTION]') && log.includes('FAILED') ? 'text-[var(--neon-red)]'
+              : log.includes('[SIGNAL]') ? 'text-[var(--kraken-light)]'
               : log.includes('[RISK AGENT] ✓') ? 'text-emerald-400'
               : log.includes('[RISK AGENT] ✗') || log.includes('Blocked') ? 'text-[var(--neon-red)]'
               : log.includes('[HEARTBEAT]') ? 'text-[var(--muted-foreground)] opacity-30'

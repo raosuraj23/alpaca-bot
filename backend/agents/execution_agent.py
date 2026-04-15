@@ -26,11 +26,26 @@ class ExecutionResult:
         return {s: getattr(self, s, None) for s in self.__slots__}
 
 
+def _get_trading_client():
+    """
+    Resolves the Alpaca TradingClient from whichever module namespace owns it.
+    Under `uvicorn main:app`, `__main__` is uvicorn — NOT the app module.
+    We search sys.modules by the known import names used at startup.
+    """
+    import sys
+    for name in ("main", "backend.main", "__main__"):
+        m = sys.modules.get(name)
+        tc = getattr(m, "trading_client", None) if m else None
+        if tc is not None:
+            return tc
+    return None
+
+
 class ExecutionAgent:
     """
     Handles physical Alpaca order submission.
     For every approved signal:
-      1. Pulls trading_client from __main__ (same pattern as AlpacaRouter)
+      1. Resolves trading_client via sys.modules (safe under uvicorn)
       2. Submits a MarketOrderRequest
       3. Records SignalRecord + ExecutionRecord to SQLite
       4. Returns ExecutionResult with slippage data
@@ -53,14 +68,67 @@ class ExecutionAgent:
 
         if qty <= 0:
             logger.error("[EXECUTION AGENT] Zero qty — aborting submission for %s %s", action, symbol)
+            self._persist_async(
+                bot_id=bot_id,
+                symbol=symbol,
+                action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None,
+                fill_price=0.0,
+                slippage=0.0,
+                status="FAILED",
+                failure_reason="zero quantity",
+            )
             return None
 
-        import __main__
-        trading_client = getattr(__main__, "trading_client", None)
+        trading_client = _get_trading_client()
 
         if not trading_client:
             logger.warning("[EXECUTION AGENT] trading_client unavailable — skipping live submission.")
+            self._persist_async(
+                bot_id=bot_id,
+                symbol=symbol,
+                action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None,
+                fill_price=0.0,
+                slippage=0.0,
+                status="FAILED",
+                failure_reason="trading client unavailable",
+            )
             return None
+
+        # SELL guard: reject if we hold no position in this symbol.
+        # Alpaca symbols may be "BTC/USD" (stream) or "BTCUSD" (position) — normalise both.
+        if action == "SELL":
+            try:
+                positions = trading_client.get_all_positions()
+                norm = symbol.replace("/", "")
+                held_qty = sum(
+                    float(p.qty) for p in positions
+                    if p.symbol.replace("/", "") == norm
+                )
+                if held_qty <= 0:
+                    logger.warning(
+                        "[EXECUTION AGENT] SELL guard: no open position in %s — aborting naked SELL",
+                        symbol,
+                    )
+                    self._persist_async(
+                        bot_id=bot_id,
+                        symbol=symbol,
+                        action=action,
+                        confidence=approved_signal.get("confidence", 0.0),
+                        order_id=None,
+                        fill_price=0.0,
+                        slippage=0.0,
+                        status="FAILED",
+                        failure_reason="no open position for SELL",
+                    )
+                    return None
+            except Exception as pos_err:
+                logger.warning(
+                    "[EXECUTION AGENT] Position check failed (%s) — proceeding cautiously", pos_err
+                )
 
         try:
             from alpaca.trading.requests import MarketOrderRequest
@@ -94,6 +162,8 @@ class ExecutionAgent:
                 order_id=order_id,
                 fill_price=fill_price,
                 slippage=slippage,
+                status="FILLED",
+                failure_reason=None,
             )
 
             return ExecutionResult(
@@ -110,7 +180,19 @@ class ExecutionAgent:
             )
 
         except Exception as e:
-            logger.error("[EXECUTION AGENT] Submission failed for %s %s: %s", action, symbol, e)
+            failure_reason = str(e)
+            logger.error("[EXECUTION AGENT] Submission failed for %s %s: %s", action, symbol, failure_reason)
+            self._persist_async(
+                bot_id=bot_id,
+                symbol=symbol,
+                action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None,
+                fill_price=0.0,
+                slippage=0.0,
+                status="FAILED",
+                failure_reason=failure_reason,
+            )
             return None
 
     def _persist_async(
@@ -119,9 +201,11 @@ class ExecutionAgent:
         symbol: str,
         action: str,
         confidence: float,
-        order_id: str,
+        order_id: str | None,
         fill_price: float,
         slippage: float,
+        status: str = "FILLED",
+        failure_reason: str | None = None,
     ):
         """
         Spawns a background coroutine to write SignalRecord + ExecutionRecord.
@@ -132,9 +216,15 @@ class ExecutionAgent:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 asyncio.create_task(self._write_db(
-                    bot_id=bot_id, symbol=symbol, action=action,
-                    confidence=confidence, order_id=order_id,
-                    fill_price=fill_price, slippage=slippage,
+                    bot_id=bot_id,
+                    symbol=symbol,
+                    action=action,
+                    confidence=confidence,
+                    order_id=order_id,
+                    fill_price=fill_price,
+                    slippage=slippage,
+                    status=status,
+                    failure_reason=failure_reason,
                 ))
         except RuntimeError:
             # No running event loop (e.g. in tests) — skip persistence
@@ -146,9 +236,11 @@ class ExecutionAgent:
         symbol: str,
         action: str,
         confidence: float,
-        order_id: str,
+        order_id: str | None,
         fill_price: float,
         slippage: float,
+        status: str,
+        failure_reason: str | None,
     ):
         """Writes a SignalRecord and linked ExecutionRecord to SQLite."""
         try:
@@ -171,10 +263,15 @@ class ExecutionAgent:
                     alpaca_order_id=order_id,
                     fill_price=fill_price,
                     slippage=slippage,
+                    status=status,
+                    failure_reason=failure_reason,
                 )
                 session.add(exe)
                 await session.commit()
-                logger.debug("[EXECUTION AGENT] DB write OK — signal_id=%d alpaca=%s", sig.id, order_id)
+                logger.debug(
+                    "[EXECUTION AGENT] DB write OK — signal_id=%d alpaca=%s status=%s",
+                    sig.id, order_id, status
+                )
 
         except Exception as e:
             logger.error("[EXECUTION AGENT] DB persist failed: %s", e)

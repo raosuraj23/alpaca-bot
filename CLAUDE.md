@@ -38,6 +38,10 @@ Alpaca Quant Bot is a multi-agent quantitative trading system with an institutio
 
 11. **Security non-negotiables.** Never hardcode API keys. All credentials come from `.env` via pydantic-settings. Never enable Alpaca Transfer/Withdrawal permissions. See `MASTER_INSTRUCTIONS.md` and `.claude/rules/security-and-risk.md` for full rules.
 
+
+12. backend can be stored in UTC but front end should display in locale timezone
+
+
 ---
 
 ## File Map (key locations)

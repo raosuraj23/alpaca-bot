@@ -19,6 +19,7 @@ class StrategyEngine:
             "statarb-gamma":  StatArbStrategy(),
             "hft-sniper":     HighFrequencyStrategy(),
         }
+        self._last_prices: dict[str, float] = {}  # last known tick price per symbol
 
     # ------------------------------------------------------------------
     # State Queries
@@ -117,11 +118,16 @@ class StrategyEngine:
     # Signal Generation (called per market tick)
     # ------------------------------------------------------------------
 
+    def get_last_price(self, symbol: str) -> float | None:
+        """Returns the most recently seen tick price for a symbol, or None."""
+        return self._last_prices.get(symbol)
+
     def process_tick(self, symbol: str, price: float) -> list[dict]:
         """
         Feeds a price tick to all ACTIVE strategies.
         Returns a list of emitted signal dicts (may be empty).
         """
+        self._last_prices[symbol] = price  # cache for manual order slippage calc
         signals = []
         for bot in self.bots.values():
             if bot.status != "ACTIVE":

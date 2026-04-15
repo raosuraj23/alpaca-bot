@@ -75,12 +75,31 @@ def get_account():
     _require_trading_client()
     try:
         acc = trading_client.get_account()
+
+        equity      = float(acc.equity or 0)
+        last_equity = float(getattr(acc, 'last_equity', None) or equity)
+        today_pl    = equity - last_equity
+
+        # unrealized_pl may not exist on all account types — safe fallback
+        unrealized_pl = 0.0
+        for attr in ('unrealized_pl', 'unrealized_plpc'):
+            raw = getattr(acc, attr, None)
+            if attr == 'unrealized_pl' and raw is not None:
+                try:
+                    unrealized_pl = float(raw)
+                except (ValueError, TypeError):
+                    pass
+                break
+
         return {
-            "equity": str(acc.equity),
-            "buying_power": str(acc.buying_power),
-            "cash": str(acc.cash),
+            "equity":         str(acc.equity),
+            "buying_power":   str(acc.buying_power),
+            "cash":           str(acc.cash),
             "portfolio_value": str(acc.portfolio_value),
-            "status": acc.status.value if hasattr(acc.status, 'value') else str(acc.status).replace('AccountStatus.', ''),
+            "status":         acc.status.value if hasattr(acc.status, 'value') else str(acc.status).replace('AccountStatus.', ''),
+            "last_equity":    str(last_equity),
+            "today_pl":       round(today_pl, 2),       # realized + unrealized change since last session open
+            "unrealized_pl":  round(unrealized_pl, 2),  # open position unrealized P&L
         }
     except HTTPException:
         raise
@@ -144,24 +163,51 @@ class OrderRequest(BaseModel):
 
 @app.post("/api/seed")
 def place_order(payload: OrderRequest):
-    """Places a market order. Used by the TradePanel and seed testing."""
+    """Places a market order via the full risk+execution pipeline. Used by the TradePanel."""
     _require_trading_client()
-    # Security: paper trading gate
     if not PAPER_TRADING:
         raise HTTPException(status_code=403, detail="Live trading orders must go through the execution agent pipeline.")
     try:
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-        side = OrderSide.BUY if payload.side.upper() == "BUY" else OrderSide.SELL
-        order = MarketOrderRequest(
-            symbol=payload.symbol,
-            qty=payload.qty,
-            side=side,
-            time_in_force=TimeInForce.GTC,
+        # Get last tick price for slippage tracking; fallback to 0.0 if stream not yet running
+        price = master_engine.get_last_price(payload.symbol) or 0.0
+
+        synthetic_signal = {
+            "action":     payload.side.upper(),
+            "symbol":     payload.symbol,
+            "price":      price,
+            "confidence": 1.0,   # Manual UI orders bypass confidence gate
+            "bot":        "tradepanel",
+            "meta":       {"source": "manual_ui"},
+        }
+
+        # Evaluate kill switch before anything else
+        equity = 0.0
+        try:
+            equity = float(trading_client.get_account().equity)
+        except Exception:
+            pass
+
+        from risk.kill_switch import global_kill_switch
+        global_kill_switch.evaluate_portfolio(equity)
+
+        approved = risk_agent.process(synthetic_signal, equity)
+        if not approved:
+            raise HTTPException(status_code=403, detail="Risk gate rejected order (kill switch active or position limits exceeded).")
+
+        # Honor the user's explicit qty rather than Kelly-sized qty
+        approved["qty"] = payload.qty
+
+        exec_result = execution_agent.execute(approved, signal_price=price)
+        if not exec_result:
+            raise HTTPException(status_code=502, detail="Execution failed — check trading_client and API keys.")
+
+        _push_log(
+            f"[TRADEPANEL] FILLED #{exec_result.order_id[:8]} — "
+            f"{payload.side.upper()} {payload.symbol} qty={exec_result.qty:.6f} "
+            f"fill=${exec_result.fill_price:.2f} slip=${exec_result.slippage:.4f}"
         )
-        result = trading_client.submit_order(order_data=order)
-        logger.info("[ORDER] %s %s %s qty=%.4f", side, payload.symbol, payload.qty, payload.qty)
-        return {"status": "submitted", "order_id": str(result.id)}
+        logger.info("[ORDER] FILLED %s %s qty=%.6f fill=%.2f", payload.side, payload.symbol, exec_result.qty, exec_result.fill_price)
+        return {"status": "submitted", "order_id": exec_result.order_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -192,6 +238,7 @@ def chat_with_orchestrator(payload: ChatPayload):
 from strategy.engine import master_engine
 from agents.risk_agent import risk_agent
 from agents.execution_agent import execution_agent
+from quant.data_buffer import market_buffer
 
 # In-memory queues — created lazily inside the running event loop
 _log_queue: Optional[asyncio.Queue] = None
@@ -351,12 +398,59 @@ async def get_reflections(limit: int = 50):
         logger.error("[REFLECTIONS] %s", e)
         return []
 
-@app.get("/api/performance")
-def get_performance():
-    """Fetches real portfolio history from Alpaca."""
-    _require_trading_client()
+
+@app.get("/api/reflections/history")
+async def get_reflections_history(limit: int = 50):
+    """
+    Returns last N ReflectionLog rows (post-trade AI insights).
+    More structured than /api/reflections — includes symbol, action, token count.
+    Powers the Brain tab history section.
+    """
     try:
-        hist = trading_client.get("/account/portfolio/history", {"period": "1M", "timeframe": "1D"})
+        from sqlalchemy import select, desc
+        from db.database import _get_session_factory
+        from db.models import ReflectionLog
+
+        async with _get_session_factory()() as session:
+            rows = (await session.execute(
+                select(ReflectionLog).order_by(desc(ReflectionLog.timestamp)).limit(limit)
+            )).scalars().all()
+
+        return [
+            {
+                "id":          r.id,
+                "strategy":    r.strategy,
+                "symbol":      r.symbol,
+                "action":      r.action,
+                "insight":     r.insight,
+                "tokens_used": r.tokens_used,
+                "timestamp":   r.timestamp.strftime("%Y-%m-%d %H:%M") if r.timestamp else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error("[REFLECTIONS/HISTORY] %s", e)
+        return []
+
+
+@app.get("/api/performance")
+def get_performance(period: str = "1M"):
+    """Fetches real portfolio history from Alpaca. period: 1D | 1W | 1M | YTD"""
+    _require_trading_client()
+    # Map UI period labels to Alpaca API params.
+    # Alpaca accepts: 1D, 1W, 1M, 3M, 6M, 1A — "YTD" is NOT a valid value.
+    period_map = {
+        "1D": ("1D", "1Min"),
+        "1W": ("1W", "1H"),
+        "1M": ("1M", "1D"),
+        "YTD": ("6M", "1D"),  # closest supported approximation for year-to-date
+    }
+    alpaca_period, timeframe = period_map.get(period.upper(), ("1M", "1D"))
+    try:
+        hist = trading_client.get(
+            "/account/portfolio/history",
+            {"period": alpaca_period, "timeframe": timeframe},
+        )
 
         timestamps = hist.get("timestamp") or []
         equities = hist.get("equity") or []
@@ -370,10 +464,150 @@ def get_performance():
         valid_pnl = [p for p in profit_loss if p is not None]
         net_pnl = valid_pnl[-1] if valid_pnl else 0.0
 
-        return {"history": curve, "net_pnl": net_pnl, "drawdown": 0.0, "has_data": len(curve) > 0}
+        # Compute max drawdown from equity curve
+        max_dd = 0.0
+        if equities:
+            peak = equities[0] or 0
+            for eq in equities:
+                if eq is None:
+                    continue
+                if eq > peak:
+                    peak = eq
+                if peak > 0:
+                    dd = (peak - eq) / peak * 100
+                    max_dd = max(max_dd, dd)
+
+        return {"history": curve, "net_pnl": net_pnl, "drawdown": round(max_dd, 4), "has_data": len(curve) > 0}
     except Exception as e:
         logger.error("[PERFORMANCE] %s", e)
         return {"history": [], "net_pnl": 0.0, "drawdown": 0.0, "has_data": False}
+
+
+@app.get("/api/analytics/returns")
+async def get_return_distribution():
+    """
+    Slippage distribution from ExecutionRecord — bps from signal price to fill price.
+    Returns 11 buckets spanning -50 to +50 bps in 10 bps steps.
+    Slippage bps = (fill_price - signal_price) / signal_price * 10000 ≈ stored slippage / fill_price * 10000.
+    """
+    try:
+        from db.database import _get_session_factory
+        from db.models import ExecutionRecord
+        from sqlalchemy import select
+
+        async with _get_session_factory()() as session:
+            result = await session.execute(
+                select(ExecutionRecord.fill_price, ExecutionRecord.slippage, ExecutionRecord.timestamp)
+                .where(ExecutionRecord.status == "FILLED")
+                .where(ExecutionRecord.fill_price > 0)
+                .order_by(ExecutionRecord.timestamp)
+            )
+            rows = result.fetchall()
+
+        if len(rows) < 1:
+            return {"buckets": [], "has_data": False}
+
+        # slippage_bps = slippage_usd / fill_price * 10000
+        slippages_bps = [
+            r[1] / r[0] * 10000
+            for r in rows
+            if r[0] > 0 and r[1] is not None
+        ]
+
+        if not slippages_bps:
+            return {"buckets": [], "has_data": False}
+
+        # 11 buckets: -50 to +50 bps in 10 bps steps
+        edges = [-50 + i * 10 for i in range(12)]
+        n_buckets = len(edges) - 1
+        counts = [0] * n_buckets
+        for bps in slippages_bps:
+            placed = False
+            for j in range(n_buckets):
+                if edges[j] <= bps < edges[j + 1]:
+                    counts[j] += 1
+                    placed = True
+                    break
+            if not placed:
+                counts[-1] += 1  # overflow into last bucket
+
+        total = max(sum(counts), 1)
+        buckets = [
+            {"label": f"{edges[i]:+d}bps", "count": counts[i], "pct": round(counts[i] / total * 100, 1)}
+            for i in range(n_buckets)
+        ]
+        return {"buckets": buckets, "has_data": True, "sample_size": len(slippages_bps)}
+
+    except Exception as e:
+        logger.error("[ANALYTICS] returns distribution failed: %s", e)
+        return {"buckets": [], "has_data": False}
+
+
+@app.get("/api/analytics/llm-cost")
+async def get_llm_cost():
+    """
+    Returns dual time-series for the LLM Cost vs PnL chart:
+      - cumulative_cost: [[timestamp_ms, cumulative_usd], ...]
+      - cumulative_pnl:  [[timestamp_ms, cumulative_pnl_usd], ...]
+    Both series share the same time axis (daily resolution).
+    """
+    try:
+        from db.database import _get_session_factory
+        from db.models import LLMUsage, ExecutionRecord
+        from sqlalchemy import select
+
+        async with _get_session_factory()() as session:
+            cost_rows = (await session.execute(
+                select(LLMUsage.timestamp, LLMUsage.cost_usd)
+                .order_by(LLMUsage.timestamp)
+            )).fetchall()
+
+            exec_rows = (await session.execute(
+                select(ExecutionRecord.timestamp, ExecutionRecord.fill_price)
+                .where(ExecutionRecord.status == "FILLED")
+                .where(ExecutionRecord.fill_price > 0)
+                .order_by(ExecutionRecord.timestamp)
+            )).fetchall()
+
+        if not cost_rows and not exec_rows:
+            return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": []}
+
+        # Build cumulative LLM cost series
+        cum_cost = 0.0
+        cost_series: list[list] = []
+        for ts, cost in cost_rows:
+            cum_cost += cost or 0
+            cost_series.append([int(ts.timestamp() * 1000) if ts else 0, round(cum_cost, 6)])
+
+        # Build cumulative PnL series from Alpaca portfolio history (1W, daily bars)
+        pnl_series: list[list] = []
+        cum_pnl = 0.0
+        try:
+            hist = trading_client.get(
+                "/account/portfolio/history",
+                {"period": "1W", "timeframe": "1D"},
+            )
+            timestamps = hist.get("timestamp") or []
+            profit_loss = hist.get("profit_loss") or []
+            for i, ts in enumerate(timestamps):
+                if i < len(profit_loss) and profit_loss[i] is not None:
+                    cum_pnl = profit_loss[i]
+                    pnl_series.append([ts * 1000, round(cum_pnl, 2)])
+        except Exception as pnl_err:
+            logger.debug("[ANALYTICS] portfolio history for llm-cost chart: %s", pnl_err)
+
+        return {
+            "has_data": bool(cost_series or pnl_series),
+            "cumulative_cost": cost_series,
+            "cumulative_pnl":  pnl_series,
+            "total_cost_usd":  round(cum_cost, 6),
+            "total_pnl_usd":   round(cum_pnl, 2),
+        }
+
+    except Exception as e:
+        logger.error("[ANALYTICS] llm-cost failed: %s", e)
+        return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": []}
+
 
 async def reflection_generator():
     """Live SSE stream — emits strategy engine reflections & signal events."""
@@ -588,6 +822,10 @@ async def stream_manager():
             async def bar_callback(bar):
                 price = float(bar.close)
                 symbol = bar.symbol
+
+                # --- Step 1: Feed OHLCV buffer (free, no LLM cost) ---
+                market_buffer.ingest_bar(symbol, bar)
+
                 await broadcast({"type": "TICK", "data": {
                     "symbol": symbol, "price": price,
                     "volume": bar.volume, "timestamp": bar.timestamp.isoformat()
@@ -631,11 +869,30 @@ async def stream_manager():
                             "timestamp":     bar.timestamp.isoformat(),
                             "type":          "decision",
                         })
-                        if PAPER_TRADING:
+                        if trading_client:
+                            # Broadcast SIGNAL event so Bot Control panel shows it in real time
+                            await broadcast({
+                                "type": "SIGNAL",
+                                "data": {
+                                    "bot_id":     signal['bot'],
+                                    "action":     approved['action'],
+                                    "symbol":     symbol,
+                                    "confidence": signal['confidence'],
+                                    "qty":        approved['qty'],
+                                    "timestamp":  bar.timestamp.isoformat(),
+                                }
+                            })
                             # Pass signal_price for accurate slippage computation
                             exec_result = execution_agent.execute(approved, signal_price=signal_price)
                             if exec_result:
-                                master_engine.update_yield(signal['bot'], 0.0)  # PnL updated on close
+                                key = (signal['bot'], symbol)
+                                if approved['action'] == 'BUY':
+                                    _entry_prices[key] = exec_result.fill_price
+                                    master_engine.update_yield(signal['bot'], 0.0)
+                                else:
+                                    entry = _entry_prices.pop(key, exec_result.fill_price)
+                                    realized_pnl = (exec_result.fill_price - entry) * exec_result.qty
+                                    master_engine.update_yield(signal['bot'], realized_pnl)
                                 _push_log(
                                     f"[EXECUTION] FILLED #{exec_result.order_id[:8]} — "
                                     f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
@@ -653,6 +910,11 @@ async def stream_manager():
                                         "confidence": signal['confidence'],
                                         "qty": exec_result.qty,
                                     }))
+                            else:
+                                _push_log(
+                                    f"[EXECUTION] ✗ FAILED {approved['action']} {symbol} "
+                                    f"— order rejected (naked SELL or Alpaca error)"
+                                )
                     else:
                         _push_log(f"[RISK AGENT] ✗ Blocked {signal['action']} {symbol} — risk gate rejected.")
 
@@ -765,9 +1027,31 @@ def get_strategy_states():
     return master_engine.get_all_states()
 
 
+_scanner_agent = None
+_scanner_task: Optional[asyncio.Task] = None
+_entry_prices: dict[tuple, float] = {}  # (bot_id, symbol) → BUY fill price for PnL tracking
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    """Returns the latest scanner results (TA scores + Haiku verdicts)."""
+    if _scanner_agent is None:
+        return []
+    return _scanner_agent.get_last_results()
+
+
+@app.post("/api/watchlist/scan")
+async def trigger_scan():
+    """Triggers an immediate on-demand symbol scan."""
+    if _scanner_agent is None:
+        raise HTTPException(status_code=503, detail="Scanner agent not initialized")
+    results = await _scanner_agent.run_once()
+    return {"status": "ok", "results": results}
+
+
 @app.on_event("startup")
 async def startup_event():
-    global _stream_task, _ai_reflection_task, _reflection_engine
+    global _stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
     from db.database import init_db
     await init_db()
     _get_log_queue()
@@ -777,7 +1061,7 @@ async def startup_event():
     if ALPACA_API_KEY and ALPACA_API_SECRET:
         _stream_task = asyncio.create_task(stream_manager())
 
-    # Start the reflection engine (replaces old _ai_reflection_loop)
+    # Start the reflection engine
     from agents.reflection_engine import ReflectionEngine
     _reflection_engine = ReflectionEngine(
         push_fn=_push_reflection,
@@ -786,10 +1070,20 @@ async def startup_event():
     )
     _ai_reflection_task = asyncio.create_task(_reflection_engine.run())
 
+    # Start the scanner agent
+    from agents.scanner_agent import ScannerAgent
+    from quant.data_buffer import market_buffer as _mb
+    _scanner_agent = ScannerAgent(
+        push_fn=_push_reflection,
+        get_buffer_fn=lambda: _mb,
+    )
+    _scanner_task = asyncio.create_task(_scanner_agent.run())
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _stream_task, _ai_reflection_task
-    for task in (_stream_task, _ai_reflection_task):
+    global _stream_task, _ai_reflection_task, _scanner_task
+    for task in (_stream_task, _ai_reflection_task, _scanner_task):
         if task and not task.done():
             task.cancel()
             try:

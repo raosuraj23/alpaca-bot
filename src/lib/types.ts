@@ -114,6 +114,12 @@ export interface AlpacaAccountResponse {
   cash: string;
   portfolio_value: string;
   status: string;
+  /** Portfolio equity at start of last trading session */
+  last_equity?: string;
+  /** Today's total P&L: equity − last_equity (realized + unrealized change) */
+  today_pl?: number;
+  /** Total unrealized P&L across all open positions */
+  unrealized_pl?: number;
 }
 
 export interface AlpacaPositionResponse {

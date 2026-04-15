@@ -1,17 +1,31 @@
 """
 Orchestrator Engine — Stateful Conversation + Command Routing
 ==============================================================
-The system brain. Receives natural language from the UI OrchestratorChat,
-maintains a rolling message history for conversational context, and parses
-embedded OrchestratorCommand JSON to dispatch lifecycle actions to the
-StrategyEngine and KillSwitch.
+The system brain. Receives natural language from the UI OrchestratorChat AND
+high-probability quant signals from the deterministic TA engine.
 
-Command routing:
+Two entry points:
+  process_chat(user_text)       — human-driven interaction (oversight, queries,
+                                   manual commands). Zero automatic trade execution.
+  process_signal(signal_event)  — called by the signal pipeline ONLY AFTER the
+                                   free deterministic math (Golden Cross + RSI gate
+                                   + Volume surge) has confirmed a setup. This is
+                                   where API tokens are spent: the LLM fetches
+                                   recent sentiment context and decides whether to
+                                   approve or reject the quant signal.
+
+Command routing (from process_chat):
   HALT_BOT         → master_engine.halt_bot(target_bot)
   RESUME_BOT       → master_engine.resume_bot(target_bot)
   ADJUST_ALLOCATION → master_engine.adjust_allocation(target_bot, pct)
   TRIGGER_BACKTEST → (Phase 4 — logged only)
   QUERY_RISK       → returns risk_agent.get_risk_status() inline
+  PLACE_ORDER      → risk_agent.process() → execution_agent.execute() → Alpaca
+
+Signal approval pipeline (from process_signal):
+  SignalEvent (BUY) → LLM Supervisor node (sentiment + context analysis)
+                    → APPROVED → ExecutionAgent → Alpaca
+                    → REJECTED → QuantSignal.llm_approved = 'REJECTED', logged
 """
 
 import json
@@ -25,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 # History window: keep last N messages (each turn = 1 Human + 1 AI = 2 messages)
 HISTORY_WINDOW = 6   # = 3 full turns
+
+# Minimum bars in the buffer before the signal pipeline is active
+# (matches quant.signals.MIN_BARS)
+_SIGNAL_MIN_BARS = 201
 
 
 class OrchestratorEngine:
@@ -59,10 +77,18 @@ class OrchestratorEngine:
             reply = response.content
             self._history.append(AIMessage(content=reply))
 
-            # Parse and execute any embedded commands in the reply
+            # Parse and execute any embedded commands; collect results
             commands = self._extract_commands(reply)
+            results = []
             for cmd in commands:
-                self._dispatch_command(cmd)
+                result = self._dispatch_command(cmd)
+                if result:
+                    results.append(result)
+
+            # Append execution results to the chat reply so the UI shows them
+            if results:
+                result_lines = "\n".join(f"→ {r}" for r in results)
+                reply = reply + f"\n\n**Execution Results:**\n{result_lines}"
 
             return reply
 
@@ -74,6 +100,111 @@ class OrchestratorEngine:
         """Resets the conversation context window."""
         self._history = []
         logger.info("[ORCHESTRATOR] Conversation history cleared.")
+
+    # ------------------------------------------------------------------
+    # Quant Signal Handoff — LLM Supervisor Node
+    # ------------------------------------------------------------------
+
+    def process_signal(self, signal_event: dict) -> dict:
+        """
+        Called by the signal pipeline after the deterministic TA engine emits a
+        BUY signal. This is the ONLY place where the LLM is woken up for trade
+        decisions — it does NOT run on every tick, only after all three
+        mathematical conditions (Golden Cross + RSI gate + Volume surge) pass.
+
+        The LLM's job here is narrow and explicit:
+          1. Acknowledge the quant setup (structured signal_event dict).
+          2. Provide brief sentiment context (recent news tone, macro bias).
+          3. Emit APPROVED or REJECTED with a one-sentence rationale.
+
+        The response is parsed for a JSON block:
+            {"llm_decision": "APPROVED" | "REJECTED", "rationale": "..."}
+
+        Returns:
+            {
+                "llm_decision": "APPROVED" | "REJECTED" | "ERROR",
+                "rationale":    str,
+                "signal_event": dict,   # original signal passed through
+            }
+        """
+        if not self.model:
+            logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s", signal_event.get("asset"))
+            return {
+                "llm_decision": "APPROVED",
+                "rationale":    "LLM offline — signal auto-approved by default.",
+                "signal_event": signal_event,
+            }
+
+        asset      = signal_event.get("asset", "UNKNOWN")
+        signal_ts  = signal_event.get("timestamp", "")
+        ema50      = signal_event.get("ema_50", 0)
+        ema200     = signal_event.get("ema_200", 0)
+        rsi_val    = signal_event.get("rsi_14", 0)
+        vsr        = signal_event.get("volume_surge_ratio", 0)
+        cond       = signal_event.get("conditions", {})
+
+        supervisor_prompt = (
+            f"The deterministic TA engine has identified a high-probability BUY setup on {asset}.\n\n"
+            f"Quant Signal Summary:\n"
+            f"  • Timestamp: {signal_ts}\n"
+            f"  • Golden Cross (EMA-50 crossed above EMA-200): {cond.get('golden_cross')} "
+            f"    (EMA-50={ema50:.2f}, EMA-200={ema200:.2f})\n"
+            f"  • RSI-14 in momentum zone (40–60): {cond.get('rsi_gate')} (RSI={rsi_val:.1f})\n"
+            f"  • Volume surge > 1.5× 20-bar SMA: {cond.get('volume_surge')} (ratio={vsr:.2f}×)\n\n"
+            f"Your task as LLM Supervisor:\n"
+            f"1. Comment briefly on the current macro/sentiment context for {asset} "
+            f"   based on your training knowledge (no live data access needed — use general market awareness).\n"
+            f"2. Decide: APPROVED (proceed to execution) or REJECTED (suppress this signal).\n"
+            f"3. Output your decision as a JSON block:\n"
+            f"   ```json\n"
+            f"   {{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
+            f"   ```\n\n"
+            f"Be brief. The math is already confirmed — your role is sentiment/context validation only."
+        )
+
+        try:
+            # Use a fresh single-message invocation — do NOT inject into chat
+            # history since this is an autonomous pipeline call, not a user turn.
+            messages = [self.system_prompt, HumanMessage(content=supervisor_prompt)]
+            response = self.model.invoke(messages)
+            reply = response.content
+
+            # Parse the decision JSON block
+            decision = "ERROR"
+            rationale = "Could not parse LLM response."
+            pattern = r"```json\s*(\{.*?\})\s*```"
+            for match in re.finditer(pattern, reply, re.DOTALL):
+                try:
+                    parsed = json.loads(match.group(1))
+                    decision  = parsed.get("llm_decision", "ERROR").upper()
+                    rationale = parsed.get("rationale", rationale)
+                    break
+                except json.JSONDecodeError:
+                    pass
+
+            # Normalise: only APPROVED passes through; anything else is REJECTED
+            if decision not in ("APPROVED", "REJECTED"):
+                decision = "REJECTED"
+                rationale = f"Unrecognised LLM response — defaulting to REJECTED. Raw: {reply[:200]}"
+
+            logger.info(
+                "[ORCHESTRATOR] Signal %s %s → LLM decision: %s | %s",
+                asset, signal_ts, decision, rationale,
+            )
+
+            return {
+                "llm_decision": decision,
+                "rationale":    rationale,
+                "signal_event": signal_event,
+            }
+
+        except Exception as exc:
+            logger.error("[ORCHESTRATOR] process_signal LLM call failed: %s", exc)
+            return {
+                "llm_decision": "ERROR",
+                "rationale":    str(exc),
+                "signal_event": signal_event,
+            }
 
     # ------------------------------------------------------------------
     # Command Parsing
@@ -105,9 +236,12 @@ class OrchestratorEngine:
     # Command Dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch_command(self, cmd: dict):
+    def _dispatch_command(self, cmd: dict) -> dict | None:
         """
         Routes a parsed OrchestratorCommand to the appropriate subsystem.
+        Returns a result dict for commands that produce meaningful output
+        (e.g. PLACE_ORDER fill details, QUERY_RISK status). Returns None
+        for fire-and-forget lifecycle commands.
         All routing happens synchronously — the strategy engine operations
         are in-memory and thread-safe.
         """
@@ -148,9 +282,77 @@ class OrchestratorEngine:
         elif action == "QUERY_RISK":
             status = risk_agent.get_risk_status()
             logger.info("[ORCHESTRATOR] QUERY_RISK → %s", status)
+            return status
+
+        elif action == "PLACE_ORDER":
+            return self._place_order(params)
 
         else:
             logger.warning("[ORCHESTRATOR] Unknown action: %s", action)
+
+        return None
+
+    def _place_order(self, params: dict) -> dict:
+        """
+        Execute a manual order from the orchestrator chat.
+        Routes through the full risk pipeline (kill switch + sizing), then
+        submits via ExecutionAgent. The user-specified qty overrides Kelly sizing.
+        """
+        import sys
+        from strategy.engine import master_engine
+        from agents.risk_agent import risk_agent
+        from agents.execution_agent import execution_agent, _get_trading_client
+
+        symbol = params.get("symbol", "BTC/USD")
+        side   = params.get("side", "BUY").upper()
+        qty    = float(params.get("qty", 0.0))
+        reason = params.get("reason", "orchestrator manual order")
+
+        if qty <= 0:
+            logger.warning("[ORCHESTRATOR] PLACE_ORDER rejected — qty must be > 0")
+            return {"error": "qty must be > 0"}
+
+        # Get last known tick price for slippage calculation
+        price = master_engine.get_last_price(symbol) or 0.0
+
+        synthetic_signal = {
+            "action":     side,
+            "symbol":     symbol,
+            "price":      price,
+            "confidence": 1.0,   # Manual orders always pass the confidence gate
+            "bot":        "orchestrator",
+            "meta":       {"reason": reason, "source": "manual"},
+        }
+
+        # Fetch current equity for kill-switch evaluation
+        equity = 0.0
+        try:
+            tc = _get_trading_client()
+            if tc:
+                equity = float(tc.get_account().equity)
+        except Exception:
+            pass
+
+        # Enforce kill switch + position sizing via RiskAgent
+        approved = risk_agent.process(synthetic_signal, equity)
+        if not approved:
+            logger.warning("[ORCHESTRATOR] PLACE_ORDER blocked by risk gate — %s %s", side, symbol)
+            return {"error": "Risk gate rejected the order (kill switch active or sizing limits exceeded)."}
+
+        # Override Kelly-sized qty with the user's explicit quantity
+        approved["qty"] = qty
+
+        exec_result = execution_agent.execute(approved, signal_price=price)
+        if not exec_result:
+            logger.error("[ORCHESTRATOR] PLACE_ORDER execution failed — %s %s qty=%s", side, symbol, qty)
+            return {"error": "Execution failed — check trading_client and API keys."}
+
+        logger.info(
+            "[ORCHESTRATOR] PLACE_ORDER filled — order_id=%s %s %s qty=%.6f fill=%.2f slip=%.4f",
+            exec_result.order_id, side, symbol, exec_result.qty,
+            exec_result.fill_price, exec_result.slippage,
+        )
+        return exec_result.to_dict()
 
 
 # Singleton orchestrator for FastAPI bindings

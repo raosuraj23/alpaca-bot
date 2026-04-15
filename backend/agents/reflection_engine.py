@@ -261,20 +261,45 @@ class ReflectionEngine:
             if model:
                 from langchain_core.messages import SystemMessage, HumanMessage
                 sys_msg = SystemMessage(content=(
-                    "You are a quant trading analyst. Given a trade execution, "
-                    "produce ONE sentence about performance, slippage quality, or "
-                    "confidence calibration. Be specific with numbers. No markdown."
+                    "You are a quant trading analyst reviewing crypto paper trades. "
+                    "All prices and slippage are in USD. qty is a fractional coin amount "
+                    "(e.g. 0.0003 BTC, 0.005 ETH — never grams or kg). "
+                    "Produce ONE concise sentence (max 30 words) analysing slippage quality, "
+                    "confidence calibration, or market conditions. "
+                    "Reference specific USD figures from the data. No markdown, no preamble."
                 ))
                 user_msg = HumanMessage(content=(
-                    f"{strategy} {action} {symbol} qty={qty:.6f} "
-                    f"fill=${fill_price:.2f} slippage=${slippage:.4f} "
-                    f"confidence={confidence:.2f}"
+                    f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
+                    f"Qty: {qty:.6f} coins | Fill price: ${fill_price:.2f} USD | "
+                    f"Slippage: ${slippage:.4f} USD | Signal confidence: {confidence:.0%}"
                 ))
                 response = model.invoke(
                     [sys_msg, user_msg],
-                    max_tokens=100,
+                    max_tokens=250,
                 )
                 insight = response.content.strip()
+
+                # Log token usage for cost tracking
+                try:
+                    usage = getattr(response, "usage_metadata", None) or {}
+                    t_in  = usage.get("input_tokens", 0)
+                    t_out = usage.get("output_tokens", 0)
+                    # Haiku pricing: $0.80/M input, $4.00/M output
+                    cost  = (t_in * 0.80 + t_out * 4.00) / 1_000_000
+                    from db.database import _get_session_factory
+                    from db.models import LLMUsage
+                    async with _get_session_factory()() as _s:
+                        _s.add(LLMUsage(
+                            model="claude-haiku-4-5",
+                            tokens_in=t_in,
+                            tokens_out=t_out,
+                            cost_usd=cost,
+                            purpose="reflection",
+                        ))
+                        await _s.commit()
+                except Exception as _le:
+                    logger.debug("[REFLECTION] LLM usage log failed: %s", _le)
+
         except Exception as e:
             logger.debug("[REFLECTION] LLM insight failed, using template: %s", e)
 
@@ -289,22 +314,29 @@ class ReflectionEngine:
 
         impact = f"Slip=${slippage:.4f} | Conf={confidence:.0%}"
 
-        # Persist to BotAmend
+        # Persist to BotAmend + ReflectionLog
         try:
             from db.database import _get_session_factory
-            from db.models import BotAmend
+            from db.models import BotAmend, ReflectionLog
             async with _get_session_factory()() as session:
-                amend = BotAmend(
+                session.add(BotAmend(
                     model=strategy,
                     action=f"TRADE:{action}",
                     reason=insight,
                     impact=impact,
                     timestamp=now,
-                )
-                session.add(amend)
+                ))
+                session.add(ReflectionLog(
+                    strategy=strategy,
+                    symbol=symbol,
+                    action=action,
+                    insight=insight,
+                    tokens_used=execution_data.get("_tokens_used"),
+                    timestamp=now,
+                ))
                 await session.commit()
         except Exception as e:
-            logger.warning("[REFLECTION] Failed to persist BotAmend: %s", e)
+            logger.warning("[REFLECTION] Failed to persist BotAmend/ReflectionLog: %s", e)
 
         # Push to SSE stream
         self._push({

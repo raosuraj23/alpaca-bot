@@ -1,11 +1,20 @@
 # Phase 4 additions
 vectorbt>=0.26.0
 
-# Phase 2 additions
-numpy==1.26.4
-pandas==2.1.4
+# Technical Analysis
+# TA-Lib requires the pre-compiled C library. Install first; if compilation
+# fails in your environment, comment it out and uncomment pandas-ta below.
+TA-Lib>=0.4.28
+# pandas-ta>=0.3.14b  # pure-Python fallback — no C dependency
+
+# Update numpy and pandas for pandas-ta compatibility
+numpy>=2.2.6
+pandas>=2.3.2
+
+# Keep langchain-core but unpin for flexibility
+langchain-core>=0.3.0
+
 langgraph>=0.2.0
-langchain-core>=0.2.0
 scipy>=1.11.0
 aiosqlite==0.22.1
 annotated-types==0.7.0

@@ -41,6 +41,10 @@ interface TradingStore {
   assetClass: AssetClass;
   activeSymbol: string;
   accountEquity: number | null;
+  /** Today's total P&L (equity − last_equity, realized + unrealized since session open) */
+  todayPnl: number | null;
+  /** Total unrealized P&L across all open positions from Alpaca account */
+  unrealizedPnl: number | null;
   ticker: TickerData | null;
   watchlist: TickerData[];
   recentTrades: TradeLog[];
@@ -51,12 +55,17 @@ interface TradingStore {
   aiInsights: string | null;
   riskStatus: RiskStatus | null;
   ledgerTrades: any[];
+  scannerResults: any[];
   strategyStates: Record<string, any[]>;
+  bots: any[];
+  performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean };
 
   setAssetClass: (ac: AssetClass) => void;
   setActiveSymbol: (s: string) => void;
   fetchMarketHistory: (s: string) => Promise<void>;
   fetchRiskStatus: () => Promise<void>;
+  fetchPositions: () => Promise<void>;
+  fetchLedger: () => Promise<void>;
   injectSocketData: (symbol: string, price: number, volume?: number) => void;
   fetchAPIIntegrations: () => Promise<void>;
   fetchStrategyStates: () => Promise<void>;
@@ -70,6 +79,8 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   assetClass:    'CRYPTO',
   activeSymbol:  'BTC/USD',
   accountEquity: null,
+  todayPnl:      null,
+  unrealizedPnl: null,
   ticker:        INITIAL_WATCHLIST[0],
   watchlist:     INITIAL_WATCHLIST,
   recentTrades:  [],
@@ -82,6 +93,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   aiInsights:    null,
   riskStatus:    null,
   ledgerTrades:  [],
+  scannerResults: [],
   strategyStates: {},
 
   setAssetClass:  (ac) => set({ assetClass: ac }),
@@ -129,6 +141,70 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     } catch {
       // Silent fail
     }
+  },
+
+  // Lightweight refresh — positions, orders, and account only.
+  // Called on a 30s polling interval from useTradingEngine.
+  fetchPositions: async () => {
+    const safeFetch = async <T>(url: string): Promise<T | null> => {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) return null;
+        return await res.json() as T;
+      } catch { return null; }
+    };
+
+    const [account, posData, ordData] = await Promise.all([
+      safeFetch<AlpacaAccountResponse>('http://localhost:8000/api/account'),
+      safeFetch<AlpacaPositionResponse[]>('http://localhost:8000/api/positions'),
+      safeFetch<AlpacaOrderResponse[]>('http://localhost:8000/api/orders'),
+    ]);
+
+    if (account) {
+      set({
+        accountEquity: parseFloat(account.equity) || null,
+        todayPnl:      account.today_pl      ?? null,
+        unrealizedPnl: account.unrealized_pl ?? null,
+      });
+    }
+
+    if (Array.isArray(posData)) {
+      const mapped: PositionData[] = posData.map(p => ({
+        id:            p.symbol,
+        symbol:        p.symbol,
+        side:          p.side.toUpperCase() as 'LONG' | 'SHORT',
+        size:          parseFloat(p.size),
+        entryPrice:    parseFloat(p.avg_entry_price ?? p.current_price),
+        markPrice:     parseFloat(p.current_price),
+        unrealizedPnl: parseFloat(p.unrealized_pnl),
+        realizedPnl:   0,
+      }));
+      set({ positions: mapped });
+    }
+
+    if (Array.isArray(ordData)) {
+      const mapped: TradeLog[] = ordData.map(o => ({
+        id:        o.id,
+        timestamp: new Date(o.submitted_at).getTime(),
+        side:      o.side.replace('OrderSide.', '').toUpperCase() as 'BUY' | 'SELL',
+        price:     parseFloat(o.fill_price ?? '0'),
+        size:      parseFloat(o.qty),
+        symbol:    o.symbol,
+        status:    (o.status === 'filled' ? 'filled' : o.status === 'canceled' ? 'cancelled' : 'pending') as import('@/lib/types').OrderStatus,
+      }));
+      set({ recentTrades: mapped });
+    }
+  },
+
+  // Refreshes the execution ledger from DB. Called on 60s interval.
+  fetchLedger: async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/ledger', { signal: AbortSignal.timeout(10000) });
+      if (res.ok) {
+        const ledger = await res.json();
+        if (Array.isArray(ledger)) set({ ledgerTrades: ledger });
+      }
+    } catch { /* silent fail */ }
   },
 
   // Real-time integration pipe for the Python FastAPI / Alpaca WebSocket bridge.
@@ -184,7 +260,13 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
       safeFetchJSON<any>('http://localhost:8000/api/performance')
     ]);
 
-    if (account) set({ accountEquity: parseFloat(account.equity) || null });
+    if (account) {
+      set({
+        accountEquity: parseFloat(account.equity) || null,
+        todayPnl:      account.today_pl      ?? null,
+        unrealizedPnl: account.unrealized_pl ?? null,
+      });
+    }
 
     if (Array.isArray(posData)) {
       const mapped: PositionData[] = posData.map(p => ({
@@ -266,6 +348,12 @@ export function useTradingEngine() {
           if (payload.type === 'QUOTE' || payload.type === 'TICK') {
             const { symbol, price, volume } = payload.data;
             useTradingStore.getState().injectSocketData(symbol, price, volume);
+          } else if (payload.type === 'SIGNAL') {
+            const d = payload.data as any;
+            const log = `[SIGNAL] ${d.bot_id?.toUpperCase()} ${d.action} ${d.symbol} qty=${Number(d.qty).toFixed(6)} conf=${d.confidence}`;
+            useTradingStore.setState(s => ({
+              botLogs: [...s.botLogs, log].slice(-100),
+            }));
           }
         } catch (err) {
           console.error('[ORCHESTRATOR] WebSocket message parse error', err);
@@ -297,9 +385,20 @@ export function useTradingEngine() {
       try {
         const data = JSON.parse(event.data);
         if (data.heartbeat) return; // ignore heartbeats
+
+        // Set aiInsights: prefer explicit insight field, fall back to text from
+        // observe/learn/scanner events (the backend never sends data.insight directly).
         if (data.insight) {
           useTradingStore.setState({ aiInsights: data.insight });
+        } else if (data.text && (data.type === 'observe' || data.type === 'learn' || data.type === 'scanner')) {
+          useTradingStore.setState({ aiInsights: data.text });
         }
+
+        // Scanner results update the scannerResults store slice
+        if (data.type === 'scanner' && Array.isArray(data.results)) {
+          useTradingStore.setState({ scannerResults: data.results });
+        }
+
         // All reflection types go to learningHistory (observe, calculate, decision, learning)
         if (data.type) {
           useTradingStore.setState(s => ({
@@ -349,10 +448,36 @@ export function useTradingEngine() {
       }
     }, 4000);
 
+    // Continuous polling — keep positions, orders, and ledger fresh
+    const pollPositions = setInterval(() => {
+      useTradingStore.getState().fetchPositions();
+    }, 30_000); // 30s — positions + orders + account
+
+    const pollLedger = setInterval(() => {
+      useTradingStore.getState().fetchLedger();
+    }, 60_000); // 60s — execution ledger from DB
+
+    // Poll watchlist scanner results every 5 min (matches backend scan cadence)
+    const pollWatchlist = setInterval(() => {
+      fetch('http://localhost:8000/api/watchlist')
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+        .catch(() => {});
+    }, 300_000); // 5 min
+
+    // Initial scanner load
+    fetch('http://localhost:8000/api/watchlist')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+      .catch(() => {});
+
     return () => {
       destroyed = true;
       clearTimeout(timer);
       clearTimeout(retry);
+      clearInterval(pollPositions);
+      clearInterval(pollLedger);
+      clearInterval(pollWatchlist);
       if (retryTimer.current) clearTimeout(retryTimer.current);
       wsRef.current?.close();
       reflectionsSSE.close();

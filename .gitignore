@@ -29,6 +29,7 @@ sessions/
 /coverage
 /test-results/
 /playwright-report/
+/.pytest_cache
 
 # next.js
 /.next/
@@ -61,3 +62,4 @@ next-env.d.ts
 .env.example
 backend/uvicorn.log
 backend/alpaca_quant.db
+backend/test_schema.db
