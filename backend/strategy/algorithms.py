@@ -71,6 +71,16 @@ class BaseStrategy:
     def _is_flat(self, symbol: str) -> bool:
         return self._position_state.get(symbol, FLAT) == FLAT
 
+    def update_params(self, params: dict) -> None:
+        """Safely mutate strategy configuration at runtime (called by AutonomousPortfolioDirector).
+        Only updates attributes that already exist on the instance."""
+        for key, val in params.items():
+            if hasattr(self, key):
+                setattr(self, key, val)
+                logger.info("[%s] param updated: %s = %s", self.name, key, val)
+            else:
+                logger.warning("[%s] update_params: unknown param %s (skipped)", self.name, key)
+
 
 # ---------------------------------------------------------------------------
 # Strategy 1: Momentum Alpha (EMA Crossover)

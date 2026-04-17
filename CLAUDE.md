@@ -1,7 +1,3 @@
-@AGENTS.md
-@DESIGN.md
-@MASTER_INSTRUCTIONS.md
-
 ## Project Definition
 
 Alpaca Quant Bot is a multi-agent quantitative trading system with an institutional-grade Next.js front-end and a Python/FastAPI multi-agent backend.
@@ -9,6 +5,7 @@ Alpaca Quant Bot is a multi-agent quantitative trading system with an institutio
 ---
 
 ## Core Rules
+DO NOT MAKE ANY VCHANGES UNTIL YOU HAVE 95% CONFIDENCE IN WHAT YOU NEED TO BUILD. ASK ME FOLLOW-UP QUESTIONS UNTIL YOU REACH THAT CONFIDENCE
 
 1. **Never use arbitrary border radiuses.** Adhere strictly to sharp corners or `rounded-sm`. Never use `rounded`, `rounded-md`, `rounded-lg`, `rounded-full`, or `rounded-[N]`.
 
@@ -42,40 +39,3 @@ Alpaca Quant Bot is a multi-agent quantitative trading system with an institutio
 
 
 ---
-
-## File Map (key locations)
-
-| File / Directory | Purpose |
-|-----------------|---------|
-| `src/lib/types.ts` | Canonical TypeScript type definitions (TickerData, TradeLog, PositionData, etc.) |
-| `src/lib/mock-data.ts` | Mock data constants — isolated, annotated, phase-tagged |
-| `src/lib/utils.ts` | `cn()` Tailwind merge utility |
-| `src/hooks/useMockTradingStream.ts` | Zustand store + WebSocket bridge |
-| `src/app/globals.css` | Design token CSS variables + scrollbar styles |
-| `src/components/ui/` | Primitive design system components (Card, Button, Badge, ValueTicker) |
-| `src/components/dashboard/` | 14 dashboard view components |
-| `backend/agents/orchestrator.py` | LLM Orchestrator engine |
-| `backend/agents/factory.py` | Agent factory / model tier selector |
-| `execution-plan.md` | 4-phase backend rollout with current completion status |
-| `DESIGN.md` | Full UI/UX design system specification (awesome-design-md format) |
-| `AGENTS.md` | Agent architecture, boundaries, and backend file map |
-
----
-
-## Available Skills
-
-These Claude Code skills are pre-loaded and directly applicable to this project. Invoke them when the task matches:
-
-| Skill | Invoke When |
-|-------|------------|
-| `trading-strategy-agents` | Building or extending the multi-agent orchestrator, risk agent, or execution agent |
-| `trading-ui-patterns` | Dashboard components, order panels, position tables, watchlist UI |
-| `risk-management` | Kill-switch logic, VaR computation, Kelly Criterion position sizing |
-| `realtime-websocket` | Zustand WebSocket bridge, Alpaca stream manager, SSE endpoints |
-| `charting-nivo` | Replacing SVG mock charts with real Nivo data-bound charts |
-| `performance-optimization` | Memoization of expensive renders, virtualization for trade tables |
-| `testing-playwright` | E2E tests for trading scenarios in `tests/dashboard.spec.ts` |
-| `ai-insights` | AI analysis cards, orchestrator chat UI, thought stream matrix |
-| `claude-api` | Optimizing Anthropic SDK usage, prompt caching in orchestrator |
-| `frontend-design` | New component design following the Kraken aesthetic |
-| `feature-dev` | Guided multi-step feature development with codebase analysis |

@@ -5,7 +5,8 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PlayCircle, DatabaseZap } from 'lucide-react';
-import { ResponsiveLine } from '@nivo/line';
+import { createChart, LineSeries } from 'lightweight-charts';
+import type { IChartApi, Time } from 'lightweight-charts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,9 +42,11 @@ export function BacktestRunner() {
   const [result,    setResult]    = React.useState<BacktestResult | null>(null);
   const [error,     setError]     = React.useState<string | null>(null);
 
-  const strategyRef  = React.useRef<HTMLSelectElement>(null);
-  const startDateRef = React.useRef<HTMLInputElement>(null);
-  const endDateRef   = React.useRef<HTMLInputElement>(null);
+  const strategyRef    = React.useRef<HTMLSelectElement>(null);
+  const startDateRef   = React.useRef<HTMLInputElement>(null);
+  const endDateRef     = React.useRef<HTMLInputElement>(null);
+  const chartContainer = React.useRef<HTMLDivElement>(null);
+  const chartRef       = React.useRef<IChartApi | null>(null);
 
   const handleRun = async () => {
     setRunning(true);
@@ -81,18 +84,52 @@ export function BacktestRunner() {
     }
   };
 
-  // Build Nivo line data from equity curve
-  const nivoData = React.useMemo(() => {
-    if (!result?.equity_curve?.length) return null;
-    return [
-      {
-        id: 'equity',
-        data: result.equity_curve.map(([ts, eq]) => ({
-          x: new Date(ts).toISOString().slice(0, 10),
-          y: eq,
-        })),
+  // Build lightweight-charts equity curve when result changes
+  React.useEffect(() => {
+    const el = chartContainer.current;
+    if (!el || !result?.equity_curve?.length) return;
+
+    // Destroy any previous chart instance
+    chartRef.current?.remove();
+
+    const chart = createChart(el, {
+      layout: {
+        background: { color: 'transparent' },
+        textColor:  'hsl(250,10%,65%)',
+        fontSize:   10,
+        fontFamily: 'JetBrains Mono, monospace',
       },
-    ];
+      grid: {
+        vertLines: { color: 'hsla(255,40%,40%,0.06)' },
+        horzLines: { color: 'hsla(255,40%,40%,0.06)' },
+      },
+      timeScale:       { borderColor: 'hsla(255,40%,40%,0.15)', timeVisible: true },
+      rightPriceScale: { borderColor: 'hsla(255,40%,40%,0.15)' },
+      autoSize: true,
+    });
+
+    const lineColor = result.net_profit >= 0 ? 'hsl(150,80%,45%)' : 'hsl(350,80%,60%)';
+    const line = chart.addSeries(LineSeries, {
+      color:            lineColor,
+      lineWidth:        2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
+    line.setData(
+      result.equity_curve.map(([ts, eq]) => ({
+        time:  Math.floor(ts / 1000) as Time,
+        value: eq,
+      })),
+    );
+
+    chart.timeScale().fitContent();
+    chartRef.current = chart;
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+    };
   }, [result]);
 
   const isComplete = !!result && !error;
@@ -223,43 +260,9 @@ export function BacktestRunner() {
           {/* Results */}
           {isComplete && result && (
             <div className="flex-1 flex flex-col p-4 gap-4">
-              {/* Equity curve chart */}
-              <div className="flex-1 min-h-[200px]">
-                {nivoData ? (
-                  <ResponsiveLine
-                    data={nivoData}
-                    margin={{ top: 10, right: 20, bottom: 40, left: 60 }}
-                    xScale={{ type: 'point' }}
-                    yScale={{ type: 'linear', min: 'auto', max: 'auto', stacked: false }}
-                    curve="monotoneX"
-                    axisBottom={{
-                      tickSize: 0,
-                      tickPadding: 8,
-                      tickRotation: -35,
-                      tickValues: 6,
-                    }}
-                    axisLeft={{
-                      tickSize: 0,
-                      tickPadding: 8,
-                      format: (v: number) => `$${(v / 1000).toFixed(0)}k`,
-                    }}
-                    enablePoints={false}
-                    enableGridX={false}
-                    enableGridY={true}
-                    gridYValues={5}
-                    colors={[result.net_profit >= 0 ? 'var(--neon-green)' : 'var(--neon-red)']}
-                    lineWidth={2}
-                    theme={{
-                      background: 'transparent',
-                      axis: {
-                        ticks: { text: { fill: 'var(--muted-foreground)', fontSize: 10 } },
-                      },
-                      grid: { line: { stroke: 'var(--border)', strokeWidth: 1 } },
-                    }}
-                    enableArea
-                    areaOpacity={0.08}
-                  />
-                ) : null}
+              {/* Equity curve — lightweight-charts LineSeries */}
+              <div className="flex-1 min-h-[200px] bg-[var(--background)]">
+                <div ref={chartContainer} className="w-full h-full" />
               </div>
 
               {/* KPI stat blocks */}

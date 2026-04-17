@@ -63,3 +63,4 @@ next-env.d.ts
 backend/uvicorn.log
 backend/alpaca_quant.db
 backend/test_schema.db
+backend/_entry_prices.json

@@ -27,6 +27,13 @@ interface RealizedPnlData {
   total_closed:   number;
 }
 
+interface AccountData {
+  equity:            number;
+  buying_power:      number;
+  cash:              number;
+  long_market_value: number;
+}
+
 // ---------------------------------------------------------------------------
 // KPI Summary Row
 // ---------------------------------------------------------------------------
@@ -94,6 +101,7 @@ export function TradeLedger() {
   const fetchLedger  = useTradingStore(s => s.fetchLedger);
 
   const [realizedData, setRealizedData]   = React.useState<RealizedPnlData | null>(null);
+  const [accountData, setAccountData]     = React.useState<AccountData | null>(null);
   const [lastRefresh, setLastRefresh]     = React.useState<Date | null>(null);
   const [refreshing, setRefreshing]       = React.useState(false);
   const [mounted, setMounted]             = React.useState(false);
@@ -113,6 +121,18 @@ export function TradeLedger() {
     } catch { /* silent */ }
   }, []);
 
+  const loadAccountData = React.useCallback(async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/account', {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAccountData(data);
+      }
+    } catch { /* silent */ }
+  }, []);
+
   const handleRefresh = async () => {
     setRefreshing(true);
     await Promise.all([fetchLedger(), loadRealizedPnl()]);
@@ -125,6 +145,13 @@ export function TradeLedger() {
     const interval = setInterval(loadRealizedPnl, 60_000);
     return () => clearInterval(interval);
   }, [loadRealizedPnl]);
+
+  // Account balance — initial load + 60s auto-refresh
+  React.useEffect(() => {
+    loadAccountData();
+    const interval = setInterval(loadAccountData, 60_000);
+    return () => clearInterval(interval);
+  }, [loadAccountData]);
 
   // Build a queue of realized trades per bot+symbol, matched FIFO to SELL rows in the ledger.
   // ledgerTrades is ordered newest-first; realized trades are ordered chronologically.
@@ -198,6 +225,23 @@ export function TradeLedger() {
           </button>
         </div>
       </CardHeader>
+
+      {/* Account Balance Strip */}
+      <div className="grid grid-cols-4 divide-x divide-[var(--border)] border-b border-[var(--border)] shrink-0 bg-[var(--panel-muted)]/20">
+        {[
+          { label: 'Equity',        value: accountData?.equity,            color: 'text-[var(--foreground)]' },
+          { label: 'Buying Power',  value: accountData?.buying_power,      color: 'text-[var(--foreground)]' },
+          { label: 'Cash',          value: accountData?.cash,              color: 'text-[var(--foreground)]' },
+          { label: 'Long Mkt Val',  value: accountData?.long_market_value, color: 'text-[var(--neon-green)]' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="flex flex-col px-4 py-2">
+            <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider mb-0.5 leading-none">{label}</span>
+            <span className={`text-sm font-mono tabular-nums font-bold leading-snug ${color}`}>
+              {value != null ? `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}
+            </span>
+          </div>
+        ))}
+      </div>
 
       {/* KPI Summary */}
       <KpiSummary data={realizedData} ledgerCount={ledgerTrades.length} />

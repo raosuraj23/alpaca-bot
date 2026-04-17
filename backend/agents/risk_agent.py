@@ -78,7 +78,7 @@ class RiskAgent:
                 passed=False, reason=reason,
                 kelly_fraction=0.0, recommended_notional=0.0, recommended_qty=0.0,
                 var_check_passed=False, var_limit=0.0,
-            )
+            )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 
         # --- 3. Position sizing ---
         sizing: SizingResult = exposure_manager.size(signal, account_equity)

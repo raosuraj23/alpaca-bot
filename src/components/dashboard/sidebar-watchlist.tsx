@@ -18,16 +18,11 @@ interface ScanResult {
 
 export function SidebarWatchlist() {
   const { watchlist, activeSymbol, setActiveSymbol, assetClass } = useTradingStore();
-  const [scanResults, setScanResults] = React.useState<ScanResult[]>([]);
+  // scannerResults is kept live by the SSE stream in useTradingStream.ts —
+  // "scanner" events from the backend update it automatically every 5 min.
+  const scanResults = useTradingStore(s => s.scannerResults) as ScanResult[];
   const [scanning, setScanning] = React.useState(false);
   const [scanError, setScanError] = React.useState(false);
-
-  React.useEffect(() => {
-    fetch('http://localhost:8000/api/watchlist')
-      .then(r => r.ok ? r.json() : [])
-      .then(d => { if (Array.isArray(d) && d.length > 0) setScanResults(d); })
-      .catch(() => {});
-  }, []);
 
   const triggerScan = async () => {
     setScanning(true);
@@ -35,7 +30,10 @@ export function SidebarWatchlist() {
     try {
       const res = await fetch('http://localhost:8000/api/watchlist/scan', { method: 'POST' });
       const data = await res.json();
-      if (data?.results) setScanResults(data.results);
+      // Write directly into the shared Zustand store so all consumers update
+      if (Array.isArray(data?.results)) {
+        useTradingStore.setState({ scannerResults: data.results });
+      }
     } catch {
       setScanError(true);
     } finally {

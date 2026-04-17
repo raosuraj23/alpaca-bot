@@ -257,8 +257,14 @@ class OrchestratorEngine:
                     action, target_bot, params)
 
         if action == "HALT_BOT":
-            if target_bot:
-                reason = params.get("reason", "Orchestrator halt command")
+            reason = params.get("reason", "Orchestrator halt command")
+            if str(target_bot).lower() in ("all", "*"):
+                results_map = {}
+                for bot_id in list(master_engine.bots.keys()):
+                    results_map[bot_id] = master_engine.halt_bot(bot_id, reason=reason)
+                logger.info("[ORCHESTRATOR] HALT_BOT all → %s", results_map)
+                return {"halted": list(results_map.keys()), "count": len(results_map)}
+            elif target_bot:
                 success = master_engine.halt_bot(target_bot, reason=reason)
                 logger.info("[ORCHESTRATOR] HALT_BOT → %s success=%s", target_bot, success)
             else:
@@ -284,6 +290,29 @@ class OrchestratorEngine:
             logger.info("[ORCHESTRATOR] QUERY_RISK → %s", status)
             return status
 
+        elif action == "QUERY_POSITIONS":
+            try:
+                from agents.execution_agent import _get_trading_client
+                tc = _get_trading_client()
+                if not tc:
+                    return {"error": "Trading client unavailable"}
+                positions = tc.get_all_positions()
+                result = [
+                    {
+                        "symbol":       p.symbol,
+                        "qty":          str(p.qty),
+                        "unrealized_pl": str(p.unrealized_pl),
+                        "current_price": str(p.current_price),
+                        "side":         str(p.side),
+                    }
+                    for p in positions
+                ]
+                logger.info("[ORCHESTRATOR] QUERY_POSITIONS → %d positions", len(result))
+                return {"positions": result, "count": len(result)}
+            except Exception as exc:
+                logger.error("[ORCHESTRATOR] QUERY_POSITIONS failed: %s", exc)
+                return {"error": str(exc)}
+
         elif action == "PLACE_ORDER":
             return self._place_order(params)
 
@@ -291,6 +320,16 @@ class OrchestratorEngine:
             logger.warning("[ORCHESTRATOR] Unknown action: %s", action)
 
         return None
+
+    def _parse_qty(self, qty_raw, portfolio_value: float) -> float:
+        """Parse qty which may be a float, int, or percentage string like '100%'."""
+        if isinstance(qty_raw, str) and qty_raw.strip().endswith('%'):
+            fraction = float(qty_raw.strip().rstrip('%')) / 100.0
+            return round(portfolio_value * fraction, 8)
+        try:
+            return float(qty_raw)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _place_order(self, params: dict) -> dict:
         """
@@ -303,10 +342,22 @@ class OrchestratorEngine:
         from agents.risk_agent import risk_agent
         from agents.execution_agent import execution_agent, _get_trading_client
 
-        symbol = params.get("symbol", "BTC/USD")
-        side   = params.get("side", "BUY").upper()
-        qty    = float(params.get("qty", 0.0))
-        reason = params.get("reason", "orchestrator manual order")
+        symbol   = params.get("symbol", "BTC/USD")
+        side     = params.get("side", "BUY").upper()
+        qty_raw  = params.get("qty", 0.0)
+        reason   = params.get("reason", "orchestrator manual order")
+
+        # Fetch equity early so we can parse percentage quantities
+        equity = 0.0
+        try:
+            from agents.execution_agent import _get_trading_client
+            tc = _get_trading_client()
+            if tc:
+                equity = float(tc.get_account().equity)
+        except Exception:
+            pass
+
+        qty = self._parse_qty(qty_raw, equity)
 
         if qty <= 0:
             logger.warning("[ORCHESTRATOR] PLACE_ORDER rejected — qty must be > 0")
@@ -323,15 +374,6 @@ class OrchestratorEngine:
             "bot":        "orchestrator",
             "meta":       {"reason": reason, "source": "manual"},
         }
-
-        # Fetch current equity for kill-switch evaluation
-        equity = 0.0
-        try:
-            tc = _get_trading_client()
-            if tc:
-                equity = float(tc.get_account().equity)
-        except Exception:
-            pass
 
         # Enforce kill switch + position sizing via RiskAgent
         approved = risk_agent.process(synthetic_signal, equity)

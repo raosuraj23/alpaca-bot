@@ -161,6 +161,7 @@ class ExecutionAgent:
                 confidence=approved_signal.get("confidence", 0.0),
                 order_id=order_id,
                 fill_price=fill_price,
+                qty=qty,
                 slippage=slippage,
                 status="FILLED",
                 failure_reason=None,
@@ -203,7 +204,8 @@ class ExecutionAgent:
         confidence: float,
         order_id: str | None,
         fill_price: float,
-        slippage: float,
+        qty: float = 1.0,
+        slippage: float = 0.0,
         status: str = "FILLED",
         failure_reason: str | None = None,
     ):
@@ -222,6 +224,7 @@ class ExecutionAgent:
                     confidence=confidence,
                     order_id=order_id,
                     fill_price=fill_price,
+                    qty=qty,
                     slippage=slippage,
                     status=status,
                     failure_reason=failure_reason,
@@ -238,9 +241,10 @@ class ExecutionAgent:
         confidence: float,
         order_id: str | None,
         fill_price: float,
-        slippage: float,
-        status: str,
-        failure_reason: str | None,
+        qty: float = 1.0,
+        slippage: float = 0.0,
+        status: str = "FILLED",
+        failure_reason: str | None = None,
     ):
         """Writes a SignalRecord and linked ExecutionRecord to SQLite."""
         try:
@@ -262,6 +266,7 @@ class ExecutionAgent:
                     signal_id=sig.id,
                     alpaca_order_id=order_id,
                     fill_price=fill_price,
+                    qty=qty,
                     slippage=slippage,
                     status=status,
                     failure_reason=failure_reason,

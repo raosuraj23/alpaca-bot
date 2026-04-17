@@ -3,7 +3,11 @@
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BarChart3, PieChart, ShieldAlert, TrendingUp, TrendingDown, Activity } from 'lucide-react';
-import { ResponsiveLine } from '@nivo/line';
+import {
+  createChart, CandlestickSeries, LineSeries, HistogramSeries,
+  CrosshairMode, createSeriesMarkers,
+} from 'lightweight-charts';
+import type { IChartApi, ISeriesApi, ISeriesMarkersPluginApi, SeriesMarker, Time } from 'lightweight-charts';
 import { useTradingStore } from '@/hooks/useTradingStream';
 
 // ---------------------------------------------------------------------------
@@ -382,7 +386,7 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
 
       {/* Daily breakdown table */}
       {data.daily_rows && data.daily_rows.length > 0 && (
-        <div className="mt-2 overflow-y-auto max-h-[120px] rounded-sm border border-[var(--border)]">
+        <div className="mt-2 rounded-sm border border-[var(--border)]">
           <table className="w-full text-xs tabular-nums font-mono">
             <thead className="sticky top-0 bg-[var(--panel-muted)]">
               <tr className="text-[var(--muted-foreground)] border-b border-[var(--border)]">
@@ -422,12 +426,174 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
 }
 
 // ---------------------------------------------------------------------------
-// Nivo P&L Curve — Robinhood/TradingView style
+// RSI helper
 // ---------------------------------------------------------------------------
 
-function PnLCurve({ history, netPnl }: { history: [number, number][]; netPnl: number }) {
-  const isUp = netPnl >= 0;
-  const lineColor = isUp ? 'hsl(150,80%,45%)' : 'hsl(350,80%,60%)';
+function computeRsi(values: number[], period = 14): (number | null)[] {
+  const result: (number | null)[] = new Array(values.length).fill(null);
+  if (values.length <= period) return result;
+  const changes = values.slice(1).map((v, i) => v - values[i]);
+  let avgGain = changes.slice(0, period).filter(c => c > 0).reduce((s, c) => s + c, 0) / period;
+  let avgLoss = changes.slice(0, period).filter(c => c < 0).reduce((s, c) => s + Math.abs(c), 0) / period;
+  for (let i = period; i < values.length; i++) {
+    const change = changes[i - 1];
+    avgGain = (avgGain * (period - 1) + (change > 0 ? change : 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + (change < 0 ? Math.abs(change) : 0)) / period;
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    result[i] = 100 - 100 / (1 + rs);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// TradingChart — lightweight-charts split-pane: candlestick + EMA (top),
+// volume histogram + RSI (bottom). Signal annotations via createSeriesMarkers.
+// ---------------------------------------------------------------------------
+
+type OHLCVCandle = { time: number; open: number; high: number; low: number; close: number; volume: number };
+
+function TradingChart({ history, lastSignal, ohlcv }: {
+  history:    [number, number][];
+  lastSignal: { action: string; symbol: string; timestamp: string } | null;
+  ohlcv?:     OHLCVCandle[];
+}) {
+  const containerRef  = React.useRef<HTMLDivElement>(null);
+  const chartRef      = React.useRef<IChartApi | null>(null);
+  const candleRef     = React.useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const markersRef    = React.useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+
+  // Rebuild chart when history or real OHLCV changes
+  React.useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !history || history.length < 2) return;
+
+    const H = el.clientHeight || 260;
+
+    const chart = createChart(el, {
+      layout: {
+        background: { color: 'transparent' },
+        textColor:  'hsl(250,10%,65%)',
+        fontSize:   10,
+        fontFamily: 'JetBrains Mono, monospace',
+      },
+      grid: {
+        vertLines: { color: 'hsla(255,40%,40%,0.06)' },
+        horzLines: { color: 'hsla(255,40%,40%,0.06)' },
+      },
+      crosshair:       { mode: CrosshairMode.Normal },
+      timeScale:       { borderColor: 'hsla(255,40%,40%,0.15)', timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: 'hsla(255,40%,40%,0.15)' },
+      height:          H,
+      autoSize:        true,
+    });
+
+    // Add second pane for volume/RSI
+    chart.addPane();
+    const panes = chart.panes();
+    panes[0].setHeight(Math.floor(H * 0.68));
+    panes[1].setHeight(Math.floor(H * 0.32));
+
+    // Use real OHLCV bars when available; fall back to synthesizing from equity snapshots
+    const candles = ohlcv && ohlcv.length > 0
+      ? ohlcv.map(c => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close }))
+      : history.map(([ts, val], i) => ({
+          time:  Math.floor(ts / 1000) as Time,
+          open:  i === 0 ? val : history[i - 1][1],
+          high:  Math.max(val, i === 0 ? val : history[i - 1][1]) * 1.001,
+          low:   Math.min(val, i === 0 ? val : history[i - 1][1]) * 0.999,
+          close: val,
+        }));
+
+    const volumes = ohlcv && ohlcv.length > 0
+      ? ohlcv.map((c, i) => ({
+          time:  c.time as Time,
+          value: c.volume,
+          color: i > 0 && c.close >= ohlcv[i - 1].close
+            ? 'hsla(150,80%,45%,0.35)'
+            : 'hsla(350,80%,60%,0.35)',
+        }))
+      : history.map(([ts, val], i) => ({
+          time:  Math.floor(ts / 1000) as Time,
+          value: i === 0 ? 0 : Math.abs(val - history[i - 1][1]),
+          color: i > 0 && val >= history[i - 1][1]
+            ? 'hsla(150,80%,45%,0.35)'
+            : 'hsla(350,80%,60%,0.35)',
+        }));
+
+    // Candlestick series — pane 0
+    const cSeries = chart.addSeries(CandlestickSeries, {
+      upColor:        'hsl(150,80%,45%)',
+      downColor:      'hsl(350,80%,60%)',
+      borderUpColor:  'hsl(150,80%,45%)',
+      borderDownColor:'hsl(350,80%,60%)',
+      wickUpColor:    'hsl(150,80%,45%)',
+      wickDownColor:  'hsl(350,80%,60%)',
+    }, 0);
+    cSeries.setData(candles);
+
+    // EMA overlay — pane 0
+    const EMA_PERIOD = 14;
+    const emaData: { time: Time; value: number }[] = [];
+    let ema = history[0]?.[1] ?? 0;
+    const k = 2 / (EMA_PERIOD + 1);
+    history.forEach(([ts, val]) => {
+      ema = val * k + ema * (1 - k);
+      emaData.push({ time: Math.floor(ts / 1000) as Time, value: ema });
+    });
+    const emaSeries = chart.addSeries(LineSeries, {
+      color:            'hsl(264,80%,75%)',
+      lineWidth:        1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    }, 0);
+    emaSeries.setData(emaData);
+
+    // Volume histogram — pane 1
+    const volSeries = chart.addSeries(HistogramSeries, {
+      color:            'hsla(264,80%,65%,0.35)',
+      priceLineVisible: false,
+      lastValueVisible: false,
+    }, 1);
+    volSeries.setData(volumes);
+
+    // RSI line — pane 1
+    const rsiValues = computeRsi(history.map(([, v]) => v));
+    const rsiData = history
+      .map(([ts], i) => ({ time: Math.floor(ts / 1000) as Time, value: rsiValues[i] }))
+      .filter((d): d is { time: Time; value: number } => d.value !== null);
+    const rsiSeries = chart.addSeries(LineSeries, {
+      color:            'hsl(40,90%,55%)',
+      lineWidth:        1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    }, 1);
+    rsiSeries.setData(rsiData);
+
+    chartRef.current  = chart;
+    candleRef.current = cSeries;
+    markersRef.current = createSeriesMarkers(cSeries, []);
+
+    return () => {
+      chart.remove();
+      chartRef.current   = null;
+      candleRef.current  = null;
+      markersRef.current = null;
+    };
+  }, [history, ohlcv]);
+
+  // Signal annotation — fires when lastSignal changes
+  React.useEffect(() => {
+    if (!lastSignal || !markersRef.current) return;
+    const prev = markersRef.current.markers() ?? [];
+    const marker: SeriesMarker<Time> = {
+      time:     Math.floor(new Date(lastSignal.timestamp).getTime() / 1000) as Time,
+      position: lastSignal.action === 'BUY' ? 'belowBar' : 'aboveBar',
+      color:    lastSignal.action === 'BUY' ? 'hsl(150,80%,45%)' : 'hsl(350,80%,60%)',
+      shape:    lastSignal.action === 'BUY' ? 'arrowUp' : 'arrowDown',
+      text:     `${lastSignal.action} ${lastSignal.symbol}`,
+    };
+    markersRef.current.setMarkers([...prev, marker]);
+  }, [lastSignal]);
 
   if (!history || history.length < 2) {
     return (
@@ -440,89 +606,82 @@ function PnLCurve({ history, netPnl }: { history: [number, number][]; netPnl: nu
     );
   }
 
-  // Pass Date objects — Nivo format:'native' requires real Date, not strings.
-  // JavaScript Date always displays in local timezone, so UTC→local is automatic.
-  const nivoData = [{
-    id: 'pnl',
-    data: history.map(([ts, val]) => ({
-      x: new Date(ts),   // Date object: local time for display
-      y: val,
-    })),
-  }];
+  return (
+    <div className="relative w-full h-full">
+      <div ref={containerRef} className="w-full h-full" />
+      {!ohlcv?.length && (
+        <div className="absolute top-2 right-2 z-10 text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-wider pointer-events-none">
+          SYNTHETIC
+        </div>
+      )}
+    </div>
+  );
+}
 
-  const values = history.map(([, v]) => v);
-  const minVal = Math.min(...values);
-  const maxVal = Math.max(...values);
-  const padding = (maxVal - minVal) * 0.1 || 1;
+// ---------------------------------------------------------------------------
+// Tear Sheet Sidebar — Sharpe, Sortino, Drawdown, Win Rate, Active Bots
+// ---------------------------------------------------------------------------
 
-  const fmtY = (v: number) =>
-    v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v <= -1000 ? `-$${(Math.abs(v) / 1000).toFixed(1)}k` : `$${v.toFixed(0)}`;
+function TearSheet({ perfData, bots, winRate }: {
+  perfData: any;
+  bots:     any[];
+  winRate:  number | null;
+}) {
+  const activeBots = bots.filter((b: any) => b.status === 'ACTIVE').length;
+  const drawdown   = perfData.drawdown ?? 0;
+  const netPnl     = perfData.net_pnl  ?? 0;
+  // Sharpe & Sortino sourced from backend /api/performance (annualised, sqrt(252))
+  const sharpe  = perfData.sharpe  ?? 0;
+  const sortino = perfData.sortino ?? 0;
 
-  const fmtTime = (d: Date) => {
-    if (!(d instanceof Date) || isNaN(d.getTime())) return '';
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
+  const rows = [
+    {
+      label: 'Net PnL',
+      value: perfData.has_data ? `${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}` : '—',
+      color: netPnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
+    },
+    {
+      label: 'Max Drawdown',
+      value: `${drawdown.toFixed(3)}%`,
+      color: drawdown >= 1.5 ? 'text-[var(--neon-red)]' : 'text-[var(--foreground)]',
+    },
+    {
+      label: 'Sharpe',
+      value: perfData.has_data ? sharpe.toFixed(2) : '—',
+      color: 'text-[var(--foreground)]',
+    },
+    {
+      label: 'Sortino',
+      value: perfData.has_data ? sortino.toFixed(2) : '—',
+      color: sortino >= 1 ? 'text-[var(--neon-green)]' : 'text-[var(--foreground)]',
+    },
+    {
+      label: 'Win Rate',
+      value: winRate != null ? `${winRate.toFixed(0)}%` : '—',
+      color: winRate != null
+        ? (winRate >= 50 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]')
+        : 'text-[var(--muted-foreground)]',
+    },
+    {
+      label: 'Active Bots',
+      value: String(activeBots),
+      color: activeBots > 0 ? 'text-[var(--neon-green)]' : 'text-[var(--muted-foreground)]',
+    },
+  ];
 
   return (
-    <ResponsiveLine
-      data={nivoData}
-      margin={{ top: 10, right: 16, bottom: 28, left: 56 }}
-      xScale={{ type: 'time', format: 'native', precision: 'minute' }}
-      yScale={{ type: 'linear', min: minVal - padding, max: maxVal + padding }}
-      axisBottom={{
-        tickValues: 5,
-        tickSize: 0,
-        tickPadding: 6,
-        format: (v: Date) => fmtTime(v),
-      }}
-      axisLeft={{
-        tickSize: 0,
-        tickPadding: 8,
-        tickValues: 4,
-        format: (v: number) => fmtY(v),
-      }}
-      enableGridX={false}
-      gridYValues={4}
-      theme={{
-        axis: {
-          ticks: { text: { fill: 'hsla(250,10%,65%,0.6)', fontSize: 9, fontFamily: 'monospace' } },
-        },
-        grid: { line: { stroke: 'hsla(255,40%,40%,0.10)', strokeWidth: 1 } },
-        crosshair: { line: { stroke: 'hsla(255,40%,70%,0.4)', strokeWidth: 1, strokeDasharray: '4 4' } },
-        tooltip: {
-          container: {
-            background: 'hsl(255,20%,10%)',
-            border: '1px solid hsla(255,40%,40%,0.3)',
-            borderRadius: 2,
-            padding: '4px 8px',
-            fontSize: 11,
-            fontFamily: 'monospace',
-            color: 'hsl(210,20%,95%)',
-          },
-        },
-      }}
-      colors={[lineColor]}
-      lineWidth={2}
-      enablePoints={false}
-      enableArea={true}
-      areaOpacity={0.12}
-      useMesh={true}
-      crosshairType="x"
-      tooltip={({ point }) => {
-        const d = point.data.x as Date;
-        const localTime = d instanceof Date && !isNaN(d.getTime())
-          ? d.toLocaleString()
-          : String(point.data.xFormatted);
-        return (
-          <div className="text-xs font-mono tabular-nums">
-            <span className="opacity-60 mr-2">{localTime}</span>
-            <span style={{ color: lineColor }} className="font-bold">
-              ${Number(point.data.y).toFixed(2)}
-            </span>
-          </div>
-        );
-      }}
-    />
+    <div className="w-40 shrink-0 flex flex-col gap-0 border-l border-[var(--border)] divide-y divide-[var(--border)]/40">
+      {rows.map(row => (
+        <div key={row.label} className="flex flex-col px-3 py-2.5">
+          <span className="text-xs uppercase tracking-wider text-[var(--muted-foreground)] mb-0.5 leading-none">
+            {row.label}
+          </span>
+          <span className={`text-sm font-mono tabular-nums font-bold leading-snug ${row.color}`}>
+            {row.value}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -534,12 +693,15 @@ const PERIODS = ['1D', '1W', '1M', 'YTD'] as const;
 type Period = typeof PERIODS[number];
 
 export function PerformanceMetrics() {
-  const performance   = useTradingStore(s => s.performance);
-  const riskStatus    = useTradingStore(s => s.riskStatus);
-  const bots          = useTradingStore(s => s.bots);
-  const todayPnl      = useTradingStore(s => s.todayPnl);
-  const unrealizedPnl = useTradingStore(s => s.unrealizedPnl);
-  const positions     = useTradingStore(s => s.positions);
+  const performance    = useTradingStore(s => s.performance);
+  const riskStatus     = useTradingStore(s => s.riskStatus);
+  const bots           = useTradingStore(s => s.bots);
+  const todayPnl       = useTradingStore(s => s.todayPnl);
+  const unrealizedPnl  = useTradingStore(s => s.unrealizedPnl);
+  const positions      = useTradingStore(s => s.positions);
+  const ohlcvData      = useTradingStore(s => s.ohlcvData);
+  const fetchOHLCV     = useTradingStore(s => s.fetchOHLCV);
+  const lastSignal    = useTradingStore(s => s.lastSignal);
 
   const [period, setPeriod] = React.useState<Period>('1M');
   const [perfData, setPerfData] = React.useState(performance);
@@ -562,6 +724,11 @@ export function PerformanceMetrics() {
     if (performance.has_data) setPerfData(performance);
   }, [performance]);
 
+  // Fetch real OHLCV once on mount; refresh when period changes
+  React.useEffect(() => {
+    fetchOHLCV('BTC/USD', '1H');
+  }, [fetchOHLCV]);
+
   React.useEffect(() => {
     const load = () =>
       fetch(`http://localhost:8000/api/analytics/llm-cost?period=${period}`)
@@ -573,23 +740,16 @@ export function PerformanceMetrics() {
     return () => clearInterval(interval);
   }, [period]);
 
-  const drawdown    = perfData.drawdown ?? riskStatus?.drawdown_pct ?? 0;
-  const killActive  = riskStatus?.triggered ?? false;
+  // Win rate — closed realized trades where pnl > 0 (not equity day-count)
+  const winRate = React.useMemo(() => {
+    const trades = perfData.realized_trades as { pnl: number }[] | undefined;
+    if (!trades || trades.length === 0) return null;
+    const wins = trades.filter((t: { pnl: number }) => t.pnl > 0).length;
+    return (wins / trades.length) * 100;
+  }, [perfData.realized_trades]);
 
-  // Annualization factor depends on the bar frequency for each period
-  // 1D = 1-minute bars (390/day), 1W/1M/YTD = daily bars
-  const sharpeAnnFactor = period === '1D' ? Math.sqrt(252 * 390) : Math.sqrt(252);
-
-  const sharpeApprox = React.useMemo(() => {
-    if (!perfData.history || perfData.history.length < 5) return null;
-    const returns = perfData.history.slice(1).map(([, v]: [number, number], i: number) => {
-      const prev = perfData.history[i][1];
-      return prev !== 0 ? (v - prev) / prev : 0;
-    });
-    const mean = returns.reduce((a: number, b: number) => a + b, 0) / returns.length;
-    const std = Math.sqrt(returns.reduce((s: number, r: number) => s + (r - mean) ** 2, 0) / returns.length);
-    return std > 0 ? (mean / std * sharpeAnnFactor).toFixed(2) : null;
-  }, [perfData.history, sharpeAnnFactor]);
+  const drawdown   = perfData.drawdown ?? riskStatus?.drawdown_pct ?? 0;
+  const killActive = riskStatus?.triggered ?? false;
 
   // Compute unrealized P&L total from live positions as fallback when account doesn't supply it
   const positionsUnrealizedPnl = React.useMemo(
@@ -623,8 +783,8 @@ export function PerformanceMetrics() {
     },
     {
       label: 'Sharpe Ratio',
-      value: sharpeApprox ?? (performance.has_data ? 'N/A' : '—'),
-      sub: 'Annualised',
+      value: perfData.has_data ? (perfData.sharpe ?? 0).toFixed(2) : '—',
+      sub: 'Annualised √252',
       c: 'text-[var(--foreground)]',
     },
     {
@@ -658,11 +818,11 @@ export function PerformanceMetrics() {
   ];
 
   return (
-    <div className="flex flex-col h-full gap-4 overflow-y-auto pr-2 pb-4">
+    <div className="flex flex-col h-full gap-4 pr-2 pb-4">
 
       {/* Kill Switch Alert Banner */}
       {killActive && (
-        <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg border border-[var(--neon-red)]/60 bg-[var(--neon-red)]/10 text-[var(--neon-red)] text-xs font-bold uppercase tracking-widest animate-pulse shrink-0">
+        <div className="flex items-center gap-3 px-4 py-2.5 rounded-sm border border-[var(--neon-red)]/60 bg-[var(--neon-red)]/10 text-[var(--neon-red)] text-xs font-bold uppercase tracking-widest animate-pulse shrink-0">
           <ShieldAlert className="w-4 h-4 shrink-0" />
           Kill Switch Active — {riskStatus?.reason ?? 'Trading Halted'}
         </div>
@@ -687,8 +847,8 @@ export function PerformanceMetrics() {
         ))}
       </div>
 
-      {/* ── Row 1: P&L Curve — Robinhood/TradingView style ── */}
-      <Card className="shrink-0 flex flex-col h-[280px]">
+      {/* ── Row 1: TradingView Chart — split-pane candlestick + volume/RSI ── */}
+      <Card className="shrink-0 flex flex-col h-[320px]">
         <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
             {(perfData.net_pnl ?? 0) >= 0
@@ -697,14 +857,13 @@ export function PerformanceMetrics() {
             }
             <div className="flex flex-col">
               <CardTitle className="text-xs tracking-wider uppercase font-semibold text-[var(--muted-foreground)]">
-                Net P&amp;L
+                Equity Curve
               </CardTitle>
               <span className={`text-lg font-mono tabular-nums font-bold leading-tight ${(perfData.net_pnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
                 {(perfData.net_pnl ?? 0) >= 0 ? '+' : ''}${(perfData.net_pnl ?? 0).toFixed(2)}
               </span>
             </div>
           </div>
-          {/* Period selector — drives P&L curve, returns, AND LLM cost */}
           <div className="flex items-center gap-1">
             {PERIODS.map(p => (
               <button
@@ -721,10 +880,18 @@ export function PerformanceMetrics() {
             ))}
           </div>
         </CardHeader>
-        <CardContent className="flex-1 p-0 bg-[var(--background)]">
-          <PnLCurve
-            history={perfData.history as [number, number][]}
-            netPnl={perfData.net_pnl ?? 0}
+        <CardContent className="flex-1 p-0 bg-[var(--background)] flex overflow-hidden">
+          <div className="flex-1 min-w-0 overflow-hidden">
+            <TradingChart
+              history={perfData.history as [number, number][]}
+              lastSignal={lastSignal}
+              ohlcv={ohlcvData?.candles}
+            />
+          </div>
+          <TearSheet
+            perfData={perfData}
+            bots={bots}
+            winRate={winRate}
           />
         </CardContent>
       </Card>
@@ -740,7 +907,7 @@ export function PerformanceMetrics() {
               Strategy Attribution
             </CardTitle>
           </CardHeader>
-          <CardContent className="flex-1 p-3 flex flex-col gap-2.5 overflow-y-auto">
+          <CardContent className="flex-1 p-3 flex flex-col gap-2.5">
             {bots.length === 0 ? (
               <div className="text-xs text-[var(--muted-foreground)] opacity-50 italic">
                 Connecting to strategy engine...
@@ -804,7 +971,7 @@ export function PerformanceMetrics() {
               Bot Performance Matrix
             </CardTitle>
           </CardHeader>
-          <CardContent className="flex-1 overflow-y-auto p-0">
+          <CardContent className="flex-1 p-0">
             {bots.length === 0 ? (
               <div className="flex items-center justify-center h-full text-xs text-[var(--muted-foreground)] opacity-40">
                 Connecting...

@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter } from 'lucide-react';
+import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot } from 'lucide-react';
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
 
@@ -34,10 +34,11 @@ interface ReflectionEntry {
 
 // Reflection type → visual style mapping
 const TYPE_STYLES: Record<string, { icon: typeof Zap; label: string; color: string; border: string; bg: string }> = {
-  observe:   { icon: Eye,            label: 'OBSERVE',   color: 'text-purple-400',  border: 'border-purple-500/30',    bg: 'bg-purple-500/5' },
-  calculate: { icon: Calculator,     label: 'POSITION',  color: 'text-blue-400',    border: 'border-blue-500/30',      bg: 'bg-blue-500/5' },
-  decision:  { icon: Zap,            label: 'DECISION',  color: 'text-[var(--neon-green)]',  border: 'border-[var(--neon-green)]/40', bg: 'bg-[var(--neon-green)]/5' },
-  learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-amber-400',   border: 'border-amber-500/30',     bg: 'bg-amber-500/5' },
+  observe:   { icon: Eye,            label: 'OBSERVE',   color: 'text-purple-400',                    border: 'border-purple-500/30',                bg: 'bg-purple-500/5' },
+  calculate: { icon: Calculator,     label: 'POSITION',  color: 'text-blue-400',                      border: 'border-blue-500/30',                  bg: 'bg-blue-500/5' },
+  decision:  { icon: Zap,            label: 'DECISION',  color: 'text-[var(--neon-green)]',           border: 'border-[var(--neon-green)]/40',       bg: 'bg-[var(--neon-green)]/5' },
+  learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-amber-400',                     border: 'border-amber-500/30',                 bg: 'bg-amber-500/5' },
+  director:  { icon: Bot,            label: 'DIRECTOR',  color: 'text-[var(--kraken-light)]',         border: 'border-[var(--kraken-purple)]/50',    bg: 'bg-[var(--kraken-purple)]/8' },
 };
 
 function getTypeStyle(type: string | undefined) {
@@ -58,6 +59,14 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
   const time = formatTimestamp(r.timestamp);
   const strategy = r.strategy ?? 'system';
   const symbol = r.symbol ?? '';
+
+  // Director autonomous action events
+  if (r.type === 'director') {
+    const entry = r as ReflectionEntry & { action?: string; target_bot?: string; success?: boolean };
+    const status = entry.success === false ? '✗' : '✓';
+    const text = `[${status}] ${entry.action ?? 'ACTION'} → ${(entry as any).target_bot ?? 'portfolio'}: ${r.reason ?? ''}`;
+    return { time, type: 'director', text, strategy: 'director', symbol: (entry as any).target_bot ?? '' };
+  }
 
   // If the reflection has a pre-formatted text field, use it
   if (r.text) {
@@ -86,13 +95,14 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
 // ---------------------------------------------------------------------------
 // Filter types
 // ---------------------------------------------------------------------------
-type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning';
+type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director';
 const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
   { value: 'ALL',       label: 'All',        color: 'text-[var(--foreground)]' },
   { value: 'observe',   label: 'Observe',    color: 'text-purple-400' },
   { value: 'calculate', label: 'Position',   color: 'text-blue-400' },
   { value: 'decision',  label: 'Decision',   color: 'text-[var(--neon-green)]' },
   { value: 'learning',  label: 'Learning',   color: 'text-amber-400' },
+  { value: 'director',  label: 'Director',   color: 'text-[var(--kraken-light)]' },
 ];
 
 // ---------------------------------------------------------------------------

@@ -9,12 +9,9 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@nivo/bar": "^0.99.0",
-    "@nivo/core": "^0.99.0",
-    "@nivo/line": "^0.99.0",
     "clsx": "^2.1.1",
-    "date-fns": "^4.1.0",
     "framer-motion": "^12.38.0",
+    "lightweight-charts": "^5.1.0",
     "lucide-react": "^1.8.0",
     "next": "16.2.3",
     "react": "19.2.4",

@@ -58,11 +58,14 @@ interface TradingStore {
   scannerResults: any[];
   strategyStates: Record<string, any[]>;
   bots: any[];
-  performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean };
+  performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean; sharpe: number; sortino: number; realized_trades?: { pnl: number }[] };
+  lastSignal: { bot_id: string; action: string; symbol: string; confidence: number; timestamp: string } | null;
+  ohlcvData: { candles: { time: number; open: number; high: number; low: number; close: number; volume: number }[]; symbol: string } | null;
 
   setAssetClass: (ac: AssetClass) => void;
   setActiveSymbol: (s: string) => void;
   fetchMarketHistory: (s: string) => Promise<void>;
+  fetchOHLCV: (symbol: string, period?: string) => Promise<void>;
   fetchRiskStatus: () => Promise<void>;
   fetchPositions: () => Promise<void>;
   fetchLedger: () => Promise<void>;
@@ -87,7 +90,9 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   positions:     [],
   botLogs:       [],
   bots:          [],
-  performance:   { history: [], net_pnl: 0, drawdown: 0, has_data: false },
+  performance:   { history: [], net_pnl: 0, drawdown: 0, has_data: false, sharpe: 0, sortino: 0 },
+  lastSignal:    null,
+  ohlcvData:     null,
   marketHistory: [],
   learningHistory: [],
   aiInsights:    null,
@@ -114,6 +119,24 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
       }
     } catch (err) {
       console.error('[ORCHESTRATOR] Error fetching market history', err);
+    }
+  },
+
+  fetchOHLCV: async (symbol: string, period = '1H') => {
+    try {
+      const encoded = encodeURIComponent(symbol);
+      const res = await fetch(
+        `http://localhost:8000/api/ohlcv?symbol=${encoded}&period=${period}`,
+        { signal: AbortSignal.timeout(10_000) },
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.candles?.length > 0) {
+          set({ ohlcvData: { candles: data.candles, symbol: data.symbol } });
+        }
+      }
+    } catch (err) {
+      console.warn('[OHLCV] fetch failed — chart will use synthetic candles', err);
     }
   },
 
@@ -353,6 +376,7 @@ export function useTradingEngine() {
             const log = `[SIGNAL] ${d.bot_id?.toUpperCase()} ${d.action} ${d.symbol} qty=${Number(d.qty).toFixed(6)} conf=${d.confidence}`;
             useTradingStore.setState(s => ({
               botLogs: [...s.botLogs, log].slice(-100),
+              lastSignal: d,
             }));
           }
         } catch (err) {

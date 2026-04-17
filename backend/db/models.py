@@ -27,6 +27,7 @@ class ExecutionRecord(Base):
     signal_id = Column(Integer, ForeignKey("signals.id"))
     alpaca_order_id = Column(String(50), nullable=True)
     fill_price = Column(Float, default=0.0)
+    qty = Column(Float, default=1.0)         # filled quantity from Alpaca order
     slippage = Column(Float, default=0.0)
     status = Column(String(20), default="FILLED")
     failure_reason = Column(String(500), nullable=True)
@@ -36,12 +37,25 @@ class BotAmend(Base):
     """Tracks deep historical parameter adjustments from Agent insights."""
     __tablename__ = "bot_amends"
 
-    id = Column(Integer, primary_key=True, index=True)
-    model = Column(String(50))
-    action = Column(String(50))
-    reason = Column(String(500))
-    impact = Column(String(100)) # Expected statistical effect
-    timestamp = Column(DateTime(timezone=True), default=_utcnow)
+    id          = Column(Integer, primary_key=True, index=True)
+    model       = Column(String(50))
+    action      = Column(String(50))
+    target_bot  = Column(String(50), nullable=True)       # which bot was affected
+    reason      = Column(String(500))
+    impact      = Column(String(100))                     # Expected statistical effect
+    params_json = Column(String(500), nullable=True)      # JSON of changed params
+    timestamp   = Column(DateTime(timezone=True), default=_utcnow)
+
+
+class BotState(Base):
+    """Persists bot halt/resume state across server restarts."""
+    __tablename__ = "bot_states"
+
+    id         = Column(Integer, primary_key=True)
+    bot_id     = Column(String(50), unique=True, index=True)
+    status     = Column(String(20), default="ACTIVE")     # ACTIVE | HALTED
+    allocation = Column(Float, default=0.0)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
 class ReflectionLog(Base):

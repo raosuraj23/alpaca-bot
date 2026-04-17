@@ -11,14 +11,16 @@ from strategy.algorithms import MomentumStrategy, StatArbStrategy, HighFrequency
 from strategy.equity_algorithms import EquityMomentumStrategy, EquityRSIStrategy, EquityPairsStrategy, EQUITY_SYMBOLS
 from strategy.options_algorithms import CoveredCallStrategy, ProtectivePutStrategy
 
-CRYPTO_SYMBOLS   = {"BTC/USD", "ETH/USD", "SOL/USD"}
-EQUITY_SYMBOL_SET = set(EQUITY_SYMBOLS)
+CRYPTO_SYMBOLS_BASE = {"BTC/USD", "ETH/USD", "SOL/USD"}  # always included; scanner expands this
+EQUITY_SYMBOL_SET   = set(EQUITY_SYMBOLS)
 
 logger = logging.getLogger(__name__)
 
 
 class StrategyEngine:
     def __init__(self):
+        # Start with the base crypto set; scanner discovery updates this at runtime
+        self.active_crypto_symbols: set[str] = set(CRYPTO_SYMBOLS_BASE)
         self.bots: dict = {
             # ── Crypto ────────────────────────────────────────────────────
             "momentum-alpha":   MomentumStrategy(),
@@ -33,6 +35,55 @@ class StrategyEngine:
             "protective-put":   ProtectivePutStrategy(),
         }
         self._last_prices: dict[str, float] = {}  # last known tick price per symbol
+
+    def restore_from_db(self, states: list[dict]) -> None:
+        """Called by startup_event() to restore persisted halt/resume states.
+        Prevents bots from booting ACTIVE after a server restart when they were halted."""
+        for row in states:
+            bot = self.bots.get(row["bot_id"])
+            if bot:
+                bot.status     = row["status"]
+                bot.allocation = row["allocation"]
+                logger.info("[ENGINE] Restored %s → status=%s alloc=%.1f%%",
+                            row["bot_id"], row["status"], row["allocation"])
+
+    def update_strategy_params(self, bot_id: str, params: dict) -> bool:
+        """Mutate strategy configuration at runtime (called by AutonomousPortfolioDirector)."""
+        bot = self.bots.get(bot_id)
+        if not bot:
+            logger.warning("[ENGINE] update_strategy_params: unknown bot_id=%s", bot_id)
+            return False
+        bot.update_params(params)
+        return True
+
+    def spawn_variant(self, source_bot_id: str, new_bot_id: str, params: dict) -> bool:
+        """Clone a bot with overridden params and add it as a new active bot.
+        Returns False if source bot not found or new_bot_id already exists."""
+        if new_bot_id in self.bots:
+            logger.warning("[ENGINE] spawn_variant: %s already exists", new_bot_id)
+            return False
+        source = self.bots.get(source_bot_id)
+        if not source:
+            logger.warning("[ENGINE] spawn_variant: source %s not found", source_bot_id)
+            return False
+        import copy
+        variant = copy.deepcopy(source)
+        variant.id     = new_bot_id
+        variant.name   = f"{source.name} [variant]"
+        variant.status = "ACTIVE"
+        variant.update_params(params)
+        self.bots[new_bot_id] = variant
+        logger.info("[ENGINE] Spawned variant %s from %s with params %s",
+                    new_bot_id, source_bot_id, params)
+        return True
+
+    def set_active_crypto_symbols(self, symbols: set[str]) -> None:
+        """Called by the scanner agent when it discovers new high-priority symbols.
+        Always merges with the base set so BTC/ETH/SOL are never dropped."""
+        merged = CRYPTO_SYMBOLS_BASE | {s for s in symbols if s.endswith("/USD")}
+        if merged != self.active_crypto_symbols:
+            logger.info("[ENGINE] Crypto symbol set updated: %s", sorted(merged))
+            self.active_crypto_symbols = merged
 
     # ------------------------------------------------------------------
     # State Queries
@@ -161,7 +212,7 @@ class StrategyEngine:
         self._last_prices[symbol] = price
         signals = []
 
-        is_crypto = symbol in CRYPTO_SYMBOLS
+        is_crypto = symbol in self.active_crypto_symbols
         is_equity = symbol in EQUITY_SYMBOL_SET
 
         for bot in self.bots.values():

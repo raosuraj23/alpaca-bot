@@ -293,21 +293,52 @@ class BotLifecyclePayload(BaseModel):
     reason: str = "Manual override"
 
 @app.post("/api/bots/{bot_id}/halt")
-def halt_bot(bot_id: str, payload: BotLifecyclePayload = BotLifecyclePayload()):
-    """Halt a specific trading bot by ID."""
-    from risk.kill_switch import global_kill_switch
+async def halt_bot(bot_id: str, payload: BotLifecyclePayload = BotLifecyclePayload()):
+    """Halt a specific trading bot by ID and persist state to SQLite."""
     success = master_engine.halt_bot(bot_id, reason=payload.reason)
     if not success:
         raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' not found")
+    # Persist halt state so it survives server restarts
+    try:
+        from db.database import _get_session_factory
+        from db.models import BotState
+        bot = master_engine.bots.get(bot_id)
+        async with _get_session_factory()() as session:
+            from sqlalchemy import select
+            row = (await session.execute(select(BotState).where(BotState.bot_id == bot_id))).scalar_one_or_none()
+            if row is None:
+                row = BotState(bot_id=bot_id)
+                session.add(row)
+            row.status = "HALTED"
+            row.allocation = bot.allocation if bot else 0.0
+            await session.commit()
+    except Exception as exc:
+        logger.warning("[HALT] BotState persist failed: %s", exc)
     _push_log(f"[ORCHESTRATOR] ⛔ Bot '{bot_id}' halted — {payload.reason}")
     return {"status": "halted", "bot_id": bot_id, "reason": payload.reason}
 
 @app.post("/api/bots/{bot_id}/resume")
-def resume_bot(bot_id: str):
-    """Resume a halted trading bot by ID."""
+async def resume_bot(bot_id: str):
+    """Resume a halted trading bot and persist ACTIVE state to SQLite."""
     success = master_engine.resume_bot(bot_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' not found")
+    # Persist resume state
+    try:
+        from db.database import _get_session_factory
+        from db.models import BotState
+        bot = master_engine.bots.get(bot_id)
+        async with _get_session_factory()() as session:
+            from sqlalchemy import select
+            row = (await session.execute(select(BotState).where(BotState.bot_id == bot_id))).scalar_one_or_none()
+            if row is None:
+                row = BotState(bot_id=bot_id)
+                session.add(row)
+            row.status = "ACTIVE"
+            row.allocation = bot.allocation if bot else 0.0
+            await session.commit()
+    except Exception as exc:
+        logger.warning("[RESUME] BotState persist failed: %s", exc)
     _push_log(f"[ORCHESTRATOR] ▶️ Bot '{bot_id}' resumed.")
     return {"status": "resumed", "bot_id": bot_id}
 
@@ -435,7 +466,7 @@ async def get_reflections_history(limit: int = 50):
 
 
 @app.get("/api/performance")
-def get_performance(period: str = "1M"):
+async def get_performance(period: str = "1M"):
     """Fetches real portfolio history from Alpaca. period: 1D | 1W | 1M | YTD"""
     _require_trading_client()
     # Map UI period labels to Alpaca API params.
@@ -478,10 +509,82 @@ def get_performance(period: str = "1M"):
                     dd = (peak - eq) / peak * 100
                     max_dd = max(max_dd, dd)
 
-        return {"history": curve, "net_pnl": net_pnl, "drawdown": round(max_dd, 4), "has_data": len(curve) > 0}
+        # Annualised Sharpe & Sortino from period-over-period equity returns
+        import math as _math
+        sharpe = 0.0
+        sortino = 0.0
+        valid_eq = [e for e in equities if e is not None]
+        if len(valid_eq) >= 2:
+            rets = [
+                (valid_eq[i] - valid_eq[i - 1]) / valid_eq[i - 1]
+                for i in range(1, len(valid_eq))
+                if valid_eq[i - 1] != 0
+            ]
+            if rets:
+                mean_r = sum(rets) / len(rets)
+                variance = sum((r - mean_r) ** 2 for r in rets) / max(len(rets) - 1, 1)
+                std_r = _math.sqrt(variance)
+                ann = _math.sqrt(252)
+                if std_r > 0:
+                    sharpe = round((mean_r / std_r) * ann, 3)
+                neg = [r for r in rets if r < 0]
+                if len(neg) > 1:
+                    neg_mean = sum(neg) / len(neg)
+                    down_var = sum((r - neg_mean) ** 2 for r in neg) / (len(neg) - 1)
+                    down_std = _math.sqrt(down_var)
+                    if down_std > 0:
+                        sortino = round((mean_r / down_std) * ann, 3)
+
+        # Compute realized trades for win-rate calculation in the UI
+        realized_trades: list = []
+        try:
+            from db.database import _get_session_factory as _gsf
+            from db.models import ExecutionRecord as _ER, SignalRecord as _SR
+            from sqlalchemy import select as _sel
+            from collections import defaultdict as _dd
+
+            async def _fetch_trades():
+                async with _gsf()() as _s:
+                    _stmt = (
+                        _sel(_ER.fill_price, _ER.qty, _SR.strategy, _SR.symbol, _SR.action, _ER.timestamp)
+                        .join(_SR, _ER.signal_id == _SR.id)
+                        .where(_ER.status == "FILLED")
+                        .order_by(_SR.strategy, _SR.symbol, _ER.timestamp)
+                    )
+                    return (await _s.execute(_stmt)).all()
+
+            _rows = await _fetch_trades()
+            _groups = _dd(list)
+            for _r in _rows:
+                _groups[(_r.strategy, _r.symbol)].append(_r)
+
+            for (_strat, _sym), _grp in _groups.items():
+                _longs: list = []
+                for _r in _grp:
+                    _q = _r.qty or 1.0
+                    if _r.action == "BUY":
+                        _longs.append(_r)
+                    elif _r.action == "SELL" and _longs:
+                        _e = _longs.pop(0)
+                        realized_trades.append({
+                            "strategy": _strat,
+                            "symbol":   _sym,
+                            "pnl":      round((_r.fill_price - _e.fill_price) * (_e.qty or 1.0), 4),
+                            "timestamp": _r.timestamp.isoformat() if _r.timestamp else None,
+                        })
+        except Exception as _rt_exc:
+            logger.debug("[PERFORMANCE] realized_trades fetch failed: %s", _rt_exc)
+
+        return {
+            "history": curve, "net_pnl": net_pnl,
+            "drawdown": round(max_dd, 4), "has_data": len(curve) > 0,
+            "sharpe": sharpe, "sortino": sortino,
+            "realized_trades": realized_trades,
+        }
     except Exception as e:
         logger.error("[PERFORMANCE] %s", e)
-        return {"history": [], "net_pnl": 0.0, "drawdown": 0.0, "has_data": False}
+        return {"history": [], "net_pnl": 0.0, "drawdown": 0.0, "has_data": False,
+                "sharpe": 0.0, "sortino": 0.0, "realized_trades": []}
 
 
 @app.get("/api/analytics/returns")
@@ -742,6 +845,55 @@ def get_market_history(symbol: str = "BTC/USD"):
         logger.error("[HISTORY] %s", e)
         return []
 
+
+@app.get("/api/ohlcv")
+async def get_ohlcv(symbol: str = "BTC/USD", period: str = "1H"):
+    """
+    Returns OHLCV bars in lightweight-charts format for the TradingChart component.
+    period: "1H" = hourly bars for last 7 days, "1D" = daily bars for last 90 days.
+    Response: { candles: [{time, open, high, low, close, volume}], symbol }
+    time is Unix seconds (UTC) as required by lightweight-charts.
+    """
+    if not ALPACA_API_KEY:
+        return {"candles": [], "symbol": symbol, "error": "API keys not configured"}
+    try:
+        from alpaca.data.historical import CryptoHistoricalDataClient
+        from alpaca.data.requests import CryptoBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from datetime import datetime, timedelta
+
+        tf = TimeFrame.Hour if period.upper() == "1H" else TimeFrame.Day
+        window = timedelta(days=7) if period.upper() == "1H" else timedelta(days=90)
+
+        client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+        req = CryptoBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=datetime.utcnow() - window,
+            end=datetime.utcnow(),
+        )
+        bars = client.get_crypto_bars(req)
+        if bars.df.empty:
+            return {"candles": [], "symbol": symbol}
+
+        candles = []
+        for idx, row in bars.df.iterrows():
+            # MultiIndex: (symbol, timestamp) — extract timestamp
+            ts = idx[1] if isinstance(idx, tuple) else idx
+            candles.append({
+                "time":   int(ts.timestamp()),
+                "open":   float(row["open"]),
+                "high":   float(row["high"]),
+                "low":    float(row["low"]),
+                "close":  float(row["close"]),
+                "volume": float(row["volume"]),
+            })
+        logger.info("[OHLCV] %s %s — %d bars", symbol, period, len(candles))
+        return {"candles": candles, "symbol": symbol}
+    except Exception as e:
+        logger.error("[OHLCV] %s", e)
+        return {"candles": [], "symbol": symbol, "error": str(e)}
+
 # ==========================================
 # WEBSOCKET STREAMING
 # ==========================================
@@ -963,8 +1115,11 @@ async def stream_manager():
                     "timestamp": quote.timestamp.isoformat()
                 }})
 
-            stream.subscribe_bars(bar_callback, "BTC/USD", "ETH/USD", "SOL/USD")
-            stream.subscribe_quotes(quote_callback, "BTC/USD", "ETH/USD", "SOL/USD")
+            # Use the engine's dynamic symbol set — updated by scanner discoveries
+            _crypto_syms = list(master_engine.active_crypto_symbols)
+            stream.subscribe_bars(bar_callback, *_crypto_syms)
+            stream.subscribe_quotes(quote_callback, *_crypto_syms)
+            logger.info("[STREAM] Subscribed to crypto symbols: %s", _crypto_syms)
 
             logger.info("[STREAM] Starting Alpaca CryptoDataStream...")
             _push_log("[STREAM] Connecting to Alpaca live data stream...")
@@ -1172,17 +1327,18 @@ async def get_realized_pnl():
     Returns a list of closed trades with entry price, exit price, qty, and net P&L.
     Falls back to in-memory _entry_prices for any currently open positions.
     """
-    from db.database import AsyncSessionLocal
+    from db.database import _get_session_factory
     from db.models import ExecutionRecord, SignalRecord
     from sqlalchemy import select, and_
 
     try:
-        async with AsyncSessionLocal() as session:
+        async with _get_session_factory()() as session:
             # Load all filled execution records joined to their signal for action + strategy + symbol
             stmt = (
                 select(
                     ExecutionRecord.id,
                     ExecutionRecord.fill_price,
+                    ExecutionRecord.qty,
                     ExecutionRecord.timestamp,
                     SignalRecord.strategy,
                     SignalRecord.symbol,
@@ -1195,7 +1351,9 @@ async def get_realized_pnl():
             )
             rows = (await session.execute(stmt)).all()
 
-        # Group by (strategy, symbol) and pair BUY → SELL in order
+        # Group by (strategy, symbol) and pair BUY → SELL in chronological order (FIFO).
+        # LONG trades: entry=BUY, exit=SELL → pnl = (exit - entry) * qty
+        # SHORT trades: entry=SELL, exit=BUY → pnl = (entry - exit) * qty
         from collections import defaultdict
         groups: dict = defaultdict(list)
         for row in rows:
@@ -1203,36 +1361,65 @@ async def get_realized_pnl():
 
         trades = []
         for (strategy, symbol), group_rows in groups.items():
-            buy_stack = []
+            open_longs: list  = []  # stack of BUY rows awaiting a SELL
+            open_shorts: list = []  # stack of SELL rows awaiting a BUY (SHORT entry)
             for row in group_rows:
+                qty = row.qty or 1.0
                 if row.action == "BUY":
-                    buy_stack.append(row)
-                elif row.action == "SELL" and buy_stack:
-                    buy_row = buy_stack.pop(0)
-                    pnl = (row.fill_price - buy_row.fill_price)  # per-unit; qty not stored yet
-                    trades.append({
-                        "strategy":    strategy,
-                        "symbol":      symbol,
-                        "entry_price": round(buy_row.fill_price, 4),
-                        "exit_price":  round(row.fill_price, 4),
-                        "pnl_per_unit": round(pnl, 4),
-                        "entry_time":  buy_row.timestamp.isoformat() if buy_row.timestamp else None,
-                        "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
-                        "confidence":  round(buy_row.confidence or 0, 3),
-                    })
+                    if open_shorts:
+                        # Close a SHORT: entry was SELL, exit is BUY
+                        entry_row = open_shorts.pop(0)
+                        entry_qty = entry_row.qty or 1.0
+                        pnl = (entry_row.fill_price - row.fill_price) * entry_qty
+                        trades.append({
+                            "strategy":   strategy,
+                            "symbol":     symbol,
+                            "direction":  "SHORT",
+                            "entry_price": round(entry_row.fill_price, 4),
+                            "exit_price":  round(row.fill_price, 4),
+                            "qty":         round(entry_qty, 6),
+                            "pnl":         round(pnl, 4),
+                            "entry_time":  entry_row.timestamp.isoformat() if entry_row.timestamp else None,
+                            "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
+                            "confidence":  round(entry_row.confidence or 0, 3),
+                        })
+                    else:
+                        open_longs.append(row)
+                elif row.action == "SELL":
+                    if open_longs:
+                        # Close a LONG: entry was BUY, exit is SELL
+                        entry_row = open_longs.pop(0)
+                        entry_qty = entry_row.qty or 1.0
+                        pnl = (row.fill_price - entry_row.fill_price) * entry_qty
+                        trades.append({
+                            "strategy":   strategy,
+                            "symbol":     symbol,
+                            "direction":  "LONG",
+                            "entry_price": round(entry_row.fill_price, 4),
+                            "exit_price":  round(row.fill_price, 4),
+                            "qty":         round(entry_qty, 6),
+                            "pnl":         round(pnl, 4),
+                            "entry_time":  entry_row.timestamp.isoformat() if entry_row.timestamp else None,
+                            "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
+                            "confidence":  round(entry_row.confidence or 0, 3),
+                        })
+                    else:
+                        open_shorts.append(row)
 
         # Add currently open positions from in-memory dict
         open_positions = [
             {
-                "strategy": bot,
-                "symbol": sym,
+                "strategy":   bot,
+                "symbol":     sym,
+                "direction":  "LONG",
                 "entry_price": round(price, 4),
-                "exit_price": None,
-                "pnl_per_unit": None,
-                "entry_time": None,
-                "exit_time": None,
-                "confidence": None,
-                "open": True,
+                "exit_price":  None,
+                "qty":         None,
+                "pnl":         None,
+                "entry_time":  None,
+                "exit_time":   None,
+                "confidence":  None,
+                "open":        True,
             }
             for (bot, sym), price in _entry_prices.items()
         ]
@@ -1514,6 +1701,21 @@ async def startup_event():
     global _stream_task, _stock_stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
     from db.database import init_db
     await init_db()
+
+    # Restore persisted bot halt/resume states so bots don't auto-restart as ACTIVE
+    try:
+        from db.database import _get_session_factory
+        from db.models import BotState
+        from sqlalchemy import select as _select
+        async with _get_session_factory()() as _session:
+            _bot_states = (await _session.execute(_select(BotState))).scalars().all()
+            master_engine.restore_from_db([
+                {"bot_id": s.bot_id, "status": s.status, "allocation": s.allocation}
+                for s in _bot_states
+            ])
+    except Exception as _exc:
+        logger.warning("[STARTUP] BotState restore failed: %s", _exc)
+
     _get_log_queue()
     _get_reflection_queue()
     logger.info("Multi-Agent REST/WS Gateway booted (paper=%s).", PAPER_TRADING)
@@ -1531,14 +1733,37 @@ async def startup_event():
     )
     _ai_reflection_task = asyncio.create_task(_reflection_engine.run())
 
-    # Start the scanner agent
+    # Start the scanner agent — wrap push_fn to intercept "discover" events and
+    # propagate newly discovered symbols into the strategy engine's routing table.
     from agents.scanner_agent import ScannerAgent
     from quant.data_buffer import market_buffer as _mb
+
+    def _scanner_push(data: dict) -> None:
+        _push_reflection(data)
+        if data.get("type") == "discover":
+            symbols: list[str] = data.get("symbols", [])
+            if symbols:
+                master_engine.set_active_crypto_symbols(set(symbols))
+                logger.info("[SCANNER→ENGINE] Symbol set updated: %s", symbols)
+
     _scanner_agent = ScannerAgent(
-        push_fn=_push_reflection,
+        push_fn=_scanner_push,
         get_buffer_fn=lambda: _mb,
     )
     _scanner_task = asyncio.create_task(_scanner_agent.run())
+
+    # Start the Autonomous Portfolio Director — reviews bots every 15 min and
+    # executes Haiku-recommended changes (allocations, params, halt/resume, variants)
+    from agents.portfolio_director import AutonomousPortfolioDirector
+    from db.database import _get_session_factory as _gsf_director
+    _director = AutonomousPortfolioDirector(
+        push_fn        = _push_reflection,
+        get_engine_fn  = lambda: master_engine,
+        get_scanner_fn = lambda: _scanner_agent.get_last_results() if _scanner_agent else [],
+        db_factory     = _gsf_director,
+    )
+    asyncio.create_task(_director.run())
+    logger.info("[DIRECTOR] Autonomous Portfolio Director scheduled (15 min interval)")
 
 
 @app.on_event("shutdown")

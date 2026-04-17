@@ -71,13 +71,12 @@ export function PositionsTable() {
                 <th className="font-medium p-2">Side</th>
                 <th className="font-medium p-2 text-right">Size</th>
                 <th className="font-medium p-2 text-right">Entry Price</th>
-                <th className="font-medium p-2 text-right">Realized PnL</th>
                 <th className="font-medium p-2 pr-4 text-right">Unrealized PnL</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border)]/30">
               {positions.length === 0 ? (
-                <tr><td colSpan={6} className="p-4 text-center text-[var(--muted-foreground)]">No open positions</td></tr>
+                <tr><td colSpan={5} className="p-4 text-center text-[var(--muted-foreground)]">No open positions</td></tr>
               ) : positions.map((pos) => (
                 <tr key={pos.id} className="hover:bg-[var(--panel-muted)] transition-colors">
                   <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{pos.symbol}</td>
@@ -86,9 +85,6 @@ export function PositionsTable() {
                   </td>
                   <td className="p-2 text-right font-mono text-[var(--foreground)]">{pos.size.toFixed(4)}</td>
                   <td className="p-2 text-right text-[var(--muted-foreground)]">${pos.entryPrice.toFixed(2)}</td>
-                  <td className={`p-2 text-right font-mono ${pos.realizedPnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-                    ${pos.realizedPnl.toFixed(2)}
-                  </td>
                   <td className="p-2 pr-4 text-right font-mono font-bold">
                     <ValueTicker value={pos.unrealizedPnl} prefix="$" />
                   </td>
