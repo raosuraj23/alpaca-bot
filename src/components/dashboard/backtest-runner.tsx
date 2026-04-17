@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -59,7 +60,7 @@ export function BacktestRunner() {
     const endDate   = endDateRef.current?.value   ?? '2023-12-31';
 
     try {
-      const res = await fetch('http://localhost:8000/api/backtest', {
+      const res = await fetch(`${API_BASE}/api/backtest`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ symbol, strategy, start_date: startDate, end_date: endDate }),

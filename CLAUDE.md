@@ -37,5 +37,8 @@ DO NOT MAKE ANY VCHANGES UNTIL YOU HAVE 95% CONFIDENCE IN WHAT YOU NEED TO BUILD
 
 12. **Timezone rule (mandatory).** All timestamps are stored and transmitted from the backend in UTC. The frontend **must** convert every UTC timestamp to the user's local timezone before display — use `new Date(utcMs).toLocaleString()`, `.toLocaleTimeString()`, or `.toLocaleDateString()`. Raw UTC strings (e.g. `2024-01-15T10:00:00Z`) must never be shown to the user. This applies to: trade timestamps, order submission times, reflection logs, ledger entries, PnL calendar dates, and any ISO timestamp field from the API.
 
+13. **Playwright tests are mandatory after every code change.** Run `npx playwright test` after every code change before reporting the task complete. If tests fail, fix the failures before finishing — do not skip or suppress them. If no test exists for the changed feature, write one first, then run the full suite.
+
+14. **Phase completion logging is mandatory.** After every successfully completed phase or sub-phase task, update the Phase Completion Status Log in `.claude/memory-preferences.md` (Section 6) with the date, phase name, items shipped, and any follow-on notes. Do this before reporting the task as done to the user.
 
 ---

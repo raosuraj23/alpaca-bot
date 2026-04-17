@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot } from 'lucide-react';
@@ -255,7 +256,7 @@ export function BotReflections() {
                 })
               )}
               <div className="flex items-center space-x-2 p-2 opacity-50">
-                <div className="w-1.5 h-1.5 rounded-full bg-[var(--kraken-purple)] animate-pulse" />
+                <div className="w-1.5 h-1.5 rounded-sm bg-[var(--kraken-purple)] animate-pulse" />
                 <span className="italic text-[var(--muted-foreground)]">
                   Listening to strategy engine signals...
                 </span>
@@ -344,7 +345,7 @@ function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
                   key={`${symbol}-${strategyId}-${idx}`}
                   className="flex items-start space-x-3 p-2.5 rounded border border-[var(--border)] bg-[var(--panel-muted)]/20"
                 >
-                  <div className={`w-2 h-2 mt-1 rounded-full ${statusDot} shrink-0`} />
+                  <div className={`w-2 h-2 mt-1 rounded-sm ${statusDot} shrink-0`} />
                   <div className="flex flex-col min-w-0">
                     <span className="text-xs font-bold text-[var(--foreground)] truncate">{name}</span>
                     <span className={`text-[10px] font-mono ${biasColor} leading-relaxed mt-0.5`}>
@@ -371,7 +372,7 @@ function HistoricalAmends() {
 
   React.useEffect(() => {
     setMounted(true);
-    fetch('http://localhost:8000/api/reflections')
+    fetch(`${API_BASE}/api/reflections`)
       .then(r => r.ok ? r.json() : [])
       .then(setAmends)
       .catch(() => {});
@@ -398,7 +399,7 @@ function HistoricalAmends() {
           </div>
         ) : amends.map((item, i) => (
           <div key={i} className="relative pl-6 pb-2 border-l border-[var(--border)] last:border-l-transparent">
-            <div className="absolute left-[-5px] top-1 w-2.5 h-2.5 rounded-full bg-[var(--kraken-purple)] shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
+            <div className="absolute left-[-5px] top-1 w-2.5 h-2.5 rounded-sm bg-[var(--kraken-purple)] shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
             <div className="flex justify-between items-start mb-1">
               <div className="flex items-center space-x-2">
                 <Badge variant="purple" className="px-1.5 py-0 text-xs">

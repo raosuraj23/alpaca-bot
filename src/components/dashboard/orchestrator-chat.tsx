@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { MessageSquare, X, Send, Bot, User } from 'lucide-react';
@@ -30,7 +31,7 @@ export function OrchestratorChat() {
     // Hit the LangChain Backend
     setIsTyping(true);
     try {
-      const res = await fetch('http://localhost:8000/api/agents/chat', {
+      const res = await fetch(`${API_BASE}/api/agents/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: inputVal })

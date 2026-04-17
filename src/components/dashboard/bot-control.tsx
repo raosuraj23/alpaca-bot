@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -53,7 +54,7 @@ export function BotControl() {
     if (!selectedBot || actionPending) return;
     setActionPending('halt');
     try {
-      await fetch(`http://localhost:8000/api/bots/${selectedBot.id}/halt`, {
+      await fetch(`${API_BASE}/api/bots/${selectedBot.id}/halt`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Manual override via Bot Control' }),
@@ -70,7 +71,7 @@ export function BotControl() {
     if (!selectedBot || actionPending) return;
     setActionPending('resume');
     try {
-      await fetch(`http://localhost:8000/api/bots/${selectedBot.id}/resume`, {
+      await fetch(`${API_BASE}/api/bots/${selectedBot.id}/resume`, {
         method: 'POST',
       });
       await fetchAPIIntegrations();
@@ -116,7 +117,7 @@ export function BotControl() {
               <span className="flex items-center gap-2">
                 {selectedBot ? (
                   <>
-                    <span className={`w-1.5 h-1.5 rounded-full ${
+                    <span className={`w-1.5 h-1.5 rounded-sm ${
                       selectedBot.status === 'ACTIVE'
                         ? 'bg-[var(--neon-green)] shadow-[0_0_4px_var(--neon-green)]'
                         : 'bg-[var(--muted-foreground)]'
@@ -149,7 +150,7 @@ export function BotControl() {
                     }`}
                   >
                     <span className="flex items-center gap-2">
-                      <span className={`w-1.5 h-1.5 rounded-full ${
+                      <span className={`w-1.5 h-1.5 rounded-sm ${
                         bot.status === 'ACTIVE'
                           ? 'bg-[var(--neon-green)] shadow-[0_0_4px_var(--neon-green)]'
                           : 'bg-[var(--muted-foreground)]'
@@ -229,7 +230,7 @@ export function BotControl() {
                 }`}
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className={`w-1 h-1 rounded-full shrink-0 ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)]' : 'bg-[var(--muted-foreground)]'}`} />
+                  <span className={`w-1 h-1 rounded-sm shrink-0 ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)]' : 'bg-[var(--muted-foreground)]'}`} />
                   <span className="truncate font-semibold">{bot.name}</span>
                   {bot.assetClass && bot.assetClass !== 'CRYPTO' && (
                     <span className="text-xs opacity-40 shrink-0">{bot.assetClass}</span>

@@ -112,7 +112,7 @@ export default function AppShell() {
           </div>
 
           <div className="flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-full bg-[var(--neon-green)] animate-live" />
+            <div className="w-1.5 h-1.5 rounded-sm bg-[var(--neon-green)] animate-live" />
             <span className="text-[var(--neon-green)] font-bold text-xs tracking-widest">LIVE</span>
           </div>
 

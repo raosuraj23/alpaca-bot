@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -110,7 +111,7 @@ export function TradeLedger() {
 
   const loadRealizedPnl = React.useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/analytics/realized-pnl', {
+      const res = await fetch(`${API_BASE}/api/analytics/realized-pnl`, {
         signal: AbortSignal.timeout(10000),
       });
       if (res.ok) {
@@ -123,7 +124,7 @@ export function TradeLedger() {
 
   const loadAccountData = React.useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/account', {
+      const res = await fetch(`${API_BASE}/api/account`, {
         signal: AbortSignal.timeout(8000),
       });
       if (res.ok) {

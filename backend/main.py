@@ -223,10 +223,10 @@ class ChatPayload(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
 
 @app.post("/api/agents/chat")
-def chat_with_orchestrator(payload: ChatPayload):
+async def chat_with_orchestrator(payload: ChatPayload):
     """Routes user message to the LangChain orchestrator agent."""
     try:
-        reply = master_orchestrator.process_chat(payload.message)
+        reply = await master_orchestrator.process_chat(payload.message)
         return {"sender": "ai", "text": reply}
     except Exception as e:
         logger.error("[ORCHESTRATOR] %s", e)
@@ -850,6 +850,7 @@ def get_market_history(symbol: str = "BTC/USD"):
 async def get_ohlcv(symbol: str = "BTC/USD", period: str = "1H"):
     """
     Returns OHLCV bars in lightweight-charts format for the TradingChart component.
+    Supports both crypto (BTC/USD) and equity (SPY, AAPL, ...) symbols.
     period: "1H" = hourly bars for last 7 days, "1D" = daily bars for last 90 days.
     Response: { candles: [{time, open, high, low, close, volume}], symbol }
     time is Unix seconds (UTC) as required by lightweight-charts.
@@ -857,28 +858,33 @@ async def get_ohlcv(symbol: str = "BTC/USD", period: str = "1H"):
     if not ALPACA_API_KEY:
         return {"candles": [], "symbol": symbol, "error": "API keys not configured"}
     try:
-        from alpaca.data.historical import CryptoHistoricalDataClient
-        from alpaca.data.requests import CryptoBarsRequest
         from alpaca.data.timeframe import TimeFrame
         from datetime import datetime, timedelta
 
-        tf = TimeFrame.Hour if period.upper() == "1H" else TimeFrame.Day
+        is_crypto = "/" in symbol
+        tf     = TimeFrame.Hour if period.upper() == "1H" else TimeFrame.Day
         window = timedelta(days=7) if period.upper() == "1H" else timedelta(days=90)
+        start  = datetime.utcnow() - window
+        end    = datetime.utcnow()
 
-        client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-        req = CryptoBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=datetime.utcnow() - window,
-            end=datetime.utcnow(),
-        )
-        bars = client.get_crypto_bars(req)
+        if is_crypto:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+            client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            req    = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
+            bars   = client.get_crypto_bars(req)
+        else:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            req    = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
+            bars   = client.get_stock_bars(req)
+
         if bars.df.empty:
             return {"candles": [], "symbol": symbol}
 
         candles = []
         for idx, row in bars.df.iterrows():
-            # MultiIndex: (symbol, timestamp) — extract timestamp
             ts = idx[1] if isinstance(idx, tuple) else idx
             candles.append({
                 "time":   int(ts.timestamp()),
@@ -969,6 +975,70 @@ class _ManagedCryptoStream:
                     await _asyncio.sleep(0)
 
         # Bind the override to the stream instance
+        import types
+        stream._run_forever = _managed_run_forever
+
+        return stream
+
+
+class _ManagedStockStream:
+    """
+    Thin wrapper around StockDataStream that overrides _run_forever() so that
+    'connection limit exceeded' ValueErrors PROPAGATE to the caller instead of
+    being swallowed by the SDK's internal retry loop.
+
+    Mirrors _ManagedCryptoStream exactly — see that class for full rationale.
+    """
+
+    def __new__(cls, key: str, secret: str):
+        from alpaca.data.live import StockDataStream
+
+        stream = StockDataStream(key, secret)
+
+        async def _managed_run_forever():
+            import asyncio as _asyncio
+            import websockets
+
+            stream._loop = _asyncio.get_running_loop()
+
+            while not any(
+                v for k, v in stream._handlers.items()
+                if k not in ("cancelErrors", "corrections")
+            ):
+                if not stream._stop_stream_queue.empty():
+                    stream._stop_stream_queue.get(timeout=1)
+                    return
+                await _asyncio.sleep(0)
+
+            stream._should_run = True
+            stream._running = False
+
+            while True:
+                try:
+                    if not stream._should_run:
+                        return
+                    if not stream._running:
+                        await stream._start_ws()
+                        await stream._send_subscribe_msg()
+                        stream._running = True
+                    await stream._consume()
+                except _asyncio.CancelledError:
+                    raise
+                except ValueError as e:
+                    if "connection limit" in str(e).lower():
+                        raise
+                    await stream.close()
+                    stream._running = False
+                    logger.warning("[EQUITY STREAM] ValueError in stream: %s", e)
+                except websockets.exceptions.WebSocketException as wse:
+                    await stream.close()
+                    stream._running = False
+                    logger.warning("[EQUITY STREAM] WebSocket error, reconnecting: %s", wse)
+                except Exception:
+                    raise
+                finally:
+                    await _asyncio.sleep(0)
+
         import types
         stream._run_forever = _managed_run_forever
 
@@ -1075,15 +1145,24 @@ async def stream_manager():
                                 key = (signal['bot'], symbol)
                                 if approved['action'] == 'BUY':
                                     _entry_prices[key] = exec_result.fill_price
+                                    _entry_times[key]  = exec_result.timestamp
                                     _persist_entry_prices(_entry_prices)
                                     master_engine.update_yield(signal['bot'], 0.0)
                                     master_engine.notify_fill(signal['bot'], symbol, 'BUY', exec_result.fill_price)
                                 else:
-                                    entry = _entry_prices.pop(key, exec_result.fill_price)
+                                    entry      = _entry_prices.pop(key, exec_result.fill_price)
+                                    entry_time = _entry_times.pop(key, None)
                                     _persist_entry_prices(_entry_prices)
                                     realized_pnl = (exec_result.fill_price - entry) * exec_result.qty
                                     master_engine.update_yield(signal['bot'], realized_pnl)
                                     master_engine.notify_fill(signal['bot'], symbol, 'SELL')
+                                    asyncio.create_task(_write_closed_trade(
+                                        bot_id=signal['bot'], symbol=symbol, direction="LONG",
+                                        entry_exec_id=None, exit_exec_id=None,
+                                        entry_price=entry, exit_price=exec_result.fill_price,
+                                        qty=exec_result.qty,
+                                        entry_time=entry_time, exit_time=exec_result.timestamp,
+                                    ))
                                 _push_log(
                                     f"[EXECUTION] FILLED #{exec_result.order_id[:8]} — "
                                     f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
@@ -1191,8 +1270,7 @@ async def equity_stream_manager():
 
     while attempts < max_attempts:
         try:
-            from alpaca.data.live import StockDataStream
-            stock_stream = StockDataStream(ALPACA_API_KEY, ALPACA_API_SECRET)
+            stock_stream = _ManagedStockStream(ALPACA_API_KEY, ALPACA_API_SECRET)
 
             async def equity_bar_callback(bar):
                 price  = float(bar.close)
@@ -1229,15 +1307,24 @@ async def equity_stream_manager():
                                 key = (signal['bot'], symbol)
                                 if approved['action'] == 'BUY':
                                     _entry_prices[key] = exec_result.fill_price
+                                    _entry_times[key]  = exec_result.timestamp
                                     _persist_entry_prices(_entry_prices)
                                     master_engine.update_yield(signal['bot'], 0.0)
                                     master_engine.notify_fill(signal['bot'], symbol, 'BUY', exec_result.fill_price)
                                 else:
-                                    entry = _entry_prices.pop(key, exec_result.fill_price)
+                                    entry      = _entry_prices.pop(key, exec_result.fill_price)
+                                    entry_time = _entry_times.pop(key, None)
                                     _persist_entry_prices(_entry_prices)
                                     realized_pnl = (exec_result.fill_price - entry) * exec_result.qty
                                     master_engine.update_yield(signal['bot'], realized_pnl)
                                     master_engine.notify_fill(signal['bot'], symbol, 'SELL')
+                                    asyncio.create_task(_write_closed_trade(
+                                        bot_id=signal['bot'], symbol=symbol, direction="LONG",
+                                        entry_exec_id=None, exit_exec_id=None,
+                                        entry_price=entry, exit_price=exec_result.fill_price,
+                                        qty=exec_result.qty,
+                                        entry_time=entry_time, exit_time=exec_result.timestamp,
+                                    ))
                                 _push_log(
                                     f"[EXECUTION] FILLED #{exec_result.order_id[:8]} \u2014 "
                                     f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
@@ -1269,11 +1356,23 @@ async def equity_stream_manager():
             return
 
         except Exception as e:
+            err_str = str(e).lower()
             attempts += 1
-            logger.warning("[EQUITY STREAM] Error (attempt %d/%d): %s", attempts, max_attempts, e)
-            _push_log(f"[EQUITY STREAM] Error \u2014 retrying in {backoff}s ({attempts}/{max_attempts})...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
+
+            if "connection limit" in err_str:
+                wait = 65
+                logger.warning(
+                    "[EQUITY STREAM] Connection limit hit (attempt %d/%d). "
+                    "Waiting %ds for Alpaca to release stale connection...",
+                    attempts, max_attempts, wait,
+                )
+                _push_log(f"[EQUITY STREAM] \u23f3 Alpaca connection limit \u2014 waiting {wait}s for stale session to expire...")
+                await asyncio.sleep(wait)
+            else:
+                logger.warning("[EQUITY STREAM] Error (attempt %d/%d): %s", attempts, max_attempts, e)
+                _push_log(f"[EQUITY STREAM] Error \u2014 retrying in {backoff}s ({attempts}/{max_attempts})...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     logger.error("[EQUITY STREAM] Max reconnect attempts reached. Equity stream suspended.")
     _push_log("[EQUITY STREAM] \u274c Equity stream suspended after max retries.")
@@ -1470,6 +1569,8 @@ def _persist_entry_prices(entry_prices: dict[tuple, float]):
         logger.warning("[ENTRY PRICES] Failed to persist to disk: %s", e)
 
 _entry_prices: dict[tuple, float] = _load_entry_prices()  # (bot_id, symbol) → BUY fill price
+# Tracks BUY fill timestamp for ClosedTrade reconciliation — (bot_id, symbol) → ISO timestamp str
+_entry_times: dict[tuple, str] = {}
 
 
 @app.get("/api/watchlist")
@@ -1696,6 +1797,71 @@ async def get_market_commentary(force: bool = False):
         return {"text": None, "error": str(e)}
 
 
+async def _portfolio_snapshot_loop():
+    """Background loop: write a PortfolioSnapshot every 60 seconds."""
+    from db.database import _get_session_factory
+    from db.models import PortfolioSnapshot
+    from risk.kill_switch import global_kill_switch
+    await asyncio.sleep(30)  # let streams connect first
+    while True:
+        try:
+            equity = 0.0
+            if trading_client:
+                try:
+                    equity = float(trading_client.get_account().equity)
+                except Exception:
+                    pass
+            drawdown_pct = 0.0
+            try:
+                ks = global_kill_switch
+                if hasattr(ks, 'start_of_day_equity') and ks.start_of_day_equity > 0:
+                    drawdown_pct = max(0.0, (ks.start_of_day_equity - equity) / ks.start_of_day_equity)
+            except Exception:
+                pass
+            async with _get_session_factory()() as _s:
+                _s.add(PortfolioSnapshot(equity=equity, drawdown_pct=drawdown_pct))
+                await _s.commit()
+        except Exception as snap_err:
+            logger.debug("[SNAPSHOT] %s", snap_err)
+        await asyncio.sleep(60)
+
+
+async def _write_closed_trade(
+    bot_id: str,
+    symbol: str,
+    direction: str,
+    entry_exec_id: int | None,
+    exit_exec_id: int | None,
+    entry_price: float,
+    exit_price: float,
+    qty: float,
+    entry_time,
+    exit_time,
+):
+    """Persist a FIFO-matched round-trip trade to the closed_trades table."""
+    from db.database import _get_session_factory
+    from db.models import ClosedTrade
+    realized_pnl = (exit_price - entry_price) * qty if direction == "LONG" else (entry_price - exit_price) * qty
+    try:
+        async with _get_session_factory()() as _s:
+            _s.add(ClosedTrade(
+                bot_id=bot_id,
+                symbol=symbol,
+                direction=direction,
+                entry_execution_id=entry_exec_id,
+                exit_execution_id=exit_exec_id,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                qty=qty,
+                realized_pnl=realized_pnl,
+                entry_time=entry_time,
+                exit_time=exit_time,
+            ))
+            await _s.commit()
+    except Exception as e:
+        logger.warning("[CLOSED TRADE] Failed to persist: %s", e)
+
+
 @app.on_event("startup")
 async def startup_event():
     global _stream_task, _stock_stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
@@ -1705,14 +1871,28 @@ async def startup_event():
     # Restore persisted bot halt/resume states so bots don't auto-restart as ACTIVE
     try:
         from db.database import _get_session_factory
-        from db.models import BotState
+        from db.models import BotState, BotAmend
         from sqlalchemy import select as _select
+        import json as _json
         async with _get_session_factory()() as _session:
             _bot_states = (await _session.execute(_select(BotState))).scalars().all()
             master_engine.restore_from_db([
-                {"bot_id": s.bot_id, "status": s.status, "allocation": s.allocation}
+                {"bot_id": s.bot_id, "status": s.status, "allocation": float(s.allocation)}
                 for s in _bot_states
             ])
+            # Re-apply the latest UPDATE_STRATEGY_PARAMS amend for each bot
+            _amends = (await _session.execute(
+                _select(BotAmend)
+                .where(BotAmend.action == "UPDATE_STRATEGY_PARAMS")
+                .order_by(BotAmend.timestamp)
+            )).scalars().all()
+            for _amend in _amends:
+                if _amend.target_bot and _amend.params_json:
+                    try:
+                        _params = _json.loads(_amend.params_json)
+                        master_engine.update_strategy_params(_amend.target_bot, _params)
+                    except Exception as _pe:
+                        logger.debug("[STARTUP] BotAmend re-apply failed for %s: %s", _amend.target_bot, _pe)
     except Exception as _exc:
         logger.warning("[STARTUP] BotState restore failed: %s", _exc)
 
@@ -1732,6 +1912,10 @@ async def startup_event():
         get_positions_fn=_get_positions_for_reflection,
     )
     _ai_reflection_task = asyncio.create_task(_reflection_engine.run())
+
+    # Start portfolio snapshot loop (60s cadence)
+    asyncio.create_task(_portfolio_snapshot_loop())
+    logger.info("[SNAPSHOT] Portfolio snapshot loop started (60s cadence)")
 
     # Start the scanner agent — wrap push_fn to intercept "discover" events and
     # propagate newly discovered symbols into the strategy engine's routing table.

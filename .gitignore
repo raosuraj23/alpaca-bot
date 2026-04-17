@@ -30,6 +30,7 @@ sessions/
 /test-results/
 /playwright-report/
 /.pytest_cache
+/tests/
 
 # next.js
 /.next/

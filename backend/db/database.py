@@ -88,8 +88,7 @@ async def _add_missing_columns(conn):
 
 async def init_db():
     """Creates all ORM tables. Called once during FastAPI startup."""
-    import db.models           # noqa: F401 — SignalRecord, ExecutionRecord, BotAmend
-    import models.market_data  # noqa: F401 — MarketCandle, QuantSignal, OrderRecord, SlippageRecord
+    import db.models  # noqa: F401 — SignalRecord, ExecutionRecord, BotAmend
     engine = _get_engine()
     async with engine.begin() as conn:
         logger.info("[DB] Initializing schema at: %s", engine.url)

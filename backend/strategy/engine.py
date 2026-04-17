@@ -57,7 +57,7 @@ class StrategyEngine:
         return True
 
     def spawn_variant(self, source_bot_id: str, new_bot_id: str, params: dict) -> bool:
-        """Clone a bot with overridden params and add it as a new active bot.
+        """Instantiate a fresh strategy variant from the same class as source_bot_id.
         Returns False if source bot not found or new_bot_id already exists."""
         if new_bot_id in self.bots:
             logger.warning("[ENGINE] spawn_variant: %s already exists", new_bot_id)
@@ -66,10 +66,12 @@ class StrategyEngine:
         if not source:
             logger.warning("[ENGINE] spawn_variant: source %s not found", source_bot_id)
             return False
-        import copy
-        variant = copy.deepcopy(source)
-        variant.id     = new_bot_id
-        variant.name   = f"{source.name} [variant]"
+        StrategyClass = type(source)
+        variant = StrategyClass(
+            bot_id=new_bot_id,
+            name=f"{source.name} [variant]",
+            allocation=source.allocation,
+        )
         variant.status = "ACTIVE"
         variant.update_params(params)
         self.bots[new_bot_id] = variant

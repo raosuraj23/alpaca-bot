@@ -34,7 +34,7 @@ export function QuantStrategies() {
               <tr key={bot.id} className="hover:bg-[var(--panel-muted)]/30 transition-colors">
                 <td className="p-4 font-medium text-[var(--foreground)]">
                   <div className="flex items-center gap-3">
-                    <div className={`w-2 h-2 rounded-full ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)] shadow-[0_0_8px_rgba(0,200,5,0.5)]' : 'bg-[var(--muted-foreground)]'}`} />
+                    <div className={`w-2 h-2 rounded-sm ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)] shadow-[0_0_8px_rgba(0,200,5,0.5)]' : 'bg-[var(--muted-foreground)]'}`} />
                     {bot.name}
                   </div>
                 </td>

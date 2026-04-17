@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { useEffect, useRef } from 'react';
+import { API_BASE, WS_BASE } from '@/lib/api';
 
 import type {
   AssetClass,
@@ -113,7 +114,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   fetchMarketHistory: async (s: string) => {
     try {
       const encoded = encodeURIComponent(s);
-      const res = await fetch(`http://localhost:8000/api/market/history?symbol=${encoded}`);
+      const res = await fetch(`${API_BASE}/api/market/history?symbol=${encoded}`);
       if (res.ok) {
         set({ marketHistory: await res.json() });
       }
@@ -126,7 +127,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     try {
       const encoded = encodeURIComponent(symbol);
       const res = await fetch(
-        `http://localhost:8000/api/ohlcv?symbol=${encoded}&period=${period}`,
+        `${API_BASE}/api/ohlcv?symbol=${encoded}&period=${period}`,
         { signal: AbortSignal.timeout(10_000) },
       );
       if (res.ok) {
@@ -142,7 +143,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
 
   fetchRiskStatus: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/risk/status', {
+      const res = await fetch(`${API_BASE}/api/risk/status`, {
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
@@ -155,7 +156,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
 
   fetchStrategyStates: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/strategy/states', {
+      const res = await fetch(`${API_BASE}/api/strategy/states`, {
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
@@ -178,9 +179,9 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     };
 
     const [account, posData, ordData] = await Promise.all([
-      safeFetch<AlpacaAccountResponse>('http://localhost:8000/api/account'),
-      safeFetch<AlpacaPositionResponse[]>('http://localhost:8000/api/positions'),
-      safeFetch<AlpacaOrderResponse[]>('http://localhost:8000/api/orders'),
+      safeFetch<AlpacaAccountResponse>(`${API_BASE}/api/account`),
+      safeFetch<AlpacaPositionResponse[]>(`${API_BASE}/api/positions`),
+      safeFetch<AlpacaOrderResponse[]>(`${API_BASE}/api/orders`),
     ]);
 
     if (account) {
@@ -222,7 +223,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   // Refreshes the execution ledger from DB. Called on 60s interval.
   fetchLedger: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/ledger', { signal: AbortSignal.timeout(10000) });
+      const res = await fetch(`${API_BASE}/api/ledger`, { signal: AbortSignal.timeout(10000) });
       if (res.ok) {
         const ledger = await res.json();
         if (Array.isArray(ledger)) set({ ledgerTrades: ledger });
@@ -276,11 +277,11 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
 
     // Parallel fetch — fast endpoints only
     const [account, posData, ordData, bots, performance] = await Promise.all([
-      safeFetchJSON<AlpacaAccountResponse>('http://localhost:8000/api/account'),
-      safeFetchJSON<AlpacaPositionResponse[]>('http://localhost:8000/api/positions'),
-      safeFetchJSON<AlpacaOrderResponse[]>('http://localhost:8000/api/orders'),
-      safeFetchJSON<any[]>('http://localhost:8000/api/bots'),
-      safeFetchJSON<any>('http://localhost:8000/api/performance')
+      safeFetchJSON<AlpacaAccountResponse>(`${API_BASE}/api/account`),
+      safeFetchJSON<AlpacaPositionResponse[]>(`${API_BASE}/api/positions`),
+      safeFetchJSON<AlpacaOrderResponse[]>(`${API_BASE}/api/orders`),
+      safeFetchJSON<any[]>(`${API_BASE}/api/bots`),
+      safeFetchJSON<any>(`${API_BASE}/api/performance`)
     ]);
 
     if (account) {
@@ -324,7 +325,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     get().fetchRiskStatus();
 
     try {
-      const ledger = await safeFetchJSON<any[]>('http://localhost:8000/api/ledger');
+      const ledger = await safeFetchJSON<any[]>(`${API_BASE}/api/ledger`);
       if (Array.isArray(ledger) && ledger.length > 0) set({ ledgerTrades: ledger });
     } catch { /* silent fail */ }
 
@@ -343,7 +344,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
  * falls back to the offline data already in the Zustand store.
  * Call this once at the app root (src/app/page.tsx).
  */
-const WS_URL = 'ws://localhost:8000/stream';
+const WS_URL = `${WS_BASE}/stream`;
 const WS_MAX_ATTEMPTS = 5;
 const WS_BASE_DELAY_MS = 2000;
 
@@ -404,7 +405,7 @@ export function useTradingEngine() {
     connect();
 
     // SSE Endpoint connections
-    const reflectionsSSE = new EventSource('http://localhost:8000/api/reflections/stream');
+    const reflectionsSSE = new EventSource(`${API_BASE}/api/reflections/stream`);
     reflectionsSSE.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -447,7 +448,7 @@ export function useTradingEngine() {
       } catch (e) {}
     };
 
-    const logsSSE = new EventSource('http://localhost:8000/api/logs/stream');
+    const logsSSE = new EventSource(`${API_BASE}/api/logs/stream`);
     logsSSE.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -484,8 +485,8 @@ export function useTradingEngine() {
     // Poll bots + performance every 60s so strategy attribution + status stays current
     const pollBots = setInterval(() => {
       Promise.all([
-        fetch('http://localhost:8000/api/bots').then(r => r.ok ? r.json() : null),
-        fetch('http://localhost:8000/api/performance').then(r => r.ok ? r.json() : null),
+        fetch(`${API_BASE}/api/bots`).then(r => r.ok ? r.json() : null),
+        fetch(`${API_BASE}/api/performance`).then(r => r.ok ? r.json() : null),
       ]).then(([bots, perf]) => {
         if (Array.isArray(bots) && bots.length > 0) useTradingStore.setState({ bots });
         if (perf) useTradingStore.setState({ performance: perf });
@@ -494,14 +495,14 @@ export function useTradingEngine() {
 
     // Poll watchlist scanner results every 5 min (matches backend scan cadence)
     const pollWatchlist = setInterval(() => {
-      fetch('http://localhost:8000/api/watchlist')
+      fetch(`${API_BASE}/api/watchlist`)
         .then(r => r.ok ? r.json() : null)
         .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
         .catch(() => {});
     }, 300_000); // 5 min
 
     // Initial scanner load
-    fetch('http://localhost:8000/api/watchlist')
+    fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
       .catch(() => {});

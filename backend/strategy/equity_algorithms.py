@@ -262,6 +262,8 @@ class EquityPairsStrategy(BaseStrategy):
 
     Only SPY signals are emitted here (QQQ is the reference leg).
     Allocation: 10% default.
+
+    Spread variance tracked via Welford's sliding-window algorithm (O(1) per tick).
     """
 
     asset_class = "EQUITY"
@@ -277,6 +279,32 @@ class EquityPairsStrategy(BaseStrategy):
         self._price_b: float | None = None
         self._spread_history: deque = deque(maxlen=self.WINDOW)
         self._last_signal: str = "NONE"
+        # Welford sliding-window state for spread variance
+        self._w_mean: float = 0.0
+        self._w_M2:   float = 0.0
+        self._w_n:    int   = 0
+
+    def _update_welford(self, spread: float) -> None:
+        """Welford's sliding-window variance update (O(1)).
+        Must be called BEFORE appending spread to self._spread_history."""
+        n_cur = len(self._spread_history)
+        if n_cur == 0:
+            self._w_mean = spread
+            self._w_M2   = 0.0
+            self._w_n    = 1
+        elif n_cur < self.WINDOW:
+            self._w_n += 1
+            delta = spread - self._w_mean
+            self._w_mean += delta / self._w_n
+            self._w_M2   += delta * (spread - self._w_mean)
+        else:
+            old_x    = self._spread_history[0]
+            old_mean = self._w_mean
+            self._w_mean += (spread - old_x) / self.WINDOW
+            self._w_M2   += (spread - old_x) * (
+                (spread - self._w_mean) + (old_x - old_mean)
+            )
+            self._w_M2 = max(0.0, self._w_M2)
 
     def analyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
@@ -293,6 +321,7 @@ class EquityPairsStrategy(BaseStrategy):
             return None
 
         spread = self._price_a / self._price_b
+        self._update_welford(spread)
         self._spread_history.append(spread)
 
         if len(self._spread_history) < self.WINDOW:
@@ -302,10 +331,9 @@ class EquityPairsStrategy(BaseStrategy):
         if symbol != self.leg_a:
             return None
 
-        mean     = sum(self._spread_history) / self.WINDOW
-        variance = sum((s - mean) ** 2 for s in self._spread_history) / self.WINDOW
-        std      = math.sqrt(variance) if variance > 0 else 1e-9
-        z_score  = (spread - mean) / std
+        mean    = self._w_mean
+        std     = math.sqrt(self._w_M2 / self.WINDOW) if self._w_M2 > 0 else 1e-9
+        z_score = (spread - mean) / std
 
         signal = None
         if z_score < -self.Z_THRESHOLD and self._last_signal != "BUY" and self._is_flat(self.leg_a):
@@ -338,12 +366,10 @@ class EquityPairsStrategy(BaseStrategy):
         if symbol not in (self.leg_a, self.leg_b):
             return None
         z_score = None
-        if len(self._spread_history) >= self.WINDOW:
-            mean = sum(self._spread_history) / self.WINDOW
-            variance = sum((s - mean) ** 2 for s in self._spread_history) / self.WINDOW
-            std = math.sqrt(variance) if variance > 0 else 1e-9
-            spread = self._spread_history[-1]
-            z_score = round((spread - mean) / std, 3)
+        if len(self._spread_history) >= self.WINDOW and self._w_M2 > 0:
+            std     = math.sqrt(self._w_M2 / self.WINDOW)
+            spread  = self._spread_history[-1]
+            z_score = round((spread - self._w_mean) / std, 3)
         return {
             "strategy": self.id,
             "name": self.name,

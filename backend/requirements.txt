@@ -1,5 +1,6 @@
 # Phase 4 additions
 vectorbt>=0.26.0
+yfinance>=0.2.40
 
 # Technical Analysis
 # TA-Lib requires the pre-compiled C library. Install first; if compilation

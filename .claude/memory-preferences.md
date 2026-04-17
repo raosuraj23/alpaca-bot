@@ -87,3 +87,33 @@ At the start of every session, Claude should:
 
 Claude must not re-propose rejected strategies or re-debate closed ADL entries
 unless the user explicitly asks to revisit them.
+
+---
+
+## 6. Phase Completion Status Log
+
+Record every phase (or sub-phase) here upon successful completion. Include the date,
+what was shipped, and any follow-on items discovered during implementation.
+
+| Date       | Phase  | Items Completed                                        | Follow-on / Notes                          |
+|------------|--------|--------------------------------------------------------|--------------------------------------------|
+| 2026-04-17 | Phase 1 · O(1) Math | Welford's sliding-window variance in StatArbStrategy, EquityPairsStrategy, ProtectivePutStrategy; O(1) RSI in EquityRSIStrategy + CoveredCallStrategy | All strategy state now O(1) per tick |
+| 2026-04-17 | Phase 1 · Factory Pattern | Removed copy.deepcopy in spawn_variant; factory via type(source)(**kwargs) | None |
+| 2026-04-17 | Phase 1+2 · DB Schema | Float→Numeric(18,8) on all price/qty/pnl cols; added ClosedTrade and PortfolioSnapshot models; composite index on (bot_id, symbol) | Alembic migration not yet generated — SQLite auto-creates on startup |
+| 2026-04-17 | Phase 2 · Async LLM | orchestrator.process_chat + process_signal → async/ainvoke; reflection_engine.learn_from_execution → async/ainvoke | None |
+| 2026-04-17 | Phase 2 · Snapshot + FIFO | _portfolio_snapshot_loop (60s cron); _write_closed_trade FIFO reconciliation on SELL fills; BotAmend param restore on startup | _entry_prices/_entry_times dicts in main.py memory; not persisted across restart |
+| 2026-04-17 | Phase 3 · OHLCV | /api/ohlcv extended to support equity symbols via StockHistoricalDataClient + StockBarsRequest | None |
+| 2026-04-17 | Phase 3 · Nivo removal | Confirmed no Nivo imports; lightweight-charts used instead | None |
+| 2026-04-17 | Phase 4 · Backtest + URL cleanup | backend/backtest/runner.py (VectorBT); POST /api/backtest with SSE progress; BacktestRunner.tsx wired to real endpoint; all hardcoded localhost URLs → API_BASE/WS_BASE env constants | 50/50 Playwright tests passing |
+
+**How to update this table:**
+
+After finishing a phase task, append a row with:
+
+- `Date` — ISO date (YYYY-MM-DD)
+- `Phase` — e.g. "Phase 1 · O(1) Math", "Phase 3 · SSE Reflections"
+- `Items Completed` — one-line summary of what was shipped
+- `Follow-on / Notes` — any new bugs found, decisions made, or deferred items
+
+Claude must update this table after every successfully completed implementation
+before reporting the task as done to the user.

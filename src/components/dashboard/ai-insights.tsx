@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -145,7 +146,7 @@ export function AiInsights() {
   const fetchNews = React.useCallback(async () => {
     setNewsLoading(true);
     try {
-      const res = await fetch('http://localhost:8000/api/market/news', {
+      const res = await fetch(`${API_BASE}/api/market/news`, {
         signal: AbortSignal.timeout(10000),
       });
       if (res.ok) {
@@ -163,7 +164,7 @@ export function AiInsights() {
     setCommLoading(true);
     try {
       const res = await fetch(
-        `http://localhost:8000/api/market/commentary${force ? '?force=true' : ''}`,
+        `${API_BASE}/api/market/commentary${force ? '?force=true' : ''}`,
         { signal: AbortSignal.timeout(30000) },
       );
       if (res.ok) {

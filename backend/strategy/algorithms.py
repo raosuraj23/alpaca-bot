@@ -184,6 +184,8 @@ class StatArbStrategy(BaseStrategy):
 
     Confidence is proportional to how far price has deviated beyond the band:
       conf = 0.65 + min(0.30, deviation_σ * 0.15)
+
+    Variance is tracked via Welford's sliding-window algorithm (O(1) per tick).
     """
 
     WINDOW = 20
@@ -192,27 +194,56 @@ class StatArbStrategy(BaseStrategy):
         super().__init__(bot_id, name, allocation, "Bollinger Band")
         self._prices: dict[str, deque] = {}
         self._last_signal: dict[str, str] = {}
+        # Welford sliding-window state per symbol
+        self._w_mean: dict[str, float] = {}
+        self._w_M2:   dict[str, float] = {}
+        self._w_n:    dict[str, int]   = {}
 
-    def _bollinger(self, prices: deque) -> tuple[float, float, float]:
-        """Returns (sma, upper_band, lower_band)."""
-        n = len(prices)
-        sma = sum(prices) / n
-        variance = sum((p - sma) ** 2 for p in prices) / n
-        sigma = math.sqrt(variance)
-        return sma, sma + 2 * sigma, sma - 2 * sigma
+    def _update_welford(self, symbol: str, price: float) -> None:
+        """Welford's sliding-window variance update (O(1)).
+        Must be called BEFORE appending price to self._prices[symbol]."""
+        n_cur = len(self._prices[symbol])
+        if n_cur == 0:
+            self._w_mean[symbol] = price
+            self._w_M2[symbol]   = 0.0
+            self._w_n[symbol]    = 1
+        elif n_cur < self.WINDOW:
+            # Window not yet full: standard incremental Welford's
+            self._w_n[symbol] += 1
+            delta = price - self._w_mean[symbol]
+            self._w_mean[symbol] += delta / self._w_n[symbol]
+            delta2 = price - self._w_mean[symbol]
+            self._w_M2[symbol] += delta * delta2
+        else:
+            # Window full: remove oldest (prices[0]), add newest
+            old_x    = self._prices[symbol][0]
+            old_mean = self._w_mean[symbol]
+            self._w_mean[symbol] = old_mean + (price - old_x) / self.WINDOW
+            self._w_M2[symbol]  += (price - old_x) * (
+                (price - self._w_mean[symbol]) + (old_x - old_mean)
+            )
+            self._w_M2[symbol] = max(0.0, self._w_M2[symbol])
+
+    def _bollinger(self, symbol: str) -> tuple[float, float, float]:
+        """Returns (sma, upper_band, lower_band) from O(1) Welford state."""
+        mean     = self._w_mean[symbol]
+        variance = self._w_M2[symbol] / self._w_n[symbol]
+        sigma    = math.sqrt(max(0.0, variance))
+        return mean, mean + 2 * sigma, mean - 2 * sigma
 
     def analyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self._prices:
             self._prices[symbol] = deque(maxlen=self.WINDOW)
             self._last_signal[symbol] = "NONE"
 
+        self._update_welford(symbol, price)
         self._prices[symbol].append(price)
 
         # Need full window before emitting signals
         if len(self._prices[symbol]) < self.WINDOW:
             return None
 
-        sma, upper, lower = self._bollinger(self._prices[symbol])
+        sma, upper, lower = self._bollinger(symbol)
 
         signal = None
         if price < lower and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
@@ -246,7 +277,7 @@ class StatArbStrategy(BaseStrategy):
         if symbol not in self._prices or len(self._prices[symbol]) < self.WINDOW:
             return {"strategy": self.id, "name": self.name, "status": "warming_up",
                     "ticks_collected": len(self._prices.get(symbol, []))}
-        sma, upper, lower = self._bollinger(self._prices[symbol])
+        sma, upper, lower = self._bollinger(symbol)
         price = self._prices[symbol][-1]
         band_width = upper - lower if upper != lower else 1
         position_pct = round((price - lower) / band_width * 100, 1)

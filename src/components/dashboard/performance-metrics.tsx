@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BarChart3, PieChart, ShieldAlert, TrendingUp, TrendingDown, Activity } from 'lucide-react';
@@ -150,7 +151,7 @@ function PnLCalendar({ history }: { history: [number, number][] }) {
             return (
               <div key={hour} className="flex-1 flex flex-col items-center group">
                 <div
-                  className="w-full rounded-t-sm transition-all duration-200 group-hover:brightness-125"
+                  className="w-full rounded-sm transition-all duration-200 group-hover:brightness-125"
                   style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
                 >
                   <title>{String(hour).padStart(2,'0')}:00{pnl != null ? ` — ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}` : ''}</title>
@@ -182,7 +183,7 @@ function PnLCalendar({ history }: { history: [number, number][] }) {
                 )}
                 <div className="w-full flex-1 flex items-end">
                   <div
-                    className={`w-full rounded-t-sm transition-all duration-300 group-hover:brightness-125 ${isToday ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
+                    className={`w-full rounded-sm transition-all duration-300 group-hover:brightness-125 ${isToday ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
                     style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
                   />
                 </div>
@@ -246,7 +247,7 @@ function PnLCalendar({ history }: { history: [number, number][] }) {
                 )}
                 <div className="w-full flex-1 flex items-end">
                   <div
-                    className={`w-full rounded-t-sm transition-all duration-300 group-hover:brightness-125 ${isCurrent ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
+                    className={`w-full rounded-sm transition-all duration-300 group-hover:brightness-125 ${isCurrent ? 'ring-1 ring-[var(--kraken-purple)]/40' : ''}`}
                     style={{ height: `${h}%`, background: cellColor(pnl, maxH) }}
                   />
                 </div>
@@ -316,7 +317,7 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
   const maxV = Math.max(...allValues, 0.001);
   const minV = Math.min(...data.cumulative_pnl.map(([, v]) => v), 0);
 
-  const toX = (ts: number, series: [number, number][]) => {
+  const toX = (ts: number) => {
     const allTs = [
       ...data.cumulative_cost.map(([t]) => t),
       ...data.cumulative_pnl.map(([t]) => t),
@@ -332,13 +333,13 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
 
   const costPath = data.cumulative_cost.length > 1
     ? data.cumulative_cost.map(([ts, v], i) =>
-        `${i === 0 ? 'M' : 'L'}${toX(ts, data.cumulative_cost).toFixed(1)},${toY(v).toFixed(1)}`
+        `${i === 0 ? 'M' : 'L'}${toX(ts).toFixed(1)},${toY(v).toFixed(1)}`
       ).join(' ')
     : null;
 
   const pnlPath = data.cumulative_pnl.length > 1
     ? data.cumulative_pnl.map(([ts, v], i) =>
-        `${i === 0 ? 'M' : 'L'}${toX(ts, data.cumulative_pnl).toFixed(1)},${toY(v).toFixed(1)}`
+        `${i === 0 ? 'M' : 'L'}${toX(ts).toFixed(1)},${toY(v).toFixed(1)}`
       ).join(' ')
     : null;
 
@@ -390,10 +391,10 @@ function LLMCostChart({ data }: { data: LLMCostData }) {
           <table className="w-full text-xs tabular-nums font-mono">
             <thead className="sticky top-0 bg-[var(--panel-muted)]">
               <tr className="text-[var(--muted-foreground)] border-b border-[var(--border)]">
-                <th className="py-1 px-2 text-left font-medium">Date</th>
-                <th className="py-1 px-2 text-right font-medium">Day PnL</th>
-                <th className="py-1 px-2 text-right font-medium">LLM Cost</th>
-                <th className="py-1 px-2 text-right font-medium">Ratio</th>
+                <th className="py-1 px-2 text-left font-medium tracking-wider">Date</th>
+                <th className="py-1 px-2 text-right font-medium tracking-wider">Day PnL</th>
+                <th className="py-1 px-2 text-right font-medium tracking-wider">LLM Cost</th>
+                <th className="py-1 px-2 text-right font-medium tracking-wider">Ratio</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border)]/30">
@@ -619,36 +620,37 @@ function TradingChart({ history, lastSignal, ohlcv }: {
 }
 
 // ---------------------------------------------------------------------------
-// Tear Sheet Sidebar — Sharpe, Sortino, Drawdown, Win Rate, Active Bots
+// Tear Sheet Sidebar — 8-row metrics panel alongside equity curve
 // ---------------------------------------------------------------------------
 
-function TearSheet({ perfData, bots, winRate }: {
-  perfData: any;
-  bots:     any[];
-  winRate:  number | null;
+function TearSheet({ perfData, winRate, todayPnl, unrealizedPnl, profitFactor, calmarRatio }: {
+  perfData:      any;
+  winRate:       number | null;
+  todayPnl:      number | null;
+  unrealizedPnl: number | null;
+  profitFactor:  number | null;
+  calmarRatio:   number | null;
 }) {
-  const activeBots = bots.filter((b: any) => b.status === 'ACTIVE').length;
-  const drawdown   = perfData.drawdown ?? 0;
-  const netPnl     = perfData.net_pnl  ?? 0;
-  // Sharpe & Sortino sourced from backend /api/performance (annualised, sqrt(252))
-  const sharpe  = perfData.sharpe  ?? 0;
-  const sortino = perfData.sortino ?? 0;
+  const drawdown = perfData.drawdown ?? 0;
+  const sharpe   = perfData.sharpe  ?? 0;
+  const sortino  = perfData.sortino ?? 0;
+
+  const pfDisplay = profitFactor == null
+    ? '—'
+    : !isFinite(profitFactor)
+      ? '∞'
+      : profitFactor.toFixed(2);
 
   const rows = [
     {
-      label: 'Net PnL',
-      value: perfData.has_data ? `${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}` : '—',
-      color: netPnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
-    },
-    {
-      label: 'Max Drawdown',
+      label: 'Max DD',
       value: `${drawdown.toFixed(3)}%`,
       color: drawdown >= 1.5 ? 'text-[var(--neon-red)]' : 'text-[var(--foreground)]',
     },
     {
       label: 'Sharpe',
       value: perfData.has_data ? sharpe.toFixed(2) : '—',
-      color: 'text-[var(--foreground)]',
+      color: sharpe >= 1 ? 'text-[var(--neon-green)]' : 'text-[var(--foreground)]',
     },
     {
       label: 'Sortino',
@@ -663,16 +665,43 @@ function TearSheet({ perfData, bots, winRate }: {
         : 'text-[var(--muted-foreground)]',
     },
     {
-      label: 'Active Bots',
-      value: String(activeBots),
-      color: activeBots > 0 ? 'text-[var(--neon-green)]' : 'text-[var(--muted-foreground)]',
+      label: 'Profit F.',
+      value: pfDisplay,
+      color: profitFactor == null
+        ? 'text-[var(--muted-foreground)]'
+        : profitFactor >= 1.5
+          ? 'text-[var(--neon-green)]'
+          : profitFactor < 1.0
+            ? 'text-[var(--neon-red)]'
+            : 'text-[var(--foreground)]',
+    },
+    {
+      label: 'Calmar',
+      value: calmarRatio != null ? calmarRatio.toFixed(2) : '—',
+      color: calmarRatio != null && calmarRatio >= 0.5
+        ? 'text-[var(--neon-green)]'
+        : 'text-[var(--foreground)]',
+    },
+    {
+      label: "Today",
+      value: todayPnl != null
+        ? (todayPnl >= 0 ? '+' : '') + `$${todayPnl.toFixed(2)}`
+        : '—',
+      color: (todayPnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
+    },
+    {
+      label: 'Unreal.',
+      value: unrealizedPnl != null
+        ? (unrealizedPnl >= 0 ? '+' : '') + `$${unrealizedPnl.toFixed(2)}`
+        : '—',
+      color: (unrealizedPnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
     },
   ];
 
   return (
-    <div className="w-40 shrink-0 flex flex-col gap-0 border-l border-[var(--border)] divide-y divide-[var(--border)]/40">
+    <div className="w-48 shrink-0 flex flex-col gap-0 border-l border-[var(--border)] divide-y divide-[var(--border)]/40">
       {rows.map(row => (
-        <div key={row.label} className="flex flex-col px-3 py-2.5">
+        <div key={row.label} className="flex flex-col px-3 py-2">
           <span className="text-xs uppercase tracking-wider text-[var(--muted-foreground)] mb-0.5 leading-none">
             {row.label}
           </span>
@@ -681,6 +710,336 @@ function TearSheet({ perfData, bots, winRate }: {
           </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DrawdownChart — running peak-to-trough underwater curve
+// ---------------------------------------------------------------------------
+
+function DrawdownChart({ history }: { history: [number, number][] }) {
+  const gradId = React.useId().replace(/:/g, '_');
+
+  const ddPoints = React.useMemo(() => {
+    if (!history || history.length < 2) return [] as { dd: number }[];
+    let peak = history[0][1];
+    return history.map(([, val]) => {
+      if (val > peak) peak = val;
+      return { dd: peak > 0 ? ((peak - val) / peak) * 100 : 0 };
+    });
+  }, [history]);
+
+  const maxDd = React.useMemo(
+    () => Math.max(...ddPoints.map(p => p.dd), 0.001),
+    [ddPoints],
+  );
+
+  const maxDdIdx = React.useMemo(
+    () => ddPoints.reduce((mi, p, i) => (p.dd > (ddPoints[mi]?.dd ?? 0) ? i : mi), 0),
+    [ddPoints],
+  );
+
+  if (ddPoints.length < 2) {
+    return (
+      <div className="w-full h-[110px] flex items-center justify-center text-xs font-mono text-[var(--muted-foreground)] opacity-30 uppercase tracking-widest">
+        Insufficient history
+      </div>
+    );
+  }
+
+  const W = 1000; const H = 100;
+  const PL = 38; const PR = 6; const PT = 10; const PB = 16;
+
+  const toX = (i: number) => PL + (i / Math.max(ddPoints.length - 1, 1)) * (W - PL - PR);
+  const toY = (dd: number) => PT + (dd / maxDd) * (H - PT - PB);
+
+  const pts = ddPoints.map((p, i) => `${toX(i).toFixed(1)},${toY(p.dd).toFixed(1)}`);
+  const linePath = `M${pts.join(' L')}`;
+  const areaPath = `${linePath} L${toX(ddPoints.length - 1).toFixed(1)},${(H - PB).toFixed(1)} L${toX(0).toFixed(1)},${(H - PB).toFixed(1)} Z`;
+
+  const mxX = toX(maxDdIdx);
+  const mxY = toY(ddPoints[maxDdIdx]?.dd ?? 0);
+  const labelRight = mxX > W * 0.75;
+
+  return (
+    <div className="w-full" style={{ height: 110 }}>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        style={{ width: '100%', height: '100%' }}
+      >
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--neon-red)" stopOpacity="0.4" />
+            <stop offset="100%" stopColor="var(--neon-red)" stopOpacity="0.04" />
+          </linearGradient>
+        </defs>
+
+        {/* Zero baseline */}
+        <line x1={PL} y1={PT} x2={W - PR} y2={PT}
+              stroke="var(--border)" strokeWidth="0.8" strokeDasharray="4,4" />
+
+        {/* Area fill */}
+        <path d={areaPath} fill={`url(#${gradId})`} />
+
+        {/* Stroke line */}
+        <path d={linePath} fill="none" stroke="var(--neon-red)" strokeWidth="1.5"
+              strokeLinejoin="round" strokeLinecap="round" />
+
+        {/* Max drawdown annotation */}
+        {(ddPoints[maxDdIdx]?.dd ?? 0) > 0.01 && (
+          <>
+            <circle cx={mxX} cy={mxY} r={3}
+              fill="var(--neon-red)" stroke="var(--background)" strokeWidth="1.5" />
+            <text
+              x={labelRight ? mxX - 5 : mxX + 5}
+              y={mxY - 4}
+              textAnchor={labelRight ? 'end' : 'start'}
+              fill="var(--neon-red)" fontSize={8}
+              fontFamily="JetBrains Mono, monospace"
+            >
+              {`-${(ddPoints[maxDdIdx]?.dd ?? 0).toFixed(2)}%`}
+            </text>
+          </>
+        )}
+
+        {/* Current drawdown dot */}
+        {(() => {
+          const last = ddPoints[ddPoints.length - 1];
+          if (!last || last.dd < 0.001) return null;
+          return (
+            <circle cx={toX(ddPoints.length - 1)} cy={toY(last.dd)} r={2.5}
+              fill="var(--neon-red)" opacity="0.7" />
+          );
+        })()}
+
+        {/* Y-axis labels */}
+        <text x={PL - 3} y={PT + 4} textAnchor="end"
+              fill="var(--muted-foreground)" fontSize={7}
+              fontFamily="JetBrains Mono, monospace" opacity="0.5">0%</text>
+        <text x={PL - 3} y={H - PB} textAnchor="end"
+              fill="var(--neon-red)" fontSize={7}
+              fontFamily="JetBrains Mono, monospace" opacity="0.7">
+          {`-${maxDd.toFixed(1)}%`}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RollingMetricsChart — 20-day rolling Sharpe over time
+// ---------------------------------------------------------------------------
+
+function RollingMetricsChart({ history }: { history: [number, number][] }) {
+  const WINDOW   = 20;
+  const SQRT_252 = Math.sqrt(252);
+
+  const rollingPoints = React.useMemo(() => {
+    if (!history || history.length < WINDOW + 2) return [] as { sharpe: number }[];
+    const returns: number[] = [];
+    for (let i = 1; i < history.length; i++) {
+      const prev = history[i - 1][1];
+      returns.push(prev !== 0 ? (history[i][1] - prev) / prev : 0);
+    }
+    const pts: { sharpe: number }[] = [];
+    for (let i = WINDOW; i <= returns.length; i++) {
+      const win  = returns.slice(i - WINDOW, i);
+      const mean = win.reduce((s, r) => s + r, 0) / WINDOW;
+      const vari = win.reduce((s, r) => s + (r - mean) ** 2, 0) / (WINDOW - 1);
+      const std  = Math.sqrt(vari);
+      pts.push({ sharpe: std < 1e-10 ? 0 : (mean / std) * SQRT_252 });
+    }
+    return pts;
+  }, [history]);
+
+  if (rollingPoints.length < 2) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-2">
+        <Activity className="w-5 h-5 text-[var(--muted-foreground)] opacity-20" />
+        <div className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-widest text-center">
+          Need {WINDOW + 2}+ equity snapshots
+        </div>
+      </div>
+    );
+  }
+
+  const W = 1000; const H = 90;
+  const PL = 34; const PR = 6; const PT = 8; const PB = 8;
+
+  const rawMax = Math.max(...rollingPoints.map(p => Math.abs(p.sharpe)));
+  const yMax   = Math.max(Math.min(rawMax, 10), 1);
+
+  const toX = (i: number) => PL + (i / Math.max(rollingPoints.length - 1, 1)) * (W - PL - PR);
+  const toY = (s: number) => {
+    const clamped = Math.max(Math.min(s, yMax), -yMax);
+    return PT + ((-clamped + yMax) / (2 * yMax)) * (H - PT - PB);
+  };
+  const zeroY = toY(0);
+
+  // Contiguous negative segments for red shading
+  const negSegs: { s: number; e: number }[] = [];
+  let segStart: number | null = null;
+  rollingPoints.forEach((p, i) => {
+    if (p.sharpe < 0 && segStart === null) segStart = i;
+    if (p.sharpe >= 0 && segStart !== null) {
+      negSegs.push({ s: segStart, e: i - 1 });
+      segStart = null;
+    }
+  });
+  if (segStart !== null) negSegs.push({ s: segStart, e: rollingPoints.length - 1 });
+
+  const pts = rollingPoints.map((p, i) => `${toX(i).toFixed(1)},${toY(p.sharpe).toFixed(1)}`);
+  const linePath = `M${pts.join(' L')}`;
+
+  const lastSharpe = rollingPoints[rollingPoints.length - 1]?.sharpe ?? 0;
+
+  return (
+    <div className="flex flex-col gap-1 h-full">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', flex: 1 }}>
+        {/* Zero line */}
+        <line x1={PL} y1={zeroY} x2={W - PR} y2={zeroY}
+              stroke="var(--border)" strokeWidth="1" strokeDasharray="4,4" />
+
+        {/* Negative zone shading */}
+        {negSegs.map((seg, i) => (
+          <rect key={i}
+            x={toX(seg.s)} y={zeroY}
+            width={Math.max(toX(seg.e) - toX(seg.s), 1)}
+            height={H - PB - zeroY}
+            fill="var(--neon-red)" opacity="0.12"
+          />
+        ))}
+
+        {/* Sharpe line */}
+        <path d={linePath} fill="none" stroke="var(--kraken-purple)" strokeWidth="1.5"
+              strokeLinejoin="round" strokeLinecap="round" />
+
+        {/* Y-axis labels */}
+        <text x={PL - 3} y={PT + 4} textAnchor="end"
+              fill="var(--muted-foreground)" fontSize={7}
+              fontFamily="JetBrains Mono, monospace" opacity="0.5">
+          +{yMax.toFixed(0)}
+        </text>
+        <text x={PL - 3} y={H - PB} textAnchor="end"
+              fill="var(--muted-foreground)" fontSize={7}
+              fontFamily="JetBrains Mono, monospace" opacity="0.5">
+          -{yMax.toFixed(0)}
+        </text>
+        <text x={PL - 3} y={zeroY + 3} textAnchor="end"
+              fill="var(--muted-foreground)" fontSize={6}
+              fontFamily="JetBrains Mono, monospace" opacity="0.4">0</text>
+      </svg>
+      <div className="flex items-center justify-between text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-50 px-1">
+        <span>20-day window · {rollingPoints.length} points</span>
+        <span className={lastSharpe >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
+          Current {lastSharpe >= 0 ? '+' : ''}{lastSharpe.toFixed(2)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TradeDistribution — histogram of realized trade P&L returns
+// ---------------------------------------------------------------------------
+
+function TradeDistribution({ trades }: { trades: { pnl: number }[] | undefined }) {
+  const N_BINS = 12;
+
+  const stats = React.useMemo(() => {
+    if (!trades || trades.length < 3) return null;
+    const pnls = trades.map(t => t.pnl);
+    const minP = Math.min(...pnls);
+    const maxP = Math.max(...pnls);
+    const range = maxP - minP || 1;
+    const bw = range / N_BINS;
+
+    const counts = new Array(N_BINS).fill(0);
+    pnls.forEach(p => {
+      const idx = Math.min(Math.floor((p - minP) / bw), N_BINS - 1);
+      counts[idx]++;
+    });
+
+    const mean = pnls.reduce((s, p) => s + p, 0) / pnls.length;
+    const sorted = [...pnls].sort((a, b) => a - b);
+    const median = sorted.length % 2 === 0
+      ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+      : sorted[Math.floor(sorted.length / 2)];
+    const variance = pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / pnls.length;
+    const std = Math.sqrt(variance);
+    const skewness = std < 1e-10 ? 0 : (3 * (mean - median)) / std;
+
+    const bins = counts.map((count, i) => ({
+      mid: minP + (i + 0.5) * bw,
+      count,
+    }));
+
+    return { bins, minP, range, bw, mean, skewness, total: pnls.length };
+  }, [trades]);
+
+  if (!stats) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-2">
+        <BarChart3 className="w-5 h-5 text-[var(--muted-foreground)] opacity-20" />
+        <div className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-widest text-center">
+          Need 3+ closed trades
+        </div>
+      </div>
+    );
+  }
+
+  const { bins, minP, range, mean, skewness, total } = stats;
+
+  const W = 1000; const H = 80;
+  const PL = 6; const PR = 6; const PT = 8; const PB = 4;
+
+  const maxCount = Math.max(...bins.map(b => b.count), 1);
+  const slotW    = (W - PL - PR) / bins.length;
+  const barGap   = 3;
+  const meanX    = PL + ((mean - minP) / range) * (W - PL - PR);
+
+  const skewLabel = skewness > 0.2
+    ? 'right-skewed +'
+    : skewness < -0.2
+      ? 'left-skewed !'
+      : 'symmetric';
+  const skewColor = skewness > 0.2
+    ? 'text-[var(--neon-green)]'
+    : skewness < -0.2
+      ? 'text-[var(--neon-red)]'
+      : 'text-[var(--muted-foreground)]';
+
+  return (
+    <div className="flex flex-col gap-1 h-full">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', flex: 1 }}>
+        {bins.map((bin, i) => {
+          const isPos = bin.mid >= 0;
+          const bh = Math.max((bin.count / maxCount) * (H - PT - PB), bin.count > 0 ? 2 : 1);
+          const x  = PL + i * slotW + barGap / 2;
+          const y  = H - PB - bh;
+          return (
+            <rect key={i}
+              x={x} y={y}
+              width={Math.max(slotW - barGap, 1)} height={bh}
+              fill={isPos ? 'var(--neon-green)' : 'var(--neon-red)'}
+              opacity="0.75"
+            />
+          );
+        })}
+
+        {/* Mean line */}
+        {meanX >= PL && meanX <= W - PR && (
+          <line x1={meanX} y1={PT} x2={meanX} y2={H - PB}
+                stroke="var(--foreground)" strokeWidth="1.5"
+                strokeDasharray="3,3" opacity="0.45" />
+        )}
+      </svg>
+      <div className="flex items-center justify-between text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60 px-1">
+        <span>{total} trades · mean ${mean.toFixed(2)}</span>
+        <span className={skewColor}>{skewLabel}</span>
+      </div>
     </div>
   );
 }
@@ -701,7 +1060,7 @@ export function PerformanceMetrics() {
   const positions      = useTradingStore(s => s.positions);
   const ohlcvData      = useTradingStore(s => s.ohlcvData);
   const fetchOHLCV     = useTradingStore(s => s.fetchOHLCV);
-  const lastSignal    = useTradingStore(s => s.lastSignal);
+  const lastSignal     = useTradingStore(s => s.lastSignal);
 
   const [period, setPeriod] = React.useState<Period>('1M');
   const [perfData, setPerfData] = React.useState(performance);
@@ -711,12 +1070,12 @@ export function PerformanceMetrics() {
 
   React.useEffect(() => {
     const loadPerf = () =>
-      fetch(`http://localhost:8000/api/performance?period=${period}`)
+      fetch(`${API_BASE}/api/performance?period=${period}`)
         .then(r => r.ok ? r.json() : null)
         .then(d => { if (d) setPerfData(d); })
         .catch(() => {});
     loadPerf();
-    const interval = setInterval(loadPerf, 60_000); // refresh every 60s
+    const interval = setInterval(loadPerf, 60_000);
     return () => clearInterval(interval);
   }, [period]);
 
@@ -731,7 +1090,7 @@ export function PerformanceMetrics() {
 
   React.useEffect(() => {
     const load = () =>
-      fetch(`http://localhost:8000/api/analytics/llm-cost?period=${period}`)
+      fetch(`${API_BASE}/api/analytics/llm-cost?period=${period}`)
         .then(r => r.ok ? r.json() : null)
         .then(d => { if (d) setLlmCostData(d); })
         .catch(() => {});
@@ -740,7 +1099,7 @@ export function PerformanceMetrics() {
     return () => clearInterval(interval);
   }, [period]);
 
-  // Win rate — closed realized trades where pnl > 0 (not equity day-count)
+  // Win rate — closed realized trades where pnl > 0
   const winRate = React.useMemo(() => {
     const trades = perfData.realized_trades as { pnl: number }[] | undefined;
     if (!trades || trades.length === 0) return null;
@@ -748,23 +1107,53 @@ export function PerformanceMetrics() {
     return (wins / trades.length) * 100;
   }, [perfData.realized_trades]);
 
+  // Profit Factor — gross wins / gross losses
+  const profitFactor = React.useMemo(() => {
+    const trades = perfData.realized_trades as { pnl: number }[] | undefined;
+    if (!trades || trades.length === 0) return null;
+    const gw = trades.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
+    const gl = trades.filter(t => t.pnl < 0).reduce((s, t) => s + Math.abs(t.pnl), 0);
+    if (gl === 0) return gw > 0 ? Infinity : null;
+    return gw / gl;
+  }, [perfData.realized_trades]);
+
   const drawdown   = perfData.drawdown ?? riskStatus?.drawdown_pct ?? 0;
   const killActive = riskStatus?.triggered ?? false;
 
-  // Compute unrealized P&L total from live positions as fallback when account doesn't supply it
+  // Calmar Ratio — annualised return / max drawdown
+  const calmarRatio = React.useMemo(() => {
+    if (drawdown <= 0 || !perfData.has_data) return null;
+    const hist = perfData.history as [number, number][];
+    if (!hist || hist.length < 2) return null;
+    const firstEq = hist[0][1];
+    const lastEq  = hist[hist.length - 1][1];
+    const days    = Math.max((hist[hist.length - 1][0] - hist[0][0]) / 86_400_000, 1);
+    const annRet  = ((lastEq - firstEq) / (firstEq || 1)) * (252 / days);
+    return annRet / (drawdown / 100);
+  }, [perfData, drawdown]);
+
+  // Compute unrealized P&L total from live positions as fallback
   const positionsUnrealizedPnl = React.useMemo(
     () => positions.reduce((sum, p) => sum + (p.unrealizedPnl ?? 0), 0),
     [positions],
   );
   const liveUnrealized = unrealizedPnl ?? positionsUnrealizedPnl;
 
+  const pfDisplay = profitFactor == null
+    ? '—'
+    : !isFinite(profitFactor)
+      ? '∞'
+      : profitFactor.toFixed(2);
+
+  // 8-item KPI grid: 4×2 layout
   const kpis = [
+    // Row 1: return / risk metrics
     {
       label: 'Total Net PnL',
       value: perfData.has_data
         ? (perfData.net_pnl >= 0 ? '+' : '') + `$${perfData.net_pnl.toFixed(2)}`
         : '$0.00',
-      sub: `${period} Live`,
+      sub: `${period} Realized`,
       c: (perfData.net_pnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
     },
     {
@@ -776,39 +1165,58 @@ export function PerformanceMetrics() {
         : 'text-[var(--foreground)]',
     },
     {
-      label: 'Kill Switch',
-      value: killActive ? 'TRIGGERED' : 'ARMED',
-      sub: killActive ? (riskStatus?.reason ?? 'Active') : 'Monitoring',
-      c: killActive ? 'text-[var(--neon-red)] animate-pulse' : 'text-[var(--neon-green)]',
-    },
-    {
       label: 'Sharpe Ratio',
       value: perfData.has_data ? (perfData.sharpe ?? 0).toFixed(2) : '—',
       sub: 'Annualised √252',
-      c: 'text-[var(--foreground)]',
+      c: (perfData.sharpe ?? 0) >= 1
+        ? 'text-[var(--neon-green)]'
+        : 'text-[var(--foreground)]',
     },
     {
-      label: 'Unrealized P&L',
-      value: liveUnrealized != null
-        ? (liveUnrealized >= 0 ? '+' : '') + `$${liveUnrealized.toFixed(2)}`
-        : '—',
-      sub: `${positions.length} open position${positions.length !== 1 ? 's' : ''}`,
-      c: liveUnrealized >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
+      label: 'Sortino Ratio',
+      value: perfData.has_data ? (perfData.sortino ?? 0).toFixed(2) : '—',
+      sub: 'Downside deviation',
+      c: (perfData.sortino ?? 0) >= 1
+        ? 'text-[var(--neon-green)]'
+        : 'text-[var(--foreground)]',
+    },
+    // Row 2: efficiency / execution metrics
+    {
+      label: 'Calmar Ratio',
+      value: calmarRatio != null ? calmarRatio.toFixed(2) : '—',
+      sub: 'Ann. Return / DD',
+      c: calmarRatio == null
+        ? 'text-[var(--muted-foreground)]'
+        : calmarRatio >= 0.5
+          ? 'text-[var(--neon-green)]'
+          : 'text-[var(--foreground)]',
     },
     {
-      label: "Today's P&L",
-      value: todayPnl != null
-        ? (todayPnl >= 0 ? '+' : '') + `$${todayPnl.toFixed(2)}`
-        : '—',
-      sub: 'vs. Last Session',
-      c: (todayPnl ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]',
+      label: 'Win Rate',
+      value: winRate != null ? `${winRate.toFixed(0)}%` : '—',
+      sub: `${(perfData.realized_trades?.length ?? 0)} trades`,
+      c: winRate != null
+        ? (winRate >= 50 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]')
+        : 'text-[var(--muted-foreground)]',
+    },
+    {
+      label: 'Profit Factor',
+      value: pfDisplay,
+      sub: 'Gross P / Gross L',
+      c: profitFactor == null
+        ? 'text-[var(--muted-foreground)]'
+        : profitFactor >= 1.5
+          ? 'text-[var(--neon-green)]'
+          : profitFactor < 1.0
+            ? 'text-[var(--neon-red)]'
+            : 'text-[var(--foreground)]',
     },
     {
       label: 'PnL / LLM Cost',
       value: llmCostData.cumulative_ratio != null
         ? `${llmCostData.cumulative_ratio.toFixed(1)}x`
         : '—',
-      sub: `${period} efficiency ratio`,
+      sub: `${period} efficiency`,
       c: (llmCostData.cumulative_ratio ?? 0) >= 1
         ? 'text-[var(--neon-green)]'
         : llmCostData.cumulative_ratio != null
@@ -816,6 +1224,8 @@ export function PerformanceMetrics() {
           : 'text-[var(--muted-foreground)]',
     },
   ];
+
+  const history = perfData.history as [number, number][];
 
   return (
     <div className="flex flex-col h-full gap-4 pr-2 pb-4">
@@ -828,15 +1238,15 @@ export function PerformanceMetrics() {
         </div>
       )}
 
-      {/* KPI Grid */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 shrink-0">
+      {/* KPI Grid — 4×2 layout */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 shrink-0">
         {kpis.map((kpi, i) => (
           <Card key={i} className="bg-[var(--panel)]/80">
             <CardContent className="p-3 flex flex-col justify-center text-center sm:text-left">
               <div className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider mb-1 line-clamp-1">
                 {kpi.label}
               </div>
-              <div className={`text-lg sm:text-xl font-bold font-mono ${kpi.c}`}>
+              <div className={`text-lg font-bold font-mono tabular-nums ${kpi.c}`}>
                 {kpi.value}
               </div>
               <div className="text-xs text-[var(--muted-foreground)] mt-1 line-clamp-1">
@@ -847,8 +1257,8 @@ export function PerformanceMetrics() {
         ))}
       </div>
 
-      {/* ── Row 1: TradingView Chart — split-pane candlestick + volume/RSI ── */}
-      <Card className="shrink-0 flex flex-col h-[320px]">
+      {/* ── Row 1: Equity Curve (h-400) + TearSheet (w-48) ── */}
+      <Card className="shrink-0 flex flex-col h-[400px]">
         <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
             {(perfData.net_pnl ?? 0) >= 0
@@ -883,95 +1293,183 @@ export function PerformanceMetrics() {
         <CardContent className="flex-1 p-0 bg-[var(--background)] flex overflow-hidden">
           <div className="flex-1 min-w-0 overflow-hidden">
             <TradingChart
-              history={perfData.history as [number, number][]}
+              history={history}
               lastSignal={lastSignal}
               ohlcv={ohlcvData?.candles}
             />
           </div>
           <TearSheet
             perfData={perfData}
-            bots={bots}
             winRate={winRate}
+            todayPnl={todayPnl}
+            unrealizedPnl={liveUnrealized}
+            profitFactor={profitFactor}
+            calmarRatio={calmarRatio}
           />
         </CardContent>
       </Card>
 
-      {/* ── Row 2: Strategy Attribution + Bot Performance Matrix ── */}
+      {/* ── Row 2: Drawdown / Underwater Chart ── */}
+      {history?.length >= 2 && (
+        <Card className="shrink-0 flex flex-col">
+          <CardHeader className="border-b border-[var(--border)] py-2 px-4 flex flex-row items-center shrink-0">
+            <TrendingDown className="w-3.5 h-3.5 text-[var(--neon-red)] mr-2 shrink-0" />
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              Underwater / Drawdown
+            </CardTitle>
+            <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40">
+              Running peak-to-trough
+            </span>
+          </CardHeader>
+          <CardContent className="p-0">
+            <DrawdownChart history={history} />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── Row 3: Rolling Sharpe | Trade P&L Distribution ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 shrink-0">
 
-        {/* Strategy Attribution — bar width = signal activity; color = yield sign */}
-        <Card className="flex flex-col h-[220px]">
+        <Card className="flex flex-col h-[180px]">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
+            <Activity className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              Rolling Sharpe
+            </CardTitle>
+            <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40">20-day</span>
+          </CardHeader>
+          <CardContent className="flex-1 p-2 flex flex-col">
+            <RollingMetricsChart history={history} />
+          </CardContent>
+        </Card>
+
+        <Card className="flex flex-col h-[180px]">
+          <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
+            <BarChart3 className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
+            <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
+              Trade P&L Distribution
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex-1 p-2 flex flex-col">
+            <TradeDistribution trades={perfData.realized_trades} />
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ── Row 4: Strategy Attribution + Bot Performance Matrix ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 shrink-0">
+
+        {/* Strategy Attribution — dual-bar: signal share + PnL attribution */}
+        <Card className="flex flex-col h-[240px]">
           <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
             <PieChart className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
             <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
               Strategy Attribution
             </CardTitle>
           </CardHeader>
-          <CardContent className="flex-1 p-3 flex flex-col gap-2.5">
+          <CardContent className="flex-1 p-3 flex flex-col gap-2 overflow-y-auto">
             {bots.length === 0 ? (
               <div className="text-xs text-[var(--muted-foreground)] opacity-50 italic">
                 Connecting to strategy engine...
               </div>
-            ) : bots.map((bot: any) => {
-              // Use signal count for bar width — meaningful even before first sell
-              const maxSignals = Math.max(...bots.map((b: any) => b.signalCount ?? 0), 1);
-              const barWidth   = ((bot.signalCount ?? 0) / maxSignals) * 100;
-              const hasYield   = (bot.yield24h ?? 0) !== 0;
-              const isPos      = (bot.yield24h ?? 0) >= 0;
-              const fillRate   = (bot.signalCount ?? 0) > 0
-                ? Math.round(((bot.fillCount ?? 0) / (bot.signalCount ?? 1)) * 100)
-                : null;
+            ) : (() => {
+              const totalSignals = bots.reduce((s: number, b: any) => s + (b.signalCount ?? 0), 0);
+              const totalPnl     = bots.reduce((s: number, b: any) => s + Math.abs(b.yield24h ?? 0), 0);
               return (
-                <div key={bot.id} className="space-y-0.5">
-                  <div className="flex justify-between items-center text-xs">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        bot.status === 'ACTIVE'
-                          ? 'bg-[var(--neon-green)] shadow-[0_0_4px_var(--neon-green)]'
-                          : 'bg-[var(--muted-foreground)]'
-                      }`} />
-                      <span className="font-semibold text-[var(--foreground)] truncate">{bot.name}</span>
-                      {bot.assetClass && bot.assetClass !== 'CRYPTO' && (
-                        <span className="text-xs text-[var(--muted-foreground)] opacity-40 shrink-0">{bot.assetClass}</span>
-                      )}
+                <>
+                  {/* Column labels */}
+                  <div className="flex items-center gap-2 pb-1 border-b border-[var(--border)]/30 shrink-0">
+                    <div className="w-28 shrink-0" />
+                    <div className="flex-1 flex justify-between text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-wider">
+                      <span>Signal</span>
+                      <span>PnL</span>
                     </div>
-                    <div className="flex items-center gap-2 font-mono tabular-nums shrink-0 ml-2">
-                      <span className="text-[var(--muted-foreground)] opacity-50 text-xs">
-                        {bot.signalCount ?? 0}s {fillRate != null ? `· ${fillRate}%` : ''}
-                      </span>
-                      <span className={`font-bold text-xs ${hasYield ? (isPos ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]') : 'text-[var(--muted-foreground)] opacity-40'}`}>
-                        {hasYield ? `${isPos ? '+' : ''}$${Math.abs(bot.yield24h ?? 0).toFixed(2)}` : 'no fills'}
-                      </span>
+                    <div className="w-20 text-right text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-wider">
+                      Eff.
                     </div>
                   </div>
-                  <div className="h-1 w-full bg-[var(--background)] overflow-hidden rounded-sm">
-                    <div
-                      className="h-full transition-all duration-700"
-                      style={{
-                        width: `${Math.max(barWidth, barWidth > 0 ? 3 : 0)}%`,
-                        background: bot.status !== 'ACTIVE'
-                          ? 'hsla(250,10%,50%,0.3)'
-                          : hasYield
-                            ? (isPos ? 'var(--neon-green)' : 'var(--neon-red)')
-                            : 'var(--kraken-purple)',
-                      }}
-                    />
-                  </div>
-                </div>
+
+                  {bots.map((bot: any) => {
+                    const signalShare = totalSignals > 0
+                      ? ((bot.signalCount ?? 0) / totalSignals) * 100
+                      : 0;
+                    const pnlShare = totalPnl > 0
+                      ? (Math.abs(bot.yield24h ?? 0) / totalPnl) * 100
+                      : 0;
+                    const efficiency = (bot.signalCount ?? 0) > 0
+                      ? (bot.yield24h ?? 0) / (bot.signalCount ?? 1)
+                      : null;
+                    const isPos = (bot.yield24h ?? 0) >= 0;
+
+                    return (
+                      <div key={bot.id} className="flex items-center gap-2">
+                        {/* Name + status dot */}
+                        <div className="flex items-center gap-1.5 w-28 shrink-0 min-w-0">
+                          <span className={`w-1.5 h-1.5 rounded-sm shrink-0 ${
+                            bot.status === 'ACTIVE'
+                              ? 'bg-[var(--neon-green)] shadow-[0_0_4px_var(--neon-green)]'
+                              : 'bg-[var(--muted-foreground)]'
+                          }`} />
+                          <span className="text-xs font-mono font-semibold text-[var(--foreground)] truncate">
+                            {bot.name}
+                          </span>
+                        </div>
+
+                        {/* Dual bars */}
+                        <div className="flex-1 flex flex-col gap-0.5">
+                          <div className="h-1 w-full bg-[var(--background)] overflow-hidden rounded-sm">
+                            <div
+                              className="h-full transition-all duration-700"
+                              style={{
+                                width: `${Math.max(signalShare, signalShare > 0 ? 2 : 0)}%`,
+                                background: 'var(--kraken-purple)',
+                                opacity: 0.7,
+                              }}
+                            />
+                          </div>
+                          <div className="h-1 w-full bg-[var(--background)] overflow-hidden rounded-sm">
+                            <div
+                              className="h-full transition-all duration-700"
+                              style={{
+                                width: `${Math.max(pnlShare, pnlShare > 0 ? 2 : 0)}%`,
+                                background: isPos ? 'var(--neon-green)' : 'var(--neon-red)',
+                              }}
+                            />
+                          </div>
+                        </div>
+
+                        {/* Efficiency */}
+                        <div className="w-20 text-right shrink-0">
+                          <span className={`text-xs font-mono tabular-nums ${
+                            efficiency == null
+                              ? 'text-[var(--muted-foreground)] opacity-40'
+                              : efficiency >= 0
+                                ? 'text-[var(--neon-green)]'
+                                : 'text-[var(--neon-red)]'
+                          }`}>
+                            {efficiency != null
+                              ? `${efficiency >= 0 ? '+' : ''}$${Math.abs(efficiency).toFixed(2)}/sig`
+                              : '—'}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
               );
-            })}
+            })()}
           </CardContent>
         </Card>
 
-        {/* Bot Performance Matrix — replaces Slippage Distribution */}
-        <Card className="flex flex-col h-[220px]">
+        {/* Bot Performance Matrix */}
+        <Card className="flex flex-col h-[240px]">
           <CardHeader className="border-b border-[var(--border)] py-2.5 px-4 flex flex-row items-center shrink-0">
             <Activity className="w-4 h-4 text-[var(--kraken-light)] mr-2" />
             <CardTitle className="text-xs uppercase tracking-widest text-[var(--muted-foreground)]">
               Bot Performance Matrix
             </CardTitle>
           </CardHeader>
-          <CardContent className="flex-1 p-0">
+          <CardContent className="flex-1 p-0 overflow-y-auto max-h-[188px]">
             {bots.length === 0 ? (
               <div className="flex items-center justify-center h-full text-xs text-[var(--muted-foreground)] opacity-40">
                 Connecting...
@@ -980,11 +1478,12 @@ export function PerformanceMetrics() {
               <table className="w-full text-xs tabular-nums font-mono">
                 <thead className="sticky top-0 bg-[var(--panel-muted)] text-[var(--muted-foreground)] border-b border-[var(--border)]">
                   <tr>
-                    <th className="text-left font-medium p-2 pl-3">Bot</th>
-                    <th className="text-center font-medium p-2">Status</th>
-                    <th className="text-right font-medium p-2">Signals</th>
-                    <th className="text-right font-medium p-2">Fill %</th>
-                    <th className="text-right font-medium p-2 pr-3">Yield</th>
+                    <th className="text-left font-medium p-2 pl-3 tracking-wider">Bot</th>
+                    <th className="text-center font-medium p-2 tracking-wider">Status</th>
+                    <th className="text-right font-medium p-2 tracking-wider">Signals</th>
+                    <th className="text-right font-medium p-2 tracking-wider">Fill %</th>
+                    <th className="text-right font-medium p-2 tracking-wider">Yield</th>
+                    <th className="text-right font-medium p-2 pr-3 tracking-wider">Avg/Trade</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--border)]/30">
@@ -993,17 +1492,19 @@ export function PerformanceMetrics() {
                       ? ((bot.fillCount ?? 0) / (bot.signalCount ?? 1) * 100).toFixed(0)
                       : '—';
                     const yield24h = bot.yield24h ?? 0;
-                    const isPos = yield24h >= 0;
+                    const isPos    = yield24h >= 0;
+                    const fills    = bot.fillCount ?? 0;
+                    const avgTrade = fills > 0 ? yield24h / fills : null;
                     return (
                       <tr key={bot.id} className="hover:bg-[var(--panel-muted)] transition-colors">
-                        <td className="p-2 pl-3 font-sans font-semibold text-[var(--foreground)] truncate max-w-[100px]">
+                        <td className="p-2 pl-3 font-mono font-semibold text-[var(--foreground)] truncate max-w-[90px]">
                           {bot.name}
                         </td>
                         <td className="p-2 text-center">
-                          <span className={`inline-flex items-center gap-1 text-xs font-sans ${
+                          <span className={`inline-flex items-center gap-1 text-xs font-mono ${
                             bot.status === 'ACTIVE' ? 'text-[var(--neon-green)]' : 'text-[var(--muted-foreground)]'
                           }`}>
-                            <span className={`w-1 h-1 rounded-full ${
+                            <span className={`w-1 h-1 rounded-sm ${
                               bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)]' : 'bg-[var(--muted-foreground)]'
                             }`} />
                             {bot.status === 'ACTIVE' ? 'ON' : 'OFF'}
@@ -1015,10 +1516,21 @@ export function PerformanceMetrics() {
                         <td className="p-2 text-right text-[var(--foreground)]">
                           {fillRate}{fillRate !== '—' ? '%' : ''}
                         </td>
-                        <td className={`p-2 pr-3 text-right font-bold ${
+                        <td className={`p-2 text-right font-bold ${
                           yield24h !== 0 ? (isPos ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]') : 'text-[var(--muted-foreground)] opacity-40'
                         }`}>
                           {yield24h !== 0 ? `${isPos ? '+' : ''}$${yield24h.toFixed(2)}` : '—'}
+                        </td>
+                        <td className={`p-2 pr-3 text-right ${
+                          avgTrade == null
+                            ? 'text-[var(--muted-foreground)] opacity-40'
+                            : avgTrade >= 0
+                              ? 'text-[var(--neon-green)]'
+                              : 'text-[var(--neon-red)]'
+                        }`}>
+                          {avgTrade != null
+                            ? `${avgTrade >= 0 ? '+' : ''}$${avgTrade.toFixed(2)}`
+                            : '—'}
                         </td>
                       </tr>
                     );
@@ -1030,7 +1542,7 @@ export function PerformanceMetrics() {
         </Card>
       </div>
 
-      {/* ── Row 3: PnL Calendar + LLM Cost vs PnL ── */}
+      {/* ── Row 5: PnL Calendar + LLM Cost vs PnL ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 shrink-0">
 
         {/* PnL Calendar Heatmap */}
@@ -1041,7 +1553,7 @@ export function PerformanceMetrics() {
             </CardTitle>
           </CardHeader>
           <CardContent className="p-4">
-            <PnLCalendar history={perfData.history as [number, number][]} />
+            <PnLCalendar history={history} />
           </CardContent>
         </Card>
 

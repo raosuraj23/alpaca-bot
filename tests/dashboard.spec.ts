@@ -11,9 +11,9 @@ test.describe('Automated Bot Terminal Verification', () => {
     // Verify Tab routing
     await expect(page.locator('text=Desk')).toBeVisible();
     await expect(page.locator('text=Analysis')).toBeVisible();
-    await expect(page.locator('text=Bots')).toBeVisible();
-    await expect(page.locator('text=Ledger')).toBeVisible();
-    await expect(page.locator('text=Brain')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Bots' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Ledger' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Brain' })).toBeVisible();
   });
 
   test('Orchestrator Sandbox FAB triggers successfully', async ({ page }) => {
@@ -32,7 +32,7 @@ test.describe('Automated Bot Terminal Verification', () => {
     
     // Validate the Strategy attribution module loaded correctly (analyst dashboard)
     await expect(page.locator('text=Strategy Attribution')).toBeVisible();
-    await expect(page.locator('text=Live Equity Trajectory')).toBeVisible();
+    await expect(page.locator('text=Equity Curve')).toBeVisible();
   });
 
 });

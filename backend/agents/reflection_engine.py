@@ -273,7 +273,7 @@ class ReflectionEngine:
                     f"Qty: {qty:.6f} coins | Fill price: ${fill_price:.2f} USD | "
                     f"Slippage: ${slippage:.4f} USD | Signal confidence: {confidence:.0%}"
                 ))
-                response = model.invoke(
+                response = await model.ainvoke(
                     [sys_msg, user_msg],
                     max_tokens=250,
                 )

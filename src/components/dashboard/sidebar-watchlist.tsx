@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -28,7 +29,7 @@ export function SidebarWatchlist() {
     setScanning(true);
     setScanError(false);
     try {
-      const res = await fetch('http://localhost:8000/api/watchlist/scan', { method: 'POST' });
+      const res = await fetch(`${API_BASE}/api/watchlist/scan`, { method: 'POST' });
       const data = await res.json();
       // Write directly into the shared Zustand store so all consumers update
       if (Array.isArray(data?.results)) {

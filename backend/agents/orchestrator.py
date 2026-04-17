@@ -62,7 +62,7 @@ class OrchestratorEngine:
     # Public Interface
     # ------------------------------------------------------------------
 
-    def process_chat(self, user_text: str) -> str:
+    async def process_chat(self, user_text: str) -> str:
         if not self.model:
             return (
                 "⚠️ System Offline: No API keys mapped in .env. "
@@ -73,7 +73,7 @@ class OrchestratorEngine:
         messages = [self.system_prompt] + self._history[-HISTORY_WINDOW:]
 
         try:
-            response = self.model.invoke(messages)
+            response = await self.model.ainvoke(messages)
             reply = response.content
             self._history.append(AIMessage(content=reply))
 
@@ -105,7 +105,7 @@ class OrchestratorEngine:
     # Quant Signal Handoff — LLM Supervisor Node
     # ------------------------------------------------------------------
 
-    def process_signal(self, signal_event: dict) -> dict:
+    async def process_signal(self, signal_event: dict) -> dict:
         """
         Called by the signal pipeline after the deterministic TA engine emits a
         BUY signal. This is the ONLY place where the LLM is woken up for trade
@@ -166,7 +166,7 @@ class OrchestratorEngine:
             # Use a fresh single-message invocation — do NOT inject into chat
             # history since this is an autonomous pipeline call, not a user turn.
             messages = [self.system_prompt, HumanMessage(content=supervisor_prompt)]
-            response = self.model.invoke(messages)
+            response = await self.model.ainvoke(messages)
             reply = response.content
 
             # Parse the decision JSON block
