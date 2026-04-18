@@ -1,9 +1,18 @@
 "use client"
 
 import * as React from 'react';
+import {
+  useReactTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  flexRender,
+  type ColumnDef,
+  type SortingState,
+} from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
+import { parseUtc } from '@/lib/utils';
 
 interface LedgerEntry {
   id: number;
@@ -19,14 +28,12 @@ interface LedgerEntry {
 }
 
 export function ExecutionLog() {
-  const recentTrades  = useTradingStore(s => s.recentTrades);
-  const ledgerTrades  = useTradingStore(s => (s as any).ledgerTrades ?? []);
+  const recentTrades = useTradingStore(s => s.recentTrades);
+  const ledgerTrades = useTradingStore(s => (s as any).ledgerTrades ?? []);
+  const [sorting, setSorting] = React.useState<SortingState>([{ id: 'timestamp', desc: true }]);
 
-  // Merge: prefer ledgerTrades (DB-backed) when available, fall back to session trades
   const rows: LedgerEntry[] = React.useMemo(() => {
     if (ledgerTrades.length > 0) return ledgerTrades;
-
-    // Map session trades (from /api/orders) into the ledger shape
     return recentTrades.map((t: any) => ({
       id:           t.id,
       order_id:     t.id,
@@ -37,9 +44,87 @@ export function ExecutionLog() {
       slippage:     0,
       slippage_bps: null,
       confidence:   null,
-      timestamp:    t.timestamp ? new Date(t.timestamp).toISOString() : null,
+      timestamp:    t.timestamp ? (parseUtc(t.timestamp)?.toISOString() ?? null) : null,
     }));
   }, [recentTrades, ledgerTrades]);
+
+  const columns = React.useMemo<ColumnDef<LedgerEntry>[]>(() => [
+    {
+      accessorKey: 'timestamp',
+      header: 'Time',
+      cell: ({ getValue }) => {
+        const ts = getValue() as string | null;
+        return (
+          <span className="text-[var(--muted-foreground)]">
+            {ts ? new Date(ts).toLocaleTimeString(undefined, { hour12: false }) : '—'}
+          </span>
+        );
+      },
+    },
+    {
+      accessorKey: 'symbol',
+      header: 'Symbol',
+      cell: ({ getValue }) => (
+        <span className="text-[var(--foreground)] font-bold">{getValue() as string}</span>
+      ),
+    },
+    {
+      accessorKey: 'bot',
+      header: 'Bot',
+      cell: ({ getValue }) => {
+        const bot = getValue() as string;
+        return bot !== '—' ? (
+          <span className="px-1 py-0.5 rounded bg-[var(--panel-muted)] text-[var(--kraken-light)] truncate max-w-[80px] block">
+            {bot}
+          </span>
+        ) : <span className="text-[var(--muted-foreground)]">—</span>;
+      },
+    },
+    {
+      accessorKey: 'side',
+      header: 'Side',
+      cell: ({ getValue }) => {
+        const side = (getValue() as string ?? '').replace('OrderSide.', '').toUpperCase();
+        return (
+          <span className={`font-bold ${side === 'BUY' ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+            {side}
+          </span>
+        );
+      },
+    },
+    {
+      accessorKey: 'fill_price',
+      header: 'Fill $',
+      cell: ({ getValue }) => {
+        const v = getValue() as number;
+        return (
+          <span className="text-right block text-[var(--foreground)]">
+            {v != null ? `$${v.toFixed(2)}` : '—'}
+          </span>
+        );
+      },
+    },
+    {
+      accessorKey: 'slippage_bps',
+      header: 'Slip bps',
+      cell: ({ getValue }) => {
+        const v = getValue() as number | null;
+        const color = v != null
+          ? v < 5 ? 'text-[var(--neon-green)]' : v < 20 ? 'text-[var(--foreground)]' : 'text-[var(--neon-red)]'
+          : 'text-[var(--muted-foreground)]';
+        return <span className={`text-right block font-bold ${color}`}>{v != null ? `${v}` : '—'}</span>;
+      },
+    },
+  ], []);
+
+  const table = useReactTable({
+    data: rows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
 
   return (
     <Card className="h-full flex flex-col">
@@ -54,50 +139,38 @@ export function ExecutionLog() {
       <CardContent className="flex-1 overflow-y-auto p-0 pb-2">
         <table className="w-full text-left text-xs tabular-nums font-mono">
           <thead className="sticky top-0 bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] shadow-sm">
-            <tr>
-              <th className="font-semibold p-2 pl-3">Time</th>
-              <th className="font-semibold p-2">Symbol</th>
-              <th className="font-semibold p-2">Bot</th>
-              <th className="font-semibold p-2">Side</th>
-              <th className="font-semibold p-2 text-right">Fill $</th>
-              <th className="font-semibold p-2 pr-3 text-right">Slip bps</th>
-            </tr>
+            {table.getHeaderGroups().map(hg => (
+              <tr key={hg.id}>
+                {hg.headers.map((header, i) => {
+                  const sorted = header.column.getIsSorted();
+                  return (
+                    <th
+                      key={header.id}
+                      className={`font-semibold p-2 ${i === 0 ? 'pl-3' : ''} ${i === hg.headers.length - 1 ? 'pr-3 text-right' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`}
+                      onClick={header.column.getToggleSortingHandler()}
+                    >
+                      <span className="inline-flex items-center gap-1">
+                        {flexRender(header.column.columnDef.header, header.getContext())}
+                        {sorted === 'asc' && <span className="text-[var(--kraken-light)]">▲</span>}
+                        {sorted === 'desc' && <span className="text-[var(--kraken-light)]">▼</span>}
+                        {!sorted && header.column.getCanSort() && <span className="opacity-20">⇅</span>}
+                      </span>
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
           </thead>
           <tbody className="divide-y divide-[var(--border)]/20">
-            {rows.map((row: LedgerEntry, i: number) => {
-              const timeStr = row.timestamp
-                ? new Date(row.timestamp).toLocaleTimeString('en-US', { hour12: false })
-                : '—';
-              const side = (row.side ?? '').replace('OrderSide.', '').toUpperCase();
-              const slipColor = row.slippage_bps != null
-                ? row.slippage_bps < 5 ? 'text-[var(--neon-green)]'
-                  : row.slippage_bps < 20 ? 'text-[var(--foreground)]'
-                  : 'text-[var(--neon-red)]'
-                : 'text-[var(--muted-foreground)]';
-
-              return (
-                <tr key={`${row.id}-${i}`} className="hover:bg-[var(--panel-muted)] transition-colors">
-                  <td className="p-1.5 pl-3 text-[var(--muted-foreground)]">{timeStr}</td>
-                  <td className="p-1.5 text-[var(--foreground)] font-bold">{row.symbol}</td>
-                  <td className="p-1.5 text-[var(--muted-foreground)] max-w-[80px] truncate">
-                    {row.bot !== '—' ? (
-                      <span className="px-1 py-0.5 rounded bg-[var(--panel-muted)] text-[var(--kraken-light)]">
-                        {row.bot}
-                      </span>
-                    ) : '—'}
+            {table.getRowModel().rows.map(row => (
+              <tr key={row.id} className="hover:bg-[var(--panel-muted)] transition-colors">
+                {row.getVisibleCells().map((cell, i) => (
+                  <td key={cell.id} className={`p-1.5 ${i === 0 ? 'pl-3' : ''} ${i === row.getVisibleCells().length - 1 ? 'pr-3' : ''}`}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>
-                  <td className={`p-1.5 font-bold ${side === 'BUY' ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-                    {side}
-                  </td>
-                  <td className="p-1.5 text-right text-[var(--foreground)]">
-                    {row.fill_price != null ? `$${row.fill_price.toFixed(2)}` : '—'}
-                  </td>
-                  <td className={`p-1.5 pr-3 text-right font-bold ${slipColor}`}>
-                    {row.slippage_bps != null ? `${row.slippage_bps}` : '—'}
-                  </td>
-                </tr>
-              );
-            })}
+                ))}
+              </tr>
+            ))}
           </tbody>
         </table>
         {rows.length === 0 && (

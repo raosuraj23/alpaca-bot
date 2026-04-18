@@ -32,7 +32,16 @@ export function SidebarWatchlist() {
       const res = await fetch(`${API_BASE}/api/watchlist/scan`, { method: 'POST' });
       const data = await res.json();
       if (Array.isArray(data?.results)) {
-        useTradingStore.setState({ scannerResults: data.results });
+        const results = data.results as ScanResult[];
+        useTradingStore.setState({ scannerResults: results });
+        const currentWl = useTradingStore.getState().watchlist;
+        const existing = new Set(currentWl.map(t => t.symbol));
+        const newEntries = results
+          .filter(r => !existing.has(r.symbol))
+          .map(r => ({ symbol: r.symbol, price: r.price, change24h: 0, volume: 0 }));
+        if (newEntries.length > 0) {
+          useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
+        }
       }
     } catch {
       setScanError(true);

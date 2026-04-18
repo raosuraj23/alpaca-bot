@@ -16,12 +16,14 @@ load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
+from config import settings
+
 app = FastAPI(title="Alpaca Multi-Agent API", version="2.0")
 
 # Allow Next.js local fetches — restrict to your domain in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[settings.frontend_url],
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
@@ -665,6 +667,17 @@ async def get_llm_cost(period: str = "1M"):
                 .order_by(LLMUsage.timestamp)
             )).fetchall()
 
+            from sqlalchemy import func as sqlfunc
+            purpose_rows = (await session.execute(
+                select(
+                    sqlfunc.strftime("%Y-%m-%d", LLMUsage.timestamp).label("day"),
+                    LLMUsage.purpose,
+                    sqlfunc.sum(LLMUsage.cost_usd).label("cost"),
+                )
+                .where(LLMUsage.timestamp >= cutoff)
+                .group_by("day", LLMUsage.purpose)
+            )).fetchall()
+
         # Aggregate LLM costs by UTC date for daily table
         daily_cost: dict[str, float] = {}
         for ts, cost in cost_rows:
@@ -701,6 +714,12 @@ async def get_llm_cost(period: str = "1M"):
         except Exception as pnl_err:
             logger.debug("[ANALYTICS] portfolio history: %s", pnl_err)
 
+        # Per-day purpose breakdown
+        daily_purpose: dict[str, dict[str, float]] = {}
+        for day, purpose, cost in purpose_rows:
+            if day:
+                daily_purpose.setdefault(day, {})[purpose] = round(float(cost or 0), 6)
+
         # Daily breakdown table — union of all dates that have cost or PnL
         all_days   = sorted(set(list(daily_cost.keys()) + list(daily_pnl.keys())))
         daily_rows = []
@@ -709,7 +728,8 @@ async def get_llm_cost(period: str = "1M"):
             cost_d = daily_cost.get(day, 0.0)
             ratio  = round(pnl_d / cost_d, 2) if cost_d > 0 else None
             daily_rows.append({"date": day, "pnl_usd": round(pnl_d, 2),
-                                "cost_usd": round(cost_d, 6), "ratio": ratio})
+                                "cost_usd": round(cost_d, 6), "ratio": ratio,
+                                "cost_by_purpose": daily_purpose.get(day, {})})
 
         total_cost       = sum(r["cost_usd"] for r in daily_rows)
         cumulative_ratio = round(cum_pnl / total_cost, 2) if total_cost > 0 else None
@@ -728,6 +748,128 @@ async def get_llm_cost(period: str = "1M"):
         logger.error("[ANALYTICS] llm-cost failed: %s", e)
         return {"has_data": False, "cumulative_cost": [], "cumulative_pnl": [],
                 "daily_rows": [], "cumulative_ratio": None}
+
+
+@app.get("/api/analytics/llm-breakdown")
+async def get_llm_breakdown(period: str = "1M"):
+    """
+    Granular LLM usage breakdown: per-model stats, per-purpose cost split, recent calls.
+    Used by the LLM Intelligence panel on the analytics dashboard.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180}
+    days_back = period_days.get(period.upper(), 30)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+
+    try:
+        from db.database import _get_session_factory
+        from db.models import LLMUsage
+        from sqlalchemy import select, func as sqlfunc
+
+        async with _get_session_factory()() as session:
+            # Per-model aggregates
+            model_rows = (await session.execute(
+                select(
+                    LLMUsage.model,
+                    sqlfunc.count(LLMUsage.id).label("calls"),
+                    sqlfunc.sum(LLMUsage.tokens_in).label("tokens_in"),
+                    sqlfunc.sum(LLMUsage.tokens_out).label("tokens_out"),
+                    sqlfunc.sum(LLMUsage.cost_usd).label("cost_usd"),
+                )
+                .where(LLMUsage.timestamp >= cutoff)
+                .group_by(LLMUsage.model)
+                .order_by(sqlfunc.sum(LLMUsage.cost_usd).desc())
+            )).fetchall()
+
+            # Per-purpose aggregates
+            purpose_rows = (await session.execute(
+                select(
+                    LLMUsage.purpose,
+                    sqlfunc.count(LLMUsage.id).label("calls"),
+                    sqlfunc.sum(LLMUsage.cost_usd).label("cost_usd"),
+                    sqlfunc.sum(LLMUsage.tokens_in).label("tokens_in"),
+                    sqlfunc.sum(LLMUsage.tokens_out).label("tokens_out"),
+                )
+                .where(LLMUsage.timestamp >= cutoff)
+                .group_by(LLMUsage.purpose)
+                .order_by(sqlfunc.sum(LLMUsage.cost_usd).desc())
+            )).fetchall()
+
+            # Recent individual calls (latest 15)
+            recent_rows = (await session.execute(
+                select(
+                    LLMUsage.model,
+                    LLMUsage.purpose,
+                    LLMUsage.tokens_in,
+                    LLMUsage.tokens_out,
+                    LLMUsage.cost_usd,
+                    LLMUsage.timestamp,
+                )
+                .where(LLMUsage.timestamp >= cutoff)
+                .order_by(LLMUsage.timestamp.desc())
+                .limit(15)
+            )).fetchall()
+
+            # Totals
+            totals = (await session.execute(
+                select(
+                    sqlfunc.count(LLMUsage.id),
+                    sqlfunc.sum(LLMUsage.tokens_in),
+                    sqlfunc.sum(LLMUsage.tokens_out),
+                    sqlfunc.sum(LLMUsage.cost_usd),
+                )
+                .where(LLMUsage.timestamp >= cutoff)
+            )).fetchone()
+
+        total_calls, total_ti, total_to, total_cost = totals or (0, 0, 0, 0)
+
+        return {
+            "has_data": bool(total_calls and total_calls > 0),
+            "total_calls":     int(total_calls or 0),
+            "total_tokens_in": int(total_ti or 0),
+            "total_tokens_out": int(total_to or 0),
+            "total_cost_usd":  round(float(total_cost or 0), 6),
+            "by_model": [
+                {
+                    "model":      r.model or "unknown",
+                    "calls":      int(r.calls),
+                    "tokens_in":  int(r.tokens_in or 0),
+                    "tokens_out": int(r.tokens_out or 0),
+                    "cost_usd":   round(float(r.cost_usd or 0), 6),
+                }
+                for r in model_rows
+            ],
+            "by_purpose": [
+                {
+                    "purpose":    r.purpose or "unknown",
+                    "calls":      int(r.calls),
+                    "cost_usd":   round(float(r.cost_usd or 0), 6),
+                    "tokens_in":  int(r.tokens_in or 0),
+                    "tokens_out": int(r.tokens_out or 0),
+                }
+                for r in purpose_rows
+            ],
+            "recent": [
+                {
+                    "model":      r.model or "unknown",
+                    "purpose":    r.purpose or "unknown",
+                    "tokens_in":  int(r.tokens_in or 0),
+                    "tokens_out": int(r.tokens_out or 0),
+                    "cost_usd":   round(float(r.cost_usd or 0), 6),
+                    "ts":         int(r.timestamp.timestamp() * 1000) if r.timestamp else 0,
+                }
+                for r in recent_rows
+            ],
+        }
+
+    except Exception as e:
+        logger.error("[ANALYTICS] llm-breakdown failed: %s", e)
+        return {
+            "has_data": False,
+            "total_calls": 0, "total_tokens_in": 0, "total_tokens_out": 0, "total_cost_usd": 0,
+            "by_model": [], "by_purpose": [], "recent": [],
+        }
 
 
 async def reflection_generator():
@@ -1240,7 +1382,11 @@ async def stream_manager():
     _push_log("[STREAM] \u274c Stream suspended after max retries. Restart backend to reconnect.")
 
 
-EQUITY_STREAM_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+from strategy.equity_algorithms import EQUITY_SYMBOLS as _EQUITY_SEED
+EQUITY_STREAM_SYMBOLS: list[str] = list(_EQUITY_SEED)  # mutable; grows via scanner discovery
+
+# Shared mutable container so _scanner_push can reach the running equity stream
+_equity_stream_state: dict = {}  # keys: "stream", "callback" — set by equity_stream_manager
 
 async def equity_stream_manager():
     """
@@ -1338,6 +1484,9 @@ async def equity_stream_manager():
                         _push_log(f"[RISK AGENT] \u2717 Blocked {signal['action']} {symbol} \u2014 risk gate rejected.")
 
             stock_stream.subscribe_bars(equity_bar_callback, *EQUITY_STREAM_SYMBOLS)
+            # Expose refs so _scanner_push can dynamically add new symbols at runtime
+            _equity_stream_state["stream"]   = stock_stream
+            _equity_stream_state["callback"] = equity_bar_callback
             logger.info("[EQUITY STREAM] Starting Alpaca StockDataStream for %s", EQUITY_STREAM_SYMBOLS)
             _push_log("[EQUITY STREAM] Connecting to Alpaca equity data stream...")
 
@@ -1539,6 +1688,8 @@ def get_strategy_states():
 
 _scanner_agent = None
 _scanner_task: Optional[asyncio.Task] = None
+_research_agent = None
+_research_task: Optional[asyncio.Task] = None
 _ENTRY_PRICES_FILE = os.path.join(os.path.dirname(__file__), "_entry_prices.json")
 
 def _load_entry_prices() -> "tuple[dict, dict]":
@@ -1903,7 +2054,7 @@ async def _write_closed_trade(
 
 @app.on_event("startup")
 async def startup_event():
-    global _stream_task, _stock_stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task
+    global _stream_task, _stock_stream_task, _ai_reflection_task, _reflection_engine, _scanner_agent, _scanner_task, _research_agent, _research_task
     from db.database import init_db
     await init_db()
 
@@ -1966,14 +2117,67 @@ async def startup_event():
         if data.get("type") == "discover":
             symbols: list[str] = data.get("symbols", [])
             if symbols:
-                master_engine.set_active_crypto_symbols(set(symbols))
-                logger.info("[SCANNER→ENGINE] Symbol set updated: %s", symbols)
+                crypto_syms = {s for s in symbols if s.endswith("/USD")}
+                equity_syms = {s for s in symbols if "/" not in s}
+
+                if crypto_syms:
+                    master_engine.set_active_crypto_symbols(crypto_syms)
+                    logger.info("[SCANNER→ENGINE] Crypto symbols updated: %s", crypto_syms)
+
+                if equity_syms:
+                    master_engine.set_active_equity_symbols(equity_syms)
+                    # Dynamically subscribe new equity symbols to the running stream
+                    stream = _equity_stream_state.get("stream")
+                    cb = _equity_stream_state.get("callback")
+                    if stream and cb:
+                        new_eq = equity_syms - set(EQUITY_STREAM_SYMBOLS)
+                        if new_eq:
+                            try:
+                                stream.subscribe_bars(cb, *new_eq)
+                                EQUITY_STREAM_SYMBOLS.extend(new_eq)
+                                logger.info("[SCANNER→EQUITY STREAM] Subscribed new symbols: %s", new_eq)
+                            except Exception as _e:
+                                logger.warning("[SCANNER→EQUITY STREAM] Subscribe failed: %s", _e)
+                    logger.info("[SCANNER→ENGINE] Equity symbols updated: %s", equity_syms)
+
+    # Start Research Agent — Gemini 2.5 Flash deep-research loop (30-min cadence).
+    # Produces ResearchBrief consumed by ScannerAgent Tier 1 for better symbol selection.
+    from agents.research_agent import ResearchAgent
+    _research_agent = ResearchAgent(
+        push_fn         = _push_reflection,
+        get_buffer_fn   = lambda: _mb,
+        signal_callback = master_orchestrator.process_signal,
+    )
+    _research_task = asyncio.create_task(_research_agent.run())
+    logger.info("[RESEARCH] Research Agent started (Gemini 2.5 Flash, 30-min cadence)")
 
     _scanner_agent = ScannerAgent(
-        push_fn=_scanner_push,
-        get_buffer_fn=lambda: _mb,
+        push_fn               = _scanner_push,
+        get_buffer_fn         = lambda: _mb,
+        get_research_fn       = lambda: _research_agent,
+        set_equity_symbols_fn = lambda syms: master_engine.set_active_equity_symbols(set(syms)),
     )
     _scanner_task = asyncio.create_task(_scanner_agent.run())
+
+    # 5-min news polling loop — detects breaking news and forwards to research agent
+    async def _news_poll_loop():
+        await asyncio.sleep(60)
+        _seen_ids: set = set()
+        while True:
+            try:
+                if _research_agent:
+                    news = await _research_agent._fetch_news_items()
+                    new_items = [n for n in news if n.get("id") not in _seen_ids]
+                    if new_items:
+                        _seen_ids.update(n["id"] for n in new_items if n.get("id"))
+                        if len(_seen_ids) > 500:
+                            _seen_ids = set(list(_seen_ids)[-200:])
+                        asyncio.create_task(_research_agent.analyze_breaking_news(new_items))
+            except Exception:
+                pass
+            await asyncio.sleep(300)
+
+    asyncio.create_task(_news_poll_loop())
 
     # Start the Autonomous Portfolio Director — reviews bots every 15 min and
     # executes Haiku-recommended changes (allocations, params, halt/resume, variants)
@@ -1991,8 +2195,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task
-    for task in (_stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task):
+    global _stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task, _research_task
+    for task in (_stream_task, _stock_stream_task, _ai_reflection_task, _scanner_task, _research_task):
         if task and not task.done():
             task.cancel()
             try:

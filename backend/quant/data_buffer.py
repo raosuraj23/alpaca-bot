@@ -195,6 +195,33 @@ class OHLCVBuffer:
             self._append_1min(symbol, ts, o, h, l, c, v)
             self._update_5min_from_bar(symbol, ts, o, h, l, c, v)
 
+    def ingest_ohlcv_df(self, symbol: str, df: "pd.DataFrame") -> None:
+        """Bulk-load a pre-fetched OHLCV DataFrame into the 1-min and 5-min buffers.
+
+        df must have a UTC-aware DatetimeIndex and columns: open, high, low, close, volume.
+        Used to pre-seed the buffer with historical REST data before live streams start,
+        so TA indicators (EMA20, RSI14, etc.) are computable from the first scan.
+        """
+        if df is None or df.empty:
+            return
+        with self._lock:
+            for ts, row in df.iterrows():
+                try:
+                    ts_utc = pd.Timestamp(ts)
+                    if ts_utc.tzinfo is None:
+                        ts_utc = ts_utc.tz_localize("UTC")
+                    else:
+                        ts_utc = ts_utc.tz_convert("UTC")
+                    o = float(row.get("open",   row.get("close", 0)))
+                    h = float(row.get("high",   row.get("close", 0)))
+                    l = float(row.get("low",    row.get("close", 0)))
+                    c = float(row.get("close",  0))
+                    v = float(row.get("volume", 0))
+                    self._append_1min(symbol, ts_utc, o, h, l, c, v)
+                    self._update_5min_from_bar(symbol, ts_utc, o, h, l, c, v)
+                except Exception:
+                    continue
+
     def ingest_tick(
         self,
         symbol: str,

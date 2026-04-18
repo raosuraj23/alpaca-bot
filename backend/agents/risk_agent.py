@@ -128,12 +128,20 @@ class RiskAgent:
 
     def get_risk_status(self) -> dict:
         """Returns combined kill switch + exposure params for /api/risk/status."""
+        from agents.factory import _gemini_budget
+        from risk.calibration import calibration_tracker
         ks = global_kill_switch.get_status()
         return {
             **ks,
-            "max_position_pct":   exposure_manager.max_position_pct * 100,
-            "max_position_usd":   exposure_manager.max_position_usd,
-            "max_kelly_fraction": exposure_manager.max_kelly_fraction,
+            "max_position_pct":    exposure_manager.max_position_pct * 100,
+            "max_position_usd":    exposure_manager.max_position_usd,
+            "max_kelly_fraction":  exposure_manager.max_kelly_fraction,
+            "gemini_budget":       {
+                "remaining":      _gemini_budget.remaining,
+                "limit":          _gemini_budget.limit,
+                "hard_exhausted": _gemini_budget.hard_exhausted,
+            },
+            "calibration":         calibration_tracker.summary(),
         }
 
 

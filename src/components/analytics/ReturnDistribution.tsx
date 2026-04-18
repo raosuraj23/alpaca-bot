@@ -44,7 +44,7 @@ export function ReturnDistribution({ trades, height = 256 }: ReturnDistributionP
   return (
     // Explicit pixel height prevents Recharts width(-1)/height(-1) warning
     <div style={{ height }}>
-      <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+      <ResponsiveContainer width="100%" height={height} minWidth={0} minHeight={0}>
         <BarChart data={bins} margin={{ top: 4, right: 8, bottom: 4, left: 8 }} style={CHART_STYLE}>
           <XAxis
             dataKey="mid"

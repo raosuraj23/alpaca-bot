@@ -38,10 +38,10 @@ function SystemClock() {
   return (
     <div className="flex flex-col items-end px-4 border-l border-[var(--border)] ml-2">
       <span className="text-xs text-[var(--kraken-light)] font-mono font-bold leading-none">
-        {time.toLocaleTimeString('en-US', { hour12: false })}
+        {time.toLocaleTimeString(undefined, { hour12: false })}
       </span>
       <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-widest mt-0.5">
-        {time.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+        {time.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
       </span>
     </div>
   );

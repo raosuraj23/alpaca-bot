@@ -7,8 +7,8 @@ during regular US equity session (9:30 AM - 4:00 PM ET, Mon-Fri).
 
 Position-state tracking: FLAT/LONG per symbol prevents naked SELLs.
 
-Supported symbols (configurable):
-  EQUITY_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+Supported symbols (seed; universe grows dynamically via expand_universe()):
+  EQUITY_SYMBOLS — initial bootstrap list, extended at runtime by scanner discovery
 """
 
 import math
@@ -25,7 +25,11 @@ ET = zoneinfo.ZoneInfo("America/New_York")
 MARKET_OPEN  = time(9, 30)
 MARKET_CLOSE = time(16, 0)
 
-EQUITY_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
+EQUITY_SYMBOLS = [
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA",
+    "TSLA", "AMZN", "GOOGL", "META", "AMD",
+    "NFLX", "INTC", "JPM", "BAC", "GS",
+]
 
 
 def _is_market_hours() -> bool:

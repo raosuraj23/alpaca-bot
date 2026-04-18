@@ -1,36 +1,32 @@
 "use client"
 
 import * as React from 'react';
+import {
+  AreaChart, Area,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
+} from 'recharts';
 import { API_BASE } from '@/lib/api';
 import { useTradingStore } from '@/hooks/useTradingStream';
 import {
   ShieldAlert, TrendingUp, TrendingDown, BarChart3,
-  Cpu, Zap, Activity,
+  Cpu, BrainCircuit,
 } from 'lucide-react';
+
 
 import { GlobalKPIs } from './GlobalKPIs';
 import { EquityCurveTerminal } from './EquityCurveTerminal';
 import { ReturnDistribution } from './ReturnDistribution';
-import { LLMTelemetry } from './LLMTelemetry';
 import { BotPerformanceMatrix } from './BotPerformanceMatrix';
-import type { LLMExecutionRecord } from '@/lib/types';
+import { LLMBreakdown, type LLMBreakdownData } from './LLMBreakdown';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-interface LLMDailyRow {
-  date: string;
-  pnl_usd: number;
-  cost_usd: number;
-  ratio: number | null;
-}
-
 interface LLMCostData {
   has_data: boolean;
   cumulative_cost: [number, number][];
   cumulative_pnl: [number, number][];
-  daily?: LLMDailyRow[];
   total_cost_usd?: number;
   cumulative_ratio?: number | null;
 }
@@ -47,6 +43,8 @@ const EMPTY_PERF = {
 
 const PERIODS = ['1D', '1W', '1M', 'YTD', 'ALL'] as const;
 type Period = typeof PERIODS[number];
+
+const CHART_STYLE = { background: 'transparent', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' };
 
 // ---------------------------------------------------------------------------
 // Bento cell wrapper
@@ -78,11 +76,86 @@ function BentoCell({
 function CellTitle({ icon, title, meta }: { icon: React.ReactNode; title: string; meta?: React.ReactNode }) {
   return (
     <>
-      {/* [&>svg] constrains the lucide icon SVG to 14×14 to prevent overflow into title text */}
       <span className="inline-flex items-center shrink-0 text-[var(--muted-foreground)] [&>svg]:w-3.5 [&>svg]:h-3.5">{icon}</span>
       <span className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)] flex-1">{title}</span>
       {meta && <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-50 shrink-0">{meta}</span>}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Drawdown Chart
+// ---------------------------------------------------------------------------
+
+function DrawdownChart({ history, height = 256 }: { history: [number, number][]; height?: number }) {
+  const data = React.useMemo(() => {
+    if (history.length < 2) return null;
+    let peak = history[0][1];
+    return history.map(([ts, v]) => {
+      if (v > peak) peak = v;
+      const dd = peak > 0 ? -((peak - v) / peak) * 100 : 0;
+      return { ts, dd };
+    });
+  }, [history]);
+
+  if (!data) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2" style={{ height }}>
+        <TrendingDown className="w-5 h-5 text-[var(--muted-foreground)] opacity-20" />
+        <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-widest">
+          No history yet
+        </span>
+      </div>
+    );
+  }
+
+  const minDd = Math.min(...data.map(d => d.dd));
+
+  return (
+    <div style={{ height }}>
+      <ResponsiveContainer width="100%" height={height} minWidth={0} minHeight={0}>
+        <AreaChart data={data} margin={{ top: 4, right: 8, bottom: 4, left: 4 }} style={CHART_STYLE}>
+          <defs>
+            <linearGradient id="ddGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="var(--neon-red)" stopOpacity={0.35} />
+              <stop offset="95%" stopColor="var(--neon-red)" stopOpacity={0.05} />
+            </linearGradient>
+          </defs>
+          <XAxis dataKey="ts" hide />
+          <YAxis
+            domain={[minDd * 1.1, 0]}
+            tickFormatter={v => `${Number(v).toFixed(1)}%`}
+            tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }}
+            stroke="var(--border)" tickLine={false} axisLine={false} width={36}
+          />
+          <ReferenceLine y={0} stroke="var(--border)" strokeDasharray="3 3" strokeOpacity={0.6} />
+          <Tooltip
+            content={({ active, payload }) => {
+              if (!active || !payload?.length) return null;
+              const { ts, dd } = payload[0].payload;
+              return (
+                <div className="bg-[var(--panel)] border border-[var(--border)] px-3 py-2 shadow-lg rounded-sm">
+                  <div className="text-xs text-[var(--muted-foreground)]">
+                    {new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </div>
+                  <div className="text-sm font-mono font-bold tabular-nums text-[var(--neon-red)]">
+                    {Number(dd).toFixed(3)}%
+                  </div>
+                </div>
+              );
+            }}
+          />
+          <Area
+            type="monotone"
+            dataKey="dd"
+            stroke="var(--neon-red)"
+            strokeWidth={1.5}
+            fill="url(#ddGrad)"
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
   );
 }
 
@@ -104,8 +177,11 @@ export function AnalyticsDashboard() {
   const [llmCostData, setLlmCostData] = React.useState<LLMCostData>({
     has_data: false, cumulative_cost: [], cumulative_pnl: [],
   });
+  const [llmBreakdown, setLlmBreakdown] = React.useState<LLMBreakdownData>({
+    has_data: false, total_calls: 0, total_tokens_in: 0, total_tokens_out: 0,
+    total_cost_usd: 0, by_model: [], by_purpose: [], recent: [],
+  });
 
-  // Fetch performance data — clear realized_trades during load so histogram shows empty state
   React.useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -138,30 +214,27 @@ export function AnalyticsDashboard() {
     return () => { cancelled = true; clearInterval(id); };
   }, [period]);
 
+  React.useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      fetch(`${API_BASE}/api/analytics/llm-breakdown?period=${period}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && !cancelled) setLlmBreakdown(d); })
+        .catch(() => {});
+    load();
+    const id = setInterval(load, 60_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [period]);
+
   const history = (perfData.history ?? []) as [number, number][];
   const killActive = riskStatus?.triggered ?? false;
   const netPnl = perfData.net_pnl ?? 0;
-
-  const llmRecords = React.useMemo<LLMExecutionRecord[]>(() => {
-    if (!llmCostData.daily?.length) return [];
-    return llmCostData.daily.map((row, i) => ({
-      id: `daily-${i}`,
-      timestamp: new Date(row.date).getTime(),
-      strategy: 'aggregate',
-      latencyMs: 0,
-      totalTokens: 0,
-      costUsd: row.cost_usd,
-      tradePnl: row.pnl_usd,
-      assetClass: 'CRYPTO' as const,
-    }));
-  }, [llmCostData.daily]);
-
   const tradeCount = (perfData.realized_trades ?? []).length;
+  const maxDd = perfData.drawdown ?? 0;
 
   return (
     <div className="flex flex-col h-full min-h-0 gap-3 overflow-y-auto pr-1 pb-4">
 
-      {/* Kill Switch Banner */}
       {killActive && (
         <div className="flex items-center gap-3 px-4 py-2.5 rounded-sm border border-[var(--neon-red)]/60 bg-[var(--neon-red)]/10 text-[var(--neon-red)] text-xs font-bold uppercase tracking-widest animate-pulse shrink-0">
           <ShieldAlert className="w-4 h-4 shrink-0" />
@@ -207,9 +280,9 @@ export function AnalyticsDashboard() {
           />
         </div>
 
-        {/* Row 2 — Equity Curve (7) | LLM Scatter: Latency vs PnL (5) — equal height */}
+        {/* Row 2 — Equity Curve (6) | Drawdown (6) */}
         <BentoCell
-          className="col-span-12 lg:col-span-7 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[320px]"
           header={
             <CellTitle
               icon={netPnl >= 0 ? <TrendingUp /> : <TrendingDown />}
@@ -223,16 +296,22 @@ export function AnalyticsDashboard() {
         </BentoCell>
 
         <BentoCell
-          className="col-span-12 lg:col-span-5 h-[320px]"
-          header={<CellTitle icon={<Zap />} title="LLM Latency vs Trade PnL" />}
+          className="col-span-12 lg:col-span-6 h-[320px]"
+          header={
+            <CellTitle
+              icon={<TrendingDown />}
+              title="Drawdown"
+              meta={history.length >= 2 ? `${maxDd.toFixed(3)}%` : undefined}
+            />
+          }
           bodyClass="p-3"
         >
-          <LLMTelemetry llmRecords={llmRecords} llmCostData={llmCostData} mode="scatter" />
+          <DrawdownChart history={history} height={256} />
         </BentoCell>
 
-        {/* Row 3 — Return Distribution (5) | Cumulative PnL vs LLM Cost (7) — equal height */}
+        {/* Row 3 — Return Distribution (6) | LLM Intelligence (6) */}
         <BentoCell
-          className="col-span-12 lg:col-span-5 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[320px]"
           header={
             <CellTitle
               icon={<BarChart3 />}
@@ -242,21 +321,21 @@ export function AnalyticsDashboard() {
           }
           bodyClass="p-3"
         >
-          <ReturnDistribution trades={perfData.realized_trades} />
+          <ReturnDistribution trades={perfData.realized_trades} height={256} />
         </BentoCell>
 
         <BentoCell
-          className="col-span-12 lg:col-span-7 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[320px]"
           header={
             <CellTitle
-              icon={<Activity />}
-              title="Cumulative PnL vs LLM Cost"
-              meta={llmCostData.has_data ? `$${(llmCostData.total_cost_usd ?? 0).toFixed(4)} spent` : undefined}
+              icon={<BrainCircuit />}
+              title="LLM Intelligence"
+              meta={llmBreakdown.has_data ? `${llmBreakdown.total_calls} calls` : undefined}
             />
           }
           bodyClass="p-3"
         >
-          <LLMTelemetry llmRecords={llmRecords} llmCostData={llmCostData} mode="cumulative" />
+          <LLMBreakdown data={llmBreakdown} height={256} />
         </BentoCell>
 
         {/* Row 4 — Bot Performance Matrix */}

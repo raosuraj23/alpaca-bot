@@ -205,10 +205,24 @@ class StatArbStrategy(BaseStrategy):
 
     def __init__(self, bot_id="statarb-gamma", name="StatArb γ", allocation=35, **kwargs):
         super().__init__(bot_id, name, allocation, "Bollinger Band", **kwargs)
-        self.WINDOW = getattr(self, 'window', 20)
+        # Patchable by PortfolioDirector — use these names in UPDATE_STRATEGY_PARAMS
+        self.lookback_period  = getattr(self, 'lookback_period', 20)   # Bollinger Band window (bars)
+        self.sigma_multiplier = getattr(self, 'sigma_multiplier', 2.0) # Band width in standard deviations
+        self.WINDOW = self.lookback_period  # internal alias kept for legacy references
         self._prices: dict[str, deque] = {}
         self._welford: dict[str, dict] = {} # Tracks count, mean, M2 for O(1) variance
         self._last_signal: dict[str, str] = {}
+
+    def update_params(self, params: dict) -> None:
+        """Extends BaseStrategy.update_params to sync lookback_period → WINDOW and reset state."""
+        super().update_params(params)
+        if 'lookback_period' in params:
+            self.WINDOW = int(self.lookback_period)
+            # Clear per-symbol state so deques are recreated with the new maxlen on next tick
+            self._prices.clear()
+            self._welford.clear()
+            self._last_signal.clear()
+            logger.info("[%s] Bollinger window reset to %d bars (state cleared)", self.name, self.WINDOW)
 
     def _bollinger(self, symbol: str) -> tuple[float, float, float]:
         """Returns (sma, upper_band, lower_band) from O(1) Welford state."""
@@ -216,7 +230,8 @@ class StatArbStrategy(BaseStrategy):
         mean = w["mean"]
         variance = w["M2"] / w["count"] if w["count"] > 0 else 0
         sigma = math.sqrt(max(0.0, variance))
-        return mean, mean + 2 * sigma, mean - 2 * sigma
+        k = self.sigma_multiplier
+        return mean, mean + k * sigma, mean - k * sigma
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self._prices:

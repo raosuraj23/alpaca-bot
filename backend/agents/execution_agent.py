@@ -7,9 +7,14 @@ to the SQLite database (SignalRecord + ExecutionRecord).
 """
 
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Pre-execution guard thresholds (overridable via config.settings if available)
+_SLIPPAGE_ABORT_PCT   = float(os.getenv("SLIPPAGE_ABORT_PCT", "0.02"))   # abort if mid-quote drift > 2%
+_MAX_CONCURRENT_POS   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "15"))  # hard cap on open positions
 
 # Lazy imports for DB to avoid circular imports at module load time
 
@@ -97,6 +102,52 @@ class ExecutionAgent:
                 failure_reason="trading client unavailable",
             )
             return None
+
+        # --- Pre-execution guard: max concurrent positions ---
+        if action == "BUY":
+            try:
+                all_positions = trading_client.get_all_positions()
+                if len(all_positions) >= _MAX_CONCURRENT_POS:
+                    logger.warning(
+                        "[EXECUTION AGENT] Position count limit reached (%d/%d) — aborting BUY %s",
+                        len(all_positions), _MAX_CONCURRENT_POS, symbol,
+                    )
+                    self._persist_async(
+                        bot_id=bot_id, symbol=symbol, action=action,
+                        confidence=approved_signal.get("confidence", 0.0),
+                        order_id=None, fill_price=0.0, slippage=0.0,
+                        status="FAILED",
+                        failure_reason=f"position limit {_MAX_CONCURRENT_POS} reached",
+                    )
+                    return None
+            except Exception as _pe:
+                logger.debug("[EXECUTION AGENT] Position count check failed: %s", _pe)
+
+        # --- Pre-execution guard: slippage check via latest quote ---
+        if s_price > 0:
+            try:
+                quote = trading_client.get_latest_quote(symbol)
+                bid = float(getattr(quote, "bid_price", 0) or 0)
+                ask = float(getattr(quote, "ask_price", 0) or 0)
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2
+                    pre_slip_pct = abs(mid - s_price) / s_price
+                    if pre_slip_pct > _SLIPPAGE_ABORT_PCT:
+                        logger.warning(
+                            "[EXECUTION AGENT] Pre-execution slippage abort: %.2f%% > %.0f%% limit "
+                            "for %s (signal=$%.4f mid=$%.4f)",
+                            pre_slip_pct * 100, _SLIPPAGE_ABORT_PCT * 100, symbol, s_price, mid,
+                        )
+                        self._persist_async(
+                            bot_id=bot_id, symbol=symbol, action=action,
+                            confidence=approved_signal.get("confidence", 0.0),
+                            order_id=None, fill_price=0.0, slippage=pre_slip_pct * s_price,
+                            status="FAILED",
+                            failure_reason=f"pre-execution slippage {pre_slip_pct:.2%} > {_SLIPPAGE_ABORT_PCT:.0%} limit",
+                        )
+                        return None
+            except Exception as _qe:
+                logger.debug("[EXECUTION AGENT] Quote slippage check failed: %s — proceeding", _qe)
 
         # SELL guard: reject if we hold no position in this symbol.
         # Alpaca symbols may be "BTC/USD" (stream) or "BTCUSD" (position) — normalise both.

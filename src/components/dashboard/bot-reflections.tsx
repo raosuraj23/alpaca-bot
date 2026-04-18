@@ -3,9 +3,10 @@
 import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot, Sparkles } from 'lucide-react';
+import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot, Sparkles, Activity } from 'lucide-react';
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
+import { parseUtc } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Type helpers
@@ -31,65 +32,69 @@ interface ReflectionEntry {
   // Trade learning fields
   fill_price?: number;
   slippage?: number;
+  // Director fields
+  target_bot?: string;
+  success?: boolean;
 }
 
 // Reflection type → visual style mapping
 const TYPE_STYLES: Record<string, { icon: typeof Zap; label: string; color: string; border: string; bg: string }> = {
-  observe:   { icon: Eye,            label: 'OBSERVE',   color: 'text-purple-400',                    border: 'border-purple-500/30',                bg: 'bg-purple-500/5' },
-  calculate: { icon: Calculator,     label: 'POSITION',  color: 'text-blue-400',                      border: 'border-blue-500/30',                  bg: 'bg-blue-500/5' },
+  observe:   { icon: Eye,            label: 'OBSERVE',   color: 'text-[var(--agent-observe)]',        border: 'border-[var(--agent-observe)]/30',    bg: 'bg-[var(--agent-observe)]/5' },
+  calculate: { icon: Calculator,     label: 'POSITION',  color: 'text-[var(--agent-calculate)]',      border: 'border-[var(--agent-calculate)]/30',  bg: 'bg-[var(--agent-calculate)]/5' },
   decision:  { icon: Zap,            label: 'DECISION',  color: 'text-[var(--neon-green)]',           border: 'border-[var(--neon-green)]/40',       bg: 'bg-[var(--neon-green)]/5' },
-  learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-amber-400',                     border: 'border-amber-500/30',                 bg: 'bg-amber-500/5' },
-  director:  { icon: Bot,            label: 'DIRECTOR',  color: 'text-[var(--kraken-light)]',         border: 'border-[var(--kraken-purple)]/50',    bg: 'bg-[var(--kraken-purple)]/8' },
-  scanner:   { icon: Sparkles,       label: 'SCANNER',   color: 'text-cyan-400',                      border: 'border-cyan-500/30',                  bg: 'bg-cyan-500/5' },
+  learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-[var(--agent-learning)]',       border: 'border-[var(--agent-learning)]/30',   bg: 'bg-[var(--agent-learning)]/5' },
+  director:  { icon: Bot,            label: 'DIRECTOR',  color: 'text-[var(--agent-execute)]',        border: 'border-[var(--agent-execute)]/30',    bg: 'bg-[var(--agent-execute)]/5' },
+  scanner:   { icon: Sparkles,       label: 'SCANNER',   color: 'text-[var(--agent-scanner)]',        border: 'border-[var(--agent-scanner)]/30',    bg: 'bg-[var(--agent-scanner)]/5' },
 };
 
 function getTypeStyle(type: string | undefined) {
   return TYPE_STYLES[type ?? ''] ?? TYPE_STYLES['observe'];
 }
 
-function formatTimestamp(ts: string | undefined): string {
+function formatTimestamp(ts: string | number | undefined): string {
   if (!ts) return 'Live';
   try {
-    return new Date(ts).toLocaleTimeString('en-US', { hour12: false });
+    return (parseUtc(ts) ?? new Date()).toLocaleTimeString(undefined, { hour12: false });
   } catch {
-    return ts;
+    return String(ts);
   }
 }
 
 // Convert a reflection payload into a display line
 function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; type: string; strategy: string; symbol: string } {
-  const time = formatTimestamp(r.timestamp);
+  const time     = formatTimestamp(r.timestamp);
   const strategy = r.strategy ?? 'system';
-  const symbol = r.symbol ?? '';
+  const symbol   = r.symbol ?? '';
 
   // Scanner events — Haiku-ranked symbol picks
   if (r.type === 'scanner') {
     const results = (r as any).results as any[] | undefined;
     if (results && results.length > 0) {
-      const top = results[0];
+      const top   = results[0];
       const picks = results.slice(0, 3).map((x: any) => `${x.symbol}(${x.signal})`).join(' · ');
-      const text = `Top picks: ${picks} — ${top.symbol}: ${top.verdict ?? top.summary ?? ''}`;
-      return { time, type: 'scanner', text, strategy: 'scanner', symbol: top.symbol ?? '' };
+      return {
+        time, type: 'scanner', strategy: 'scanner', symbol: top.symbol ?? '',
+        text: `Top picks: ${picks} — ${top.symbol}: ${top.verdict ?? top.summary ?? ''}`,
+      };
     }
     return { time, type: 'scanner', text: r.text ?? 'Scanner update', strategy: 'scanner', symbol: '' };
   }
 
   // Director autonomous action events
   if (r.type === 'director') {
-    const entry = r as ReflectionEntry & { action?: string; target_bot?: string; success?: boolean };
-    const status = entry.success === false ? '✗' : '✓';
-    const text = `[${status}] ${entry.action ?? 'ACTION'} → ${(entry as any).target_bot ?? 'portfolio'}: ${r.reason ?? ''}`;
-    return { time, type: 'director', text, strategy: 'director', symbol: (entry as any).target_bot ?? '' };
+    const status = r.success === false ? '✗' : '✓';
+    const text   = `[${status}] ${r.action ?? 'ACTION'} → ${r.target_bot ?? 'portfolio'}: ${r.reason ?? ''}`;
+    return { time, type: 'director', text, strategy: 'director', symbol: r.target_bot ?? '' };
   }
 
-  // If the reflection has a pre-formatted text field, use it
+  // Pre-formatted text field
   if (r.text) {
     return { time, type: r.type ?? 'observe', text: r.text, strategy, symbol };
   }
 
   // Legacy format: action + symbol signals
   if (r.action && r.symbol) {
-    const meta = r.meta ?? {};
+    const meta    = r.meta ?? {};
     const metaStr = Object.entries(meta)
       .map(([k, v]) => `${k}=${typeof v === 'number' ? (v as number).toFixed(4) : v}`)
       .join(' · ');
@@ -111,14 +116,43 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
 // ---------------------------------------------------------------------------
 type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director' | 'scanner';
 const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
-  { value: 'ALL',       label: 'All',        color: 'text-[var(--foreground)]' },
-  { value: 'observe',   label: 'Observe',    color: 'text-purple-400' },
-  { value: 'calculate', label: 'Position',   color: 'text-blue-400' },
-  { value: 'decision',  label: 'Decision',   color: 'text-[var(--neon-green)]' },
-  { value: 'learning',  label: 'Learning',   color: 'text-amber-400' },
-  { value: 'director',  label: 'Director',   color: 'text-[var(--kraken-light)]' },
-  { value: 'scanner',   label: 'Scanner',    color: 'text-cyan-400' },
+  { value: 'ALL',       label: 'All',      color: 'text-[var(--foreground)]' },
+  { value: 'observe',   label: 'Observe',  color: 'text-[var(--agent-observe)]' },
+  { value: 'calculate', label: 'Position', color: 'text-[var(--agent-calculate)]' },
+  { value: 'decision',  label: 'Decision', color: 'text-[var(--neon-green)]' },
+  { value: 'learning',  label: 'Learning', color: 'text-[var(--agent-learning)]' },
+  { value: 'director',  label: 'Director', color: 'text-[var(--agent-execute)]' },
+  { value: 'scanner',   label: 'Scanner',  color: 'text-[var(--agent-scanner)]' },
 ];
+
+// ---------------------------------------------------------------------------
+// Director Status Strip — surfaces last director actions prominently
+// ---------------------------------------------------------------------------
+
+function DirectorStatus({ entries }: { entries: ReturnType<typeof reflectionToDisplay>[] }) {
+  const directorEntries = entries.filter(e => e.type === 'director').slice(0, 2);
+
+  if (directorEntries.length === 0) return null;
+
+  return (
+    <Card className="bg-[var(--panel)] border-[var(--agent-execute)]/30">
+      <CardHeader className="py-2.5 px-4 border-b border-[var(--agent-execute)]/20 flex flex-row items-center space-x-2 bg-gradient-to-r from-[var(--agent-execute)]/8 to-transparent">
+        <Activity className="w-3.5 h-3.5 text-[var(--agent-execute)] shrink-0" />
+        <CardTitle className="text-xs tracking-wide uppercase text-[var(--agent-execute)]">
+          Director — Last Actions
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="py-2 px-4 space-y-1.5">
+        {directorEntries.map((e, i) => (
+          <div key={i} className="flex items-start gap-2 font-mono text-xs">
+            <span className="text-[var(--muted-foreground)] shrink-0 w-[60px]">[{e.time}]</span>
+            <span className="text-[var(--agent-execute)] leading-relaxed">{e.text}</span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -126,9 +160,9 @@ const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
 
 export function BotReflections() {
   const learningHistory = useTradingStore(s => s.learningHistory) as ReflectionEntry[];
-  const strategyStates = useTradingStore(s => s.strategyStates);
-  const [mounted, setMounted] = React.useState(false);
-  const [filter, setFilter] = React.useState<FilterType>('ALL');
+  const strategyStates  = useTradingStore(s => s.strategyStates);
+  const [mounted, setMounted]               = React.useState(false);
+  const [filter, setFilter]                 = React.useState<FilterType>('ALL');
   const [strategyFilter, setStrategyFilter] = React.useState<string>('ALL');
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
@@ -155,6 +189,9 @@ export function BotReflections() {
     return Array.from(set);
   }, [learningHistory]);
 
+  // Pulse indicator: stream is live if we have any entries
+  const isLive = entries.length > 0;
+
   if (!mounted) return (
     <div className="flex h-full gap-4">
       <Card className="flex-1 flex flex-col bg-[var(--panel)]">
@@ -174,11 +211,15 @@ export function BotReflections() {
       <HistoricalAmends />
 
       {/* ------------------------------------------------------------------ */}
-      {/* Right: Live Thought Matrix (SSE stream via /api/reflections/stream) */}
+      {/* Right: Strategy Mental Model + Director Status + Live Thought Matrix */}
       {/* ------------------------------------------------------------------ */}
-      <div className="flex-[2] flex flex-col gap-4">
-        {/* Strategy Mental Model Panel */}
+      <div className="flex-[2] flex flex-col gap-3">
+
+        {/* Strategy Mental Model Panel — shows all symbols */}
         <StrategyMentalModel states={strategyStates} />
+
+        {/* Director Status Strip — last 2 director actions */}
+        <DirectorStatus entries={entries} />
 
         {/* Live Thought Stream */}
         <Card className="flex-1 flex flex-col bg-[var(--panel)]">
@@ -186,7 +227,16 @@ export function BotReflections() {
             <div className="flex items-center space-x-3">
               <SearchCode className="w-5 h-5 text-[var(--kraken-light)]" />
               <div className="flex flex-col">
-                <CardTitle className="text-sm tracking-wide">Live Thought Matrix</CardTitle>
+                <div className="flex items-center gap-2">
+                  <CardTitle className="text-sm tracking-wide">Live Thought Matrix</CardTitle>
+                  {/* SSE live indicator */}
+                  <div className={`w-1.5 h-1.5 rounded-sm ${isLive ? 'bg-[var(--neon-green)] animate-pulse' : 'bg-[var(--muted-foreground)]'}`} />
+                  {entries.length > 0 && (
+                    <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60">
+                      {entries.length}
+                    </span>
+                  )}
+                </div>
                 <span className="text-xs text-[var(--muted-foreground)] uppercase">
                   Agent Internal Monologue
                 </span>
@@ -201,7 +251,7 @@ export function BotReflections() {
                   <button
                     key={opt.value}
                     onClick={() => setFilter(opt.value)}
-                    className={`px-2 py-0.5 text-xs rounded font-mono transition-all duration-200 ${
+                    className={`px-2 py-0.5 text-xs rounded-sm font-mono transition-all duration-200 ${
                       filter === opt.value
                         ? `${opt.color} bg-white/10 shadow-sm`
                         : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-white/5'
@@ -215,7 +265,7 @@ export function BotReflections() {
                 <select
                   value={strategyFilter}
                   onChange={e => setStrategyFilter(e.target.value)}
-                  className="ml-2 px-2 py-0.5 text-xs rounded bg-[var(--panel-muted)] text-[var(--foreground)] border border-[var(--border)] font-mono"
+                  className="ml-2 px-2 py-0.5 text-xs rounded-sm bg-[var(--panel-muted)] text-[var(--foreground)] border border-[var(--border)] font-mono"
                 >
                   <option value="ALL">All Bots</option>
                   {strategies.map(s => (
@@ -232,34 +282,34 @@ export function BotReflections() {
             <div className="p-4 flex flex-col space-y-2 font-mono text-xs">
               {entries.length === 0 ? (
                 <>
-                  <div className="flex items-start space-x-3 p-2 rounded border border-[var(--border)] bg-[var(--panel-muted)]/30">
+                  <div className="flex items-start space-x-3 p-2 rounded-sm border border-[var(--border)] bg-[var(--panel-muted)]/30">
                     <span className="text-[var(--muted-foreground)] shrink-0">[SYSTEM]</span>
                     <span className="text-[var(--foreground)] leading-relaxed">
                       Initializing strategy engine... awaiting live market data.
                     </span>
                   </div>
-                  <div className="flex items-start space-x-3 p-2 rounded border border-[var(--border)] bg-[var(--panel-muted)]/30">
+                  <div className="flex items-start space-x-3 p-2 rounded-sm border border-[var(--border)] bg-[var(--panel-muted)]/30">
                     <span className="text-[var(--muted-foreground)] shrink-0">[STREAM]</span>
                     <span className="text-[var(--foreground)] leading-relaxed">
-                      Connecting to Alpaca CryptoDataStream — BTC/USD · ETH/USD · SOL/USD
+                      Connecting to Alpaca CryptoDataStream — awaiting live universe...
                     </span>
                   </div>
                 </>
               ) : (
                 entries.map((t, i) => {
                   const style = getTypeStyle(t.type);
-                  const Icon = style.icon;
+                  const Icon  = style.icon;
                   return (
                     <div
                       key={i}
-                      className={`flex items-start space-x-3 p-2 rounded border ${style.border} ${style.bg} transition-all duration-300 ${
+                      className={`flex items-start space-x-3 p-2 rounded-sm border ${style.border} ${style.bg} transition-all duration-300 ${
                         i === 0 ? 'animate-in fade-in slide-in-from-top-1 duration-500' : ''
                       }`}
                     >
                       <span className="text-[var(--muted-foreground)] shrink-0 w-[60px]">[{t.time}]</span>
                       <Badge
                         variant="outline"
-                        className={`shrink-0 px-1.5 py-0 text-[10px] font-mono ${style.color} border-current/30`}
+                        className={`shrink-0 px-1.5 py-0 text-xs font-mono ${style.color} border-current/30`}
                       >
                         <Icon className="w-2.5 h-2.5 mr-1 inline" />
                         {style.label}
@@ -284,7 +334,7 @@ export function BotReflections() {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy Mental Model Panel
+// Strategy Mental Model Panel — shows ALL symbols (was limited to first only)
 // ---------------------------------------------------------------------------
 
 function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
@@ -314,39 +364,48 @@ function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
       </CardHeader>
       <CardContent className="py-3 px-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          {symbols.slice(0, 1).map(symbol =>
+          {/* Fixed: iterate ALL symbols, not just the first one */}
+          {symbols.map(symbol =>
             (states[symbol] ?? []).map((state: any, idx: number) => {
               const strategyId = state.strategy ?? 'unknown';
-              const name = state.name ?? strategyId;
-              const botStatus = state.bot_status ?? 'UNKNOWN';
+              const name       = state.name ?? strategyId;
+              const botStatus  = state.bot_status ?? 'UNKNOWN';
 
-              let summary = '';
+              let summary  = '';
               let biasColor = 'text-[var(--muted-foreground)]';
 
               if (strategyId === 'momentum-alpha') {
                 const spread = state.spread_pct ?? 0;
-                const bias = state.bias ?? 'NEUTRAL';
-                const near = state.near_crossover;
+                const bias   = state.bias ?? 'NEUTRAL';
+                const near   = state.near_crossover;
                 summary = `EMA spread: ${spread > 0 ? '+' : ''}${spread.toFixed(4)}%`;
                 if (near) summary += ' ⚡ Near crossover';
                 summary += ` | Bias: ${bias}`;
-                biasColor = bias === 'BULLISH' ? 'text-[var(--neon-green)]' : bias === 'BEARISH' ? 'text-red-400' : 'text-[var(--muted-foreground)]';
+                biasColor = bias === 'BULLISH'
+                  ? 'text-[var(--neon-green)]'
+                  : bias === 'BEARISH'
+                  ? 'text-[var(--neon-red)]'
+                  : 'text-[var(--muted-foreground)]';
               } else if (strategyId === 'statarb-gamma') {
                 if (state.status === 'warming_up') {
                   summary = `Warming up (${state.ticks_collected ?? 0}/20 ticks)`;
                 } else {
-                  const pos = state.position_in_band_pct ?? 50;
+                  const pos  = state.position_in_band_pct ?? 50;
                   const zone = state.zone ?? 'NEUTRAL';
-                  summary = `BB position: ${pos.toFixed(0)}th pctile | Zone: ${zone}`;
-                  biasColor = zone === 'OVERSOLD' ? 'text-[var(--neon-green)]' : zone === 'OVERBOUGHT' ? 'text-red-400' : 'text-[var(--muted-foreground)]';
+                  summary   = `BB position: ${pos.toFixed(0)}th pctile | Zone: ${zone}`;
+                  biasColor  = zone === 'OVERSOLD'
+                    ? 'text-[var(--neon-green)]'
+                    : zone === 'OVERBOUGHT'
+                    ? 'text-[var(--neon-red)]'
+                    : 'text-[var(--muted-foreground)]';
                 }
               } else if (strategyId === 'hft-sniper') {
                 if (botStatus === 'HALTED') {
-                  summary = 'HALTED — awaiting activation';
+                  summary   = 'HALTED — awaiting activation';
                   biasColor = 'text-[var(--muted-foreground)]';
                 } else {
                   const mom = state.momentum_pct ?? 0;
-                  summary = `Momentum: ${mom > 0 ? '+' : ''}${mom.toFixed(5)}%`;
+                  summary   = `Momentum: ${mom > 0 ? '+' : ''}${mom.toFixed(5)}%`;
                 }
               }
 
@@ -357,12 +416,15 @@ function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
               return (
                 <div
                   key={`${symbol}-${strategyId}-${idx}`}
-                  className="flex items-start space-x-3 p-2.5 rounded border border-[var(--border)] bg-[var(--panel-muted)]/20"
+                  className="flex items-start space-x-3 p-2.5 rounded-sm border border-[var(--border)] bg-[var(--panel-muted)]/20"
                 >
                   <div className={`w-2 h-2 mt-1 rounded-sm ${statusDot} shrink-0`} />
                   <div className="flex flex-col min-w-0">
-                    <span className="text-xs font-bold text-[var(--foreground)] truncate">{name}</span>
-                    <span className={`text-[10px] font-mono ${biasColor} leading-relaxed mt-0.5`}>
+                    <span className="text-xs font-bold text-[var(--foreground)] truncate">
+                      {name}
+                      <span className="ml-1 text-[var(--muted-foreground)] font-normal opacity-60">{symbol}</span>
+                    </span>
+                    <span className={`text-xs font-mono ${biasColor} leading-relaxed mt-0.5`}>
                       {summary}
                     </span>
                   </div>
@@ -377,7 +439,7 @@ function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
 }
 
 // ---------------------------------------------------------------------------
-// Historical Amends column — fetches /api/reflections on mount
+// Historical Amends column — fetches /api/reflections every 30s
 // ---------------------------------------------------------------------------
 
 function HistoricalAmends() {
@@ -386,10 +448,14 @@ function HistoricalAmends() {
 
   React.useEffect(() => {
     setMounted(true);
-    fetch(`${API_BASE}/api/reflections`)
-      .then(r => r.ok ? r.json() : [])
-      .then(setAmends)
-      .catch(() => {});
+    const load = () =>
+      fetch(`${API_BASE}/api/reflections`)
+        .then(r => r.ok ? r.json() : [])
+        .then(setAmends)
+        .catch(() => {});
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
   }, []);
 
   if (!mounted) return (
@@ -404,7 +470,14 @@ function HistoricalAmends() {
     <Card className="flex-1 flex flex-col bg-[var(--panel)]">
       <CardHeader className="py-4 border-b border-[var(--kraken-purple)]/30 flex flex-row items-center space-x-3 bg-gradient-to-r from-[var(--kraken-purple)]/10 to-transparent">
         <BrainCircuit className="w-5 h-5 text-[var(--kraken-purple)]" />
-        <CardTitle className="text-sm tracking-wide">Historical Learning & Amends</CardTitle>
+        <div className="flex flex-col flex-1 min-w-0">
+          <CardTitle className="text-sm tracking-wide">Historical Learning & Amends</CardTitle>
+          {amends.length > 0 && (
+            <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-50">
+              {amends.length} records · 30s refresh
+            </span>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
         {amends.length === 0 ? (
@@ -423,8 +496,8 @@ function HistoricalAmends() {
                   {item.model ?? 'Orchestrator'}
                 </span>
               </div>
-              <span className="text-xs text-[var(--muted-foreground)] font-mono">
-                {item.date ?? 'Live'}
+              <span className="text-xs text-[var(--muted-foreground)] font-mono tabular-nums">
+                {item.date ? (parseUtc(item.date)?.toLocaleString(undefined, { hour12: false }) ?? 'Live') : 'Live'}
               </span>
             </div>
             <p className="text-xs text-[var(--muted-foreground)] mb-2 mt-2 leading-relaxed">

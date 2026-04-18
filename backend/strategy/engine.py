@@ -15,7 +15,6 @@ from strategy.equity_algorithms import EquityMomentumStrategy, EquityRSIStrategy
 from strategy.options_algorithms import CoveredCallStrategy, ProtectivePutStrategy
 
 CRYPTO_SYMBOLS_BASE = {"BTC/USD", "ETH/USD", "SOL/USD"}  # always included; scanner expands this
-EQUITY_SYMBOL_SET   = set(EQUITY_SYMBOLS)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +24,8 @@ class StrategyEngine:
         self.ws_subscribe_callback = ws_subscribe_callback
         # Start with the base crypto set; scanner discovery updates this at runtime
         self.active_crypto_symbols: set[str] = set(CRYPTO_SYMBOLS_BASE)
+        # Equity symbols routing table; grows as scanner/research surface new tickers
+        self.active_equity_symbols: set[str] = set(EQUITY_SYMBOLS)
         
         # Refactor: Use a registry/factory for clean instantiation
         self._strategy_classes = {
@@ -94,17 +95,23 @@ class StrategyEngine:
         return True
 
     def set_active_crypto_symbols(self, symbols: set[str]) -> None:
-        """Merges new symbols and commands the WebSocket to subscribe."""
+        """Merges new crypto symbols and commands the WebSocket to subscribe."""
         merged = CRYPTO_SYMBOLS_BASE | {s for s in symbols if s.endswith("/USD")}
         new_symbols = merged - self.active_crypto_symbols
-        
+
         if new_symbols:
-            logger.info("[ENGINE] Discovering new symbols: %s", list(new_symbols))
+            logger.info("[ENGINE] New crypto symbols discovered: %s", list(new_symbols))
             self.active_crypto_symbols = merged
-            
-            # CRITICAL FIX: Actually subscribe to the data stream!
+
             if self.ws_subscribe_callback:
                 self.ws_subscribe_callback(list(new_symbols))
+
+    def set_active_equity_symbols(self, symbols: set[str]) -> None:
+        """Merges newly discovered equity symbols into the tick-routing table."""
+        new_symbols = {s for s in symbols if "/" not in s} - self.active_equity_symbols
+        if new_symbols:
+            logger.info("[ENGINE] New equity symbols discovered: %s", list(new_symbols))
+            self.active_equity_symbols |= new_symbols
 
     # ------------------------------------------------------------------
     # State Queries
@@ -227,7 +234,7 @@ class StrategyEngine:
         self._last_prices[symbol] = price
         
         is_crypto = symbol in self.active_crypto_symbols
-        is_equity = symbol in EQUITY_SYMBOL_SET
+        is_equity = symbol in self.active_equity_symbols
 
         # Filter active bots relevant to this asset class
         active_bots = []

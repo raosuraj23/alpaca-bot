@@ -18,15 +18,15 @@ interface StrategyAttributionProps {
 }
 
 const ASSET_COLORS: Record<string, string> = {
-  CRYPTO: 'hsl(264, 80%, 65%)',
-  EQUITY: 'hsl(150, 80%, 45%)',
-  OPTIONS: 'hsl(40, 80%, 60%)',
+  CRYPTO: 'var(--kraken-purple)',
+  EQUITY: 'var(--neon-green)',
+  OPTIONS: 'var(--warning)',
 };
 
 const ALGO_COLORS = [
-  'hsl(264, 80%, 65%)', 'hsl(150, 80%, 45%)', 'hsl(40, 80%, 60%)',
-  'hsl(190, 70%, 60%)', 'hsl(0, 70%, 60%)', 'hsl(220, 70%, 65%)',
-  'hsl(300, 60%, 60%)', 'hsl(60, 70%, 55%)',
+  'var(--kraken-purple)', 'var(--neon-green)',    'var(--warning)',
+  'var(--agent-scanner)', 'var(--neon-red)',       'var(--agent-calculate)',
+  'var(--agent-observe)', 'var(--kraken-light)',
 ];
 
 export function StrategyAttribution({ bots }: StrategyAttributionProps) {

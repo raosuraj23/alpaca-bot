@@ -4,34 +4,7 @@ import * as React from 'react';
 import { createChart, AreaSeries, HistogramSeries, createSeriesMarkers } from 'lightweight-charts';
 import type { IChartApi, Time } from 'lightweight-charts';
 import { Activity } from 'lucide-react';
-
-// Raw HSL strings — canvas cannot read CSS variables
-const COLORS = {
-  text: 'hsl(250, 10%, 65%)',
-  border: 'hsla(255, 40%, 40%, 0.15)',
-  green: 'hsl(150, 80%, 45%)',
-  greenFill: 'hsla(150, 80%, 45%, 0.15)',
-  red: 'hsl(350, 80%, 60%)',
-  redFill: 'hsla(350, 80%, 60%, 0.12)',
-};
-
-const BASE_OPTS = {
-  layout: {
-    background: { color: 'transparent' as const },
-    textColor: COLORS.text,
-    fontSize: 10,
-    fontFamily: 'JetBrains Mono, monospace',
-  },
-  grid: {
-    vertLines: { color: COLORS.border },
-    horzLines: { color: COLORS.border },
-  },
-  crosshair: { mode: 1 as const },
-  rightPriceScale: { borderColor: COLORS.border, scaleMargins: { top: 0.1, bottom: 0.05 } },
-  timeScale: { borderColor: COLORS.border, timeVisible: true, secondsVisible: false },
-  handleScale: false as const,
-  handleScroll: false as const,
-};
+import { cssVar } from '@/lib/utils';
 
 interface EquityCurveTerminalProps {
   history: [number, number][];
@@ -67,11 +40,28 @@ export function EquityCurveTerminal({ history, lastSignal }: EquityCurveTerminal
     const el = topRef.current;
     if (!el || equityPoints.length < 2) return;
 
-    const chart = createChart(el, { ...BASE_OPTS, autoSize: true });
+    // Resolve CSS variables at effect time — lightweight-charts uses canvas, not CSS
+    const text      = cssVar('--muted-foreground');
+    const border    = cssVar('--border');
+    const green     = cssVar('--neon-green');
+    const red       = cssVar('--neon-red');
+    const greenFill = cssVar('--neon-green-fill');
+    const redFill   = cssVar('--neon-red-fill');
+
+    const chart = createChart(el, {
+      layout: { background: { color: 'transparent' as const }, textColor: text, fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+      grid: { vertLines: { color: border }, horzLines: { color: border } },
+      crosshair: { mode: 1 as const },
+      rightPriceScale: { borderColor: border, scaleMargins: { top: 0.1, bottom: 0.05 } },
+      timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
+      handleScale: false as const,
+      handleScroll: false as const,
+      autoSize: true,
+    });
     chart1Ref.current = chart;
 
-    const lineColor = isPositive ? COLORS.green : COLORS.red;
-    const topColor  = isPositive ? COLORS.greenFill : COLORS.redFill;
+    const lineColor = isPositive ? green : red;
+    const topColor  = isPositive ? greenFill : redFill;
 
     const area = chart.addSeries(AreaSeries, {
       lineColor,
@@ -88,7 +78,7 @@ export function EquityCurveTerminal({ history, lastSignal }: EquityCurveTerminal
       createSeriesMarkers(area, [{
         time: sigTs,
         position: isBuy ? 'belowBar' : 'aboveBar',
-        color: isBuy ? COLORS.green : COLORS.red,
+        color: isBuy ? green : red,
         shape: isBuy ? 'arrowUp' : 'arrowDown',
         text: lastSignal.action,
       }]);
@@ -104,18 +94,27 @@ export function EquityCurveTerminal({ history, lastSignal }: EquityCurveTerminal
     const el = bottomRef.current;
     if (!el || ddPoints.length < 2) return;
 
+    const text   = cssVar('--muted-foreground');
+    const border = cssVar('--border');
+    const red    = cssVar('--neon-red');
+
     const chart = createChart(el, {
-      ...BASE_OPTS,
+      layout: { background: { color: 'transparent' as const }, textColor: text, fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+      grid: { vertLines: { color: border }, horzLines: { color: border } },
+      crosshair: { mode: 1 as const },
+      rightPriceScale: { borderColor: border, scaleMargins: { top: 0.05, bottom: 0 } },
+      timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
+      handleScale: false as const,
+      handleScroll: false as const,
       autoSize: true,
-      rightPriceScale: { ...BASE_OPTS.rightPriceScale, scaleMargins: { top: 0.05, bottom: 0 } },
     });
     chart2Ref.current = chart;
 
     const dd = chart.addSeries(HistogramSeries, {
-      color: COLORS.red,
+      color: red,
       priceFormat: { type: 'percent', precision: 3, minMove: 0.001 },
     });
-    dd.setData(ddPoints.map(p => ({ ...p, color: COLORS.red })));
+    dd.setData(ddPoints.map(p => ({ ...p, color: red })));
     chart.timeScale().fitContent();
 
     return () => { chart.remove(); chart2Ref.current = null; };

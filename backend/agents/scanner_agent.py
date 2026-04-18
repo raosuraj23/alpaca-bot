@@ -21,21 +21,54 @@ Portfolio integration:
 
 import asyncio
 import logging
+import pandas as pd
 from datetime import datetime, timezone
 from typing import Callable, Optional
+from config import GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT
 
 logger = logging.getLogger(__name__)
 
-# Base watchlist — always scanned regardless of discovery
+# Absolute bootstrap — always monitored regardless of discovery
 SCAN_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 
-# Extended universe evaluated during TIER 1 discovery
-UNIVERSE_SYMBOLS = [
+# Seed universes — starting point only; universe grows at runtime via expand_universe()
+_CRYPTO_SEED: list[str] = [
     "BTC/USD", "ETH/USD", "SOL/USD",
     "AVAX/USD", "LINK/USD", "UNI/USD",
     "DOGE/USD", "ADA/USD", "LTC/USD",
     "DOT/USD", "BCH/USD", "ATOM/USD",
 ]
+_EQUITY_SEED: list[str] = [
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA",
+    "TSLA", "AMZN", "GOOGL", "META", "AMD",
+    "NFLX", "INTC", "JPM", "BAC", "GS",
+]
+
+# Module-level mutable universe — grows as research/scanner surface new symbols
+_dynamic_universe: set[str] = set(_CRYPTO_SEED + _EQUITY_SEED)
+
+
+def expand_universe(symbols: list[str]) -> None:
+    """Add newly discovered symbols to the active evaluation universe.
+
+    Called by ResearchAgent after each brief and by ScannerAgent after discovery.
+    Thread-safe for asyncio single-threaded event loop.
+    """
+    new = [s for s in symbols if s and s not in _dynamic_universe]
+    if new:
+        logger.info("[SCANNER] Universe expanded: +%s", new)
+        _dynamic_universe.update(new)
+
+
+def get_universe() -> list[str]:
+    """Current evaluation universe as a stable list (seed order preserved, new appended)."""
+    seed_order = _CRYPTO_SEED + _EQUITY_SEED
+    extras = sorted(_dynamic_universe - set(seed_order))
+    return seed_order + extras
+
+
+# Back-compat alias imported by research_agent.py — always reflects current dynamic universe
+UNIVERSE_SYMBOLS = get_universe()
 
 SCAN_INTERVAL      = 300   # 5 min — TA screener cadence
 DISCOVERY_INTERVAL = 1800  # 30 min — Sonnet market research cadence
@@ -45,6 +78,68 @@ MAX_ACTIVE_SYMBOLS = 8     # Cap to control LLM cost and stream connections
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Anomaly detection — Step 1 of the Agentic 5-Step Pipeline
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+@dataclass
+class AnomalyFlag:
+    symbol: str
+    flag_type: Literal["PRICE_SPIKE", "VOLUME_SURGE", "WIDE_SPREAD"]
+    price_move_pct: float = 0.0    # absolute % move vs. previous bar
+    volume_ratio_7d: float = 1.0   # current volume / 7-day rolling average
+    spread_bps: float = 0.0        # bid-ask spread in basis points (if quote data available)
+    description: str = ""
+
+
+def detect_anomalies(symbol: str, bars: list[dict]) -> list[AnomalyFlag]:
+    """
+    Scan recent OHLCV bars for hard-threshold anomalies.
+
+    Rules:
+      PRICE_SPIKE  — single-bar close move > 10% (absolute)
+      VOLUME_SURGE — current bar volume > 2× 7-day (7*24*60 min bars) average
+    """
+    flags: list[AnomalyFlag] = []
+    if len(bars) < 2:
+        return flags
+
+    closes  = [b["close"]  for b in bars]
+    volumes = [b["volume"] for b in bars]
+
+    # PRICE_SPIKE: latest close vs. previous close
+    prev, curr = closes[-2], closes[-1]
+    if prev > 0:
+        move_pct = abs((curr - prev) / prev) * 100
+        if move_pct > 10.0:
+            flags.append(AnomalyFlag(
+                symbol=symbol,
+                flag_type="PRICE_SPIKE",
+                price_move_pct=round(move_pct, 3),
+                description=f"{symbol} moved {move_pct:+.2f}% in last bar (prev=${prev:.2f} → ${curr:.2f})",
+            ))
+
+    # VOLUME_SURGE: vs. 7-day rolling average (up to 10080 1-min bars)
+    lookback = min(len(volumes) - 1, 10_080)
+    if lookback >= 20:
+        avg_vol_7d = sum(volumes[-lookback:-1]) / lookback
+        if avg_vol_7d > 0:
+            ratio = volumes[-1] / avg_vol_7d
+            if ratio > 2.0:
+                flags.append(AnomalyFlag(
+                    symbol=symbol,
+                    flag_type="VOLUME_SURGE",
+                    volume_ratio_7d=round(ratio, 2),
+                    description=f"{symbol} volume {ratio:.1f}× 7-day avg (current={volumes[-1]:,.0f})",
+                ))
+
+    return flags
 
 
 class ScannerAgent:
@@ -62,15 +157,21 @@ class ScannerAgent:
         self,
         push_fn: Callable[[dict], None],
         get_buffer_fn: Callable,
+        get_research_fn: Optional[Callable] = None,
+        set_equity_symbols_fn: Optional[Callable] = None,
     ):
-        self._push        = push_fn
-        self._get_buffer  = get_buffer_fn
+        self._push                  = push_fn
+        self._get_buffer            = get_buffer_fn
+        self._get_research          = get_research_fn
+        self._set_equity_symbols_fn = set_equity_symbols_fn
         self._running     = False
         self._last_scan:      Optional[datetime] = None
         self._last_discovery: Optional[datetime] = None
         self._results:        list[dict] = []
-        # Active symbol set — starts from base, expanded by discovery
-        self._active_symbols: list[str] = list(SCAN_SYMBOLS)
+        # Active symbol set — starts from top seeds across both asset classes
+        self._active_symbols: list[str] = list(
+            dict.fromkeys(_CRYPTO_SEED[:6] + _EQUITY_SEED[:6])
+        )
 
     def get_last_results(self) -> list[dict]:
         """Returns the most recent scan results for REST polling."""
@@ -83,12 +184,80 @@ class ScannerAgent:
     async def run(self):
         """Background entry point — runs both tiers concurrently."""
         self._running = True
+        await self._seed_buffer_with_history()
         await asyncio.sleep(WARMUP_DELAY)
         logger.info("[SCANNER] Agent started (scan=%ds, discovery=%ds)", SCAN_INTERVAL, DISCOVERY_INTERVAL)
         await asyncio.gather(
             self._scan_loop(),
             self._discovery_loop(),
         )
+
+    async def _seed_buffer_with_history(self) -> None:
+        """
+        Pre-populate the OHLCV buffer with 1-min REST bars for every seed symbol.
+        Without this, only live-streamed symbols have enough bars for TA scoring,
+        which locks the scanner permanently to BTC/ETH/SOL.
+        Fetches 120 1-min bars (~2 hours) per symbol — enough for EMA20, RSI14, BBands.
+        """
+        try:
+            from config import settings
+            from datetime import timedelta
+            from alpaca.data.timeframe import TimeFrame
+
+            api_key    = settings.alpaca_api_key_id
+            api_secret = settings.alpaca_api_secret_key
+            universe   = get_universe()
+            crypto_syms  = [s for s in universe if "/" in s]
+            equity_syms  = [s for s in universe if "/" not in s]
+            end   = datetime.now(timezone.utc)
+            start = end - timedelta(hours=3)
+            buf   = self._get_buffer()
+
+            if buf is None:
+                return
+
+            # Crypto bars
+            if crypto_syms:
+                try:
+                    from alpaca.data.historical import CryptoHistoricalDataClient
+                    from alpaca.data.requests import CryptoBarsRequest
+                    client = CryptoHistoricalDataClient(api_key, api_secret)
+                    req    = CryptoBarsRequest(
+                        symbol_or_symbols=crypto_syms,
+                        timeframe=TimeFrame.Minute,
+                        start=start, end=end,
+                    )
+                    bars_df = client.get_crypto_bars(req).df
+                    if not bars_df.empty:
+                        for sym in bars_df.index.get_level_values(0).unique():
+                            sym_df = bars_df.xs(sym, level=0) if isinstance(bars_df.index, pd.MultiIndex) else bars_df
+                            buf.ingest_ohlcv_df(sym, sym_df)
+                            logger.info("[SCANNER] Seeded buffer: %s (%d bars)", sym, len(sym_df))
+                except Exception as e:
+                    logger.warning("[SCANNER] Crypto history seed failed: %s", e)
+
+            # Equity bars (market hours only — may return empty outside session)
+            if equity_syms:
+                try:
+                    from alpaca.data.historical import StockHistoricalDataClient
+                    from alpaca.data.requests import StockBarsRequest
+                    client = StockHistoricalDataClient(api_key, api_secret)
+                    req    = StockBarsRequest(
+                        symbol_or_symbols=equity_syms,
+                        timeframe=TimeFrame.Minute,
+                        start=start, end=end,
+                    )
+                    bars_df = client.get_stock_bars(req).df
+                    if not bars_df.empty:
+                        for sym in bars_df.index.get_level_values(0).unique():
+                            sym_df = bars_df.xs(sym, level=0) if isinstance(bars_df.index, pd.MultiIndex) else bars_df
+                            buf.ingest_ohlcv_df(sym, sym_df)
+                            logger.info("[SCANNER] Seeded buffer: %s (%d bars)", sym, len(sym_df))
+                except Exception as e:
+                    logger.warning("[SCANNER] Equity history seed failed: %s", e)
+
+        except Exception as e:
+            logger.warning("[SCANNER] Buffer seed skipped: %s", e)
 
     async def _scan_loop(self):
         """TIER 2 — TA screener runs every SCAN_INTERVAL seconds."""
@@ -129,9 +298,9 @@ class ScannerAgent:
         if buffer is None:
             return
 
-        # Score every universe symbol deterministically
+        # Score every universe symbol deterministically (uses live dynamic universe)
         universe_scored = []
-        for symbol in UNIVERSE_SYMBOLS:
+        for symbol in get_universe():
             result = self._score_symbol(symbol, buffer)
             if result is not None:
                 universe_scored.append(result)
@@ -148,12 +317,35 @@ class ScannerAgent:
                 if result:
                     universe_scored.append(result)
 
-        # Sonnet ranks and selects the best symbols
-        selected = await self._sonnet_research(universe_scored, position_symbols)
+        # Build research context from ResearchAgent if available and fresh
+        research_context = ""
+        if self._get_research:
+            ra = self._get_research()
+            if ra:
+                brief = ra.get_latest_brief()
+                if brief:
+                    research_context = (
+                        f"\n\nResearch Intelligence (Gemini 2.5 Flash, {brief.generated_at}):\n"
+                        f"Macro: {brief.macro_theme}\n"
+                        f"Catalysts: {', '.join(brief.catalysts[:3])}\n"
+                        f"Risks: {', '.join(brief.risks[:3])}\n"
+                        f"Recommended focus: {', '.join(brief.recommended_focus)}\n"
+                        f"Sentiments: {'; '.join(f'{s.symbol}={s.sentiment}({s.confidence:.0%})' for s in brief.sentiment_by_symbol)}"
+                    )
 
-        # Merge with base symbols (base always included)
-        merged = list(dict.fromkeys(SCAN_SYMBOLS + selected + position_symbols))
+        # Gemini 2.0 Flash ranks and selects the best symbols
+        selected = await self._gemini_discovery(universe_scored, position_symbols, research_context)
+
+        # Discovery drives active list; position symbols always appended; fall back to seeds
+        merged = list(dict.fromkeys(selected + position_symbols))
+        if not merged:
+            merged = list(dict.fromkeys(_CRYPTO_SEED[:3] + _EQUITY_SEED[:3]))
         self._active_symbols = merged[:MAX_ACTIVE_SYMBOLS]
+
+        # Notify engine of any newly discovered equity symbols
+        equity_discovered = [s for s in self._active_symbols if "/" not in s]
+        if equity_discovered and self._set_equity_symbols_fn:
+            self._set_equity_symbols_fn(equity_discovered)
 
         now = _utcnow()
         self._last_discovery = now
@@ -167,22 +359,24 @@ class ScannerAgent:
 
         logger.info("[SCANNER] Discovery complete — active: %s", self._active_symbols)
 
-    async def _sonnet_research(self, scored: list[dict], held_symbols: list[str]) -> list[str]:
+    async def _gemini_discovery(
+        self,
+        scored: list[dict],
+        held_symbols: list[str],
+        research_context: str = "",
+    ) -> list[str]:
         """
-        Asks Sonnet to select the top symbols from the universe based on:
-          - Current TA scores and signals
-          - Portfolio holdings (must monitor held positions)
-          - Market regime (trending / ranging / volatile)
-
-        Returns an ordered list of symbol strings.
+        Asks Gemini 2.0 Flash to select the top symbols from a pre-scored list.
+        Injects research context from ResearchAgent when available.
+        Budget: 800 output tokens.
         """
         try:
             from agents.factory import swarm_factory
-            model = swarm_factory.build_model(model_level="smart")
+            model = swarm_factory.build_model(model_level="discovery", max_tokens=800)
             if not model:
-                raise RuntimeError("smart model unavailable")
+                raise RuntimeError("discovery model unavailable")
 
-            from langchain_core.messages import SystemMessage, HumanMessage
+            from langchain_core.messages import HumanMessage, SystemMessage
 
             held_str = ", ".join(held_symbols) if held_symbols else "none"
             universe_str = "\n".join(
@@ -191,33 +385,30 @@ class ScannerAgent:
                 for s in sorted(scored, key=lambda x: abs(x["score"]), reverse=True)
             )
 
-            response = model.invoke(
-                [
-                    SystemMessage(content=(
-                        "You are a quantitative crypto portfolio manager. "
-                        "Your task is to select the best symbols to actively monitor and trade "
-                        f"from the universe below. Constraints:\n"
-                        f"- Always include held positions: {held_str}\n"
-                        f"- Select no more than {MAX_ACTIVE_SYMBOLS} symbols total\n"
-                        f"- Prioritise symbols with strong directional signals (BUY or SELL)\n"
-                        f"- Avoid correlated pairs (e.g. do not select both BTC and multiple ETH forks)\n"
-                        f"- Consider liquidity: prefer BTC, ETH, SOL over micro-caps\n\n"
-                        "Respond ONLY with a comma-separated list of symbols in priority order. "
-                        "Example: BTC/USD, ETH/USD, SOL/USD"
-                    )),
-                    HumanMessage(content=f"Universe TA scores:\n{universe_str}"),
-                ],
-                max_tokens=100,
-            )
+            response = await model.ainvoke([
+                SystemMessage(content=(
+                    "You are a quantitative multi-asset portfolio manager covering crypto and US equities. "
+                    "Select the best symbols to actively monitor and trade from the scored universe.\n"
+                    f"Constraints:\n"
+                    f"- Always include held positions: {held_str}\n"
+                    f"- Select no more than {MAX_ACTIVE_SYMBOLS} symbols total\n"
+                    f"- Prioritise symbols with strong directional signals (BUY or SELL)\n"
+                    f"- Avoid correlated pairs\n"
+                    f"- Prioritise high-conviction directional signals across all asset classes\n\n"
+                    "Respond ONLY with a comma-separated list of symbols in priority order. "
+                    "Example: BTC/USD, AAPL, ETH/USD, SPY"
+                )),
+                HumanMessage(content=f"Universe TA scores:\n{universe_str}{research_context}"),
+            ])
 
             # Parse comma-separated symbol list from response
             raw = response.content.strip()
             selected: list[str] = []
             for token in raw.replace("\n", ",").split(","):
                 sym = token.strip().upper()
-                # Normalise: "BTCUSD" -> "BTC/USD", "BTC/USD" stays
-                if "/" not in sym and len(sym) > 3:
-                    sym = sym.replace("USD", "/USD")
+                # Normalize compact crypto format: "BTCUSD" → "BTC/USD"
+                if "/" not in sym and sym.endswith("USD") and len(sym) > 4:
+                    sym = sym[:-3] + "/USD"
                 if sym and any(s["symbol"] == sym for s in scored):
                     selected.append(sym)
                 if len(selected) >= MAX_ACTIVE_SYMBOLS:
@@ -226,14 +417,14 @@ class ScannerAgent:
             # Log cost
             try:
                 usage = getattr(response, "usage_metadata", None) or {}
-                t_in  = usage.get("input_tokens", 0)
-                t_out = usage.get("output_tokens", 0)
-                cost  = (t_in * 3.00 + t_out * 15.00) / 1_000_000  # Sonnet pricing
+                t_in  = usage.get("input_tokens", 0) or usage.get("prompt_token_count", 0)
+                t_out = usage.get("output_tokens", 0) or usage.get("candidates_token_count", 0)
+                cost  = (t_in * GEMINI_FLASH_COST_IN + t_out * GEMINI_FLASH_COST_OUT) / 1_000_000
                 from db.database import _get_session_factory
                 from db.models import LLMUsage
                 async with _get_session_factory()() as _s:
                     _s.add(LLMUsage(
-                        model="claude-sonnet-4-6",
+                        model=GEMINI_FLASH_MODEL,
                         tokens_in=t_in,
                         tokens_out=t_out,
                         cost_usd=cost,
@@ -241,14 +432,13 @@ class ScannerAgent:
                     ))
                     await _s.commit()
             except Exception as _le:
-                logger.debug("[SCANNER] Sonnet cost log failed: %s", _le)
+                logger.debug("[SCANNER] Discovery cost log failed: %s", _le)
 
-            logger.info("[SCANNER] Sonnet selected: %s", selected)
+            logger.info("[SCANNER] Discovery selected: %s", selected)
             return selected
 
         except Exception as e:
-            logger.debug("[SCANNER] Sonnet research unavailable: %s", e)
-            # Fallback: pick top-scoring symbols by abs(score)
+            logger.debug("[SCANNER] Discovery unavailable: %s", e)
             top = sorted(scored, key=lambda x: abs(x["score"]), reverse=True)
             return [s["symbol"] for s in top[:MAX_ACTIVE_SYMBOLS]]
 
@@ -292,15 +482,16 @@ class ScannerAgent:
         self._last_scan = now
         self._results = [
             {
-                "symbol":    s["symbol"],
-                "score":     round(s["score"], 4),
-                "signal":    s["signal"],
-                "price":     s.get("price", 0),
-                "rsi":       s.get("rsi"),
-                "vol_surge": s.get("vol_surge"),
-                "summary":   s["summary"],
-                "verdict":   haiku_verdicts.get(s["symbol"], s["summary"]),
-                "timestamp": now.isoformat(),
+                "symbol":        s["symbol"],
+                "score":         round(s["score"], 4),
+                "signal":        s["signal"],
+                "price":         s.get("price", 0),
+                "rsi":           s.get("rsi"),
+                "vol_surge":     s.get("vol_surge"),
+                "summary":       s["summary"],
+                "verdict":       haiku_verdicts.get(s["symbol"], s["summary"]),
+                "anomaly_flags": s.get("anomaly_flags", []),
+                "timestamp":     now.isoformat(),
             }
             for s in scored
         ]
@@ -335,10 +526,10 @@ class ScannerAgent:
                        -0.3 if price in upper 75%+
         """
         try:
-            bars = buffer.get_bars(symbol)
-            if not bars or len(bars) < 20:
+            df = buffer.get_candles(symbol, "1Min")
+            if df is None or df.empty or len(df) < 20:
                 return None
-
+            bars    = df.to_dict(orient="records")
             closes  = [b["close"]  for b in bars]
             volumes = [b["volume"] for b in bars]
 
@@ -389,15 +580,22 @@ class ScannerAgent:
             signal  = "BUY" if score > 1.0 else "SELL" if score < -1.0 else "NEUTRAL"
             summary = f"${price:,.2f} | " + ", ".join(signals[:3]) if signals else f"${price:,.2f}"
 
+            # Anomaly detection — flags price spikes and volume surges
+            anomaly_flags = detect_anomalies(symbol, bars)
+            if anomaly_flags:
+                for flag in anomaly_flags:
+                    logger.warning("[SCANNER] ANOMALY %s: %s", flag.flag_type, flag.description)
+
             return {
-                "symbol":    symbol,
-                "score":     score,
-                "signal":    signal,
-                "summary":   summary,
-                "price":     price,
-                "rsi":       round(rsi, 1) if rsi is not None else None,
-                "vol_surge": round(vol_surge, 2),
-                "band_pct":  round(band_pct, 3),
+                "symbol":        symbol,
+                "score":         score,
+                "signal":        signal,
+                "summary":       summary,
+                "price":         price,
+                "rsi":           round(rsi, 1) if rsi is not None else None,
+                "vol_surge":     round(vol_surge, 2),
+                "band_pct":      round(band_pct, 3),
+                "anomaly_flags": [{"type": f.flag_type, "description": f.description} for f in anomaly_flags],
             }
 
         except Exception as e:
@@ -458,18 +656,18 @@ class ScannerAgent:
             # Log token usage
             try:
                 usage = getattr(response, "usage_metadata", None) or {}
-                t_in  = usage.get("input_tokens", 0)
-                t_out = usage.get("output_tokens", 0)
-                cost  = (t_in * 0.80 + t_out * 4.00) / 1_000_000
+                t_in  = usage.get("input_tokens", 0) or usage.get("prompt_token_count", 0)
+                t_out = usage.get("output_tokens", 0) or usage.get("candidates_token_count", 0)
+                cost  = (t_in * GEMINI_FLASH_COST_IN + t_out * GEMINI_FLASH_COST_OUT) / 1_000_000
                 from db.database import _get_session_factory
                 from db.models import LLMUsage
                 async with _get_session_factory()() as _s:
                     _s.add(LLMUsage(
-                        model="claude-haiku-4-5",
+                        model=GEMINI_FLASH_MODEL,
                         tokens_in=t_in,
                         tokens_out=t_out,
                         cost_usd=cost,
-                        purpose="scanner",
+                        purpose="scanner_verdict",
                     ))
                     await _s.commit()
             except Exception as _le:

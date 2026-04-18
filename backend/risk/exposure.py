@@ -16,16 +16,43 @@ Sizing formula:
 
 import logging
 from dataclasses import dataclass
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Risk parameters (adjustable per strategy)
-MAX_POSITION_PCT    = 0.10   # 10% of equity hard cap
-MAX_POSITION_USD    = 50_000 # $50k absolute cap
-MAX_KELLY_FRACTION  = 0.25   # never bet more than 25% of Kelly suggestion
-REWARD_RISK_RATIO   = 2.0    # assumed R:R (2:1 take-profit / stop-loss)
-VAR_DAILY_PCT       = 0.01   # 1% daily VaR limit
-VAR_CONFIDENCE      = 0.95   # 95th percentile
+# Risk parameters — sourced from config so they're overridable via env vars
+MAX_POSITION_PCT    = 0.10                       # 10% of equity hard cap (structural constant)
+MAX_POSITION_USD    = 50_000                     # $50k absolute cap (structural constant)
+MAX_KELLY_FRACTION  = settings.max_kelly_fraction
+REWARD_RISK_RATIO   = settings.reward_risk_ratio
+VAR_DAILY_PCT       = settings.var_daily_pct
+VAR_CONFIDENCE      = settings.var_confidence
+
+
+def kelly_fraction(
+    win_rate: float,
+    win_loss_ratio: float,
+    kelly_scale: float = 0.25,
+) -> float:
+    """
+    Fractional Kelly sizing adapted for continuous price-action assets.
+
+    Full Kelly: f* = W - (1 - W) / R
+    where W = win_rate, R = win/loss ratio (reward:risk).
+    Use fractional Kelly (0.25–0.50) for live trading to reduce variance.
+
+    Args:
+        win_rate:       Historical win rate 0 < W < 1
+        win_loss_ratio: Average win / average loss (R ratio), must be > 0
+        kelly_scale:    Fraction of full Kelly to use (0.25 = quarter-Kelly, 0.50 = half-Kelly)
+
+    Returns:
+        Fractional Kelly position size as a fraction of bankroll, floored at 0.
+    """
+    if win_loss_ratio <= 0 or not 0.0 < win_rate < 1.0:
+        raise ValueError(f"Invalid Kelly inputs: win_rate={win_rate}, win_loss_ratio={win_loss_ratio}")
+    full_kelly = win_rate - (1.0 - win_rate) / win_loss_ratio
+    return max(0.0, full_kelly * kelly_scale)  # floored at zero — never size negatively
 
 
 @dataclass
@@ -66,6 +93,7 @@ class ExposureManager:
     def size(self, signal: dict, account_equity: float) -> SizingResult:
         """Full sizing computation. Returns a SizingResult with diagnostics."""
         symbol     = signal.get("symbol", "")
+        bot_id     = signal.get("bot", "")
         confidence = float(signal.get("confidence", 0.5))
         price      = float(signal.get("price", 1.0))
 
@@ -76,13 +104,21 @@ class ExposureManager:
                 rejection_reason="Invalid equity or price"
             )
 
-        # --- Kelly Fraction ---
+        # --- Dynamic Kelly Fraction via calibration scalar ---
+        # calibration_scalar returns [0.25, 0.50] based on rolling Brier Score.
+        # Well-calibrated strategies earn higher position sizes; poor ones are capped at quarter-Kelly.
+        try:
+            from risk.calibration import calibration_tracker
+            cal_scalar = calibration_tracker.calibration_scalar(bot_id)
+        except Exception:
+            cal_scalar = self.max_kelly_fraction  # fallback if calibration not loaded
+
         p = confidence
         q = 1.0 - p
         b = self.reward_risk_ratio
         raw_kelly = (p * b - q) / b           # raw Kelly fraction (0..1 for winning edge)
         kelly = max(0.0, raw_kelly)            # Kelly is 0 if edge is negative
-        capped_kelly = kelly * self.max_kelly_fraction  # fractional Kelly (safer)
+        capped_kelly = kelly * cal_scalar      # dynamic fractional Kelly
 
         # --- Notional Calculation ---
         notional = account_equity * capped_kelly
@@ -103,8 +139,8 @@ class ExposureManager:
         qty = round(notional / price, 6) if price > 0 else 0.0
 
         logger.info(
-            "[EXPOSURE] %s kelly=%.4f capped=%.4f notional=$%.2f qty=%.6f var_limit=$%.2f",
-            symbol, kelly, capped_kelly, notional, qty, var_limit
+            "[EXPOSURE] %s kelly=%.4f capped=%.4f(scalar=%.2f) notional=$%.2f qty=%.6f var_limit=$%.2f",
+            symbol, kelly, capped_kelly, cal_scalar, notional, qty, var_limit
         )
 
         return SizingResult(

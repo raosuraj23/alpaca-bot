@@ -15,9 +15,39 @@ momentum readings). No LLM calls, no cost.
 import asyncio
 import logging
 from datetime import datetime
+from enum import Enum
 from typing import Callable, Optional
+from config import CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT
 
 logger = logging.getLogger(__name__)
+
+
+class FailureClass(str, Enum):
+    BAD_PREDICTION    = "BAD_PREDICTION"    # model was directionally wrong despite high confidence
+    TIMING            = "TIMING"            # correct direction, but entry/exit timing degraded P&L
+    EXECUTION_QUALITY = "EXECUTION"         # slippage or fill quality was the primary drag
+    MARKET_SHOCK      = "MARKET_SHOCK"      # exogenous catalyst (news, macro) invalidated signal
+
+
+def classify_failure(
+    signal_confidence: float,
+    realized_pnl: float,
+    slippage: float,
+    signal_price: float,
+    news_shock: bool = False,
+) -> FailureClass:
+    """
+    Deterministic failure classification for losing trades.
+    Priority: MARKET_SHOCK > EXECUTION_QUALITY > BAD_PREDICTION > TIMING
+    """
+    if news_shock:
+        return FailureClass.MARKET_SHOCK
+    slippage_pct = abs(slippage / signal_price) if signal_price > 0 else 0.0
+    if slippage_pct > 0.02:
+        return FailureClass.EXECUTION_QUALITY
+    if realized_pnl < 0 and signal_confidence > 0.70:
+        return FailureClass.BAD_PREDICTION
+    return FailureClass.TIMING
 
 # Cadence constants (seconds)
 OBSERVE_INTERVAL = 60
@@ -301,13 +331,12 @@ class ReflectionEngine:
                     usage = getattr(response, "usage_metadata", None) or {}
                     t_in  = usage.get("input_tokens", 0)
                     t_out = usage.get("output_tokens", 0)
-                    # Haiku pricing: $0.80/M input, $4.00/M output
-                    cost  = (t_in * 0.80 + t_out * 4.00) / 1_000_000
+                    cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
                     from db.database import _get_session_factory
                     from db.models import LLMUsage
                     async with _get_session_factory()() as _s:
                         _s.add(LLMUsage(
-                            model="claude-haiku-4-5",
+                            model=CLAUDE_HAIKU_MODEL,
                             tokens_in=t_in,
                             tokens_out=t_out,
                             cost_usd=cost,
@@ -339,10 +368,33 @@ class ReflectionEngine:
 
         impact = f"Slip=${slippage:.4f} | Conf={confidence:.0%}"
 
+        # Classify failure and compute Brier Score contribution (for losing trades only)
+        failure_cls: Optional[str] = None
+        brier_contrib: Optional[float] = None
+        outcome = 1 if (realized_pnl is not None and realized_pnl > 0) else 0
+
+        if realized_pnl is not None:
+            if realized_pnl <= 0:
+                failure_cls = classify_failure(
+                    signal_confidence=confidence,
+                    realized_pnl=realized_pnl,
+                    slippage=slippage,
+                    signal_price=float(execution_data.get("signal_price", fill_price or 1.0)),
+                ).value
+            # Brier contribution: (forecast - outcome)^2 for every closed trade
+            brier_contrib = round((confidence - outcome) ** 2, 6)
+
+            # Feed into in-memory calibration tracker
+            try:
+                from risk.calibration import calibration_tracker
+                calibration_tracker.log(strategy, confidence, outcome)
+            except Exception as _ce:
+                logger.debug("[REFLECTION] Calibration log failed: %s", _ce)
+
         # Persist to BotAmend + ReflectionLog
         try:
             from db.database import _get_session_factory
-            from db.models import BotAmend, ReflectionLog
+            from db.models import BotAmend, ReflectionLog, CalibrationRecord
             async with _get_session_factory()() as session:
                 session.add(BotAmend(
                     model=strategy,
@@ -357,8 +409,17 @@ class ReflectionEngine:
                     action=action,
                     insight=insight,
                     tokens_used=execution_data.get("_tokens_used"),
+                    failure_class=failure_cls,
+                    brier_contribution=brier_contrib,
                     timestamp=now,
                 ))
+                if realized_pnl is not None:
+                    session.add(CalibrationRecord(
+                        strategy=strategy,
+                        forecast=round(confidence, 4),
+                        outcome=outcome,
+                        brier_contribution=brier_contrib,
+                    ))
                 await session.commit()
         except Exception as e:
             logger.warning("[REFLECTION] Failed to persist BotAmend/ReflectionLog: %s", e)

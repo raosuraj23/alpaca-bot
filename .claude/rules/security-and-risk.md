@@ -11,7 +11,7 @@ RULE: No API key, secret, token, wallet seed, or password may appear in any
 Python source file, Jupyter notebook, test file, log file, or commit.
 
 - All credentials are loaded exclusively via pydantic-settings from environment
-  variables. The canonical config object is `src/config.py`.
+  variables. The canonical config object is `backend/config.py`.
 - Locally: variables are stored in `.env` (gitignored). `.env.example` with
   placeholder values IS committed.
 - In cloud: variables are loaded from AWS Secrets Manager or GCP Secret Manager.

@@ -496,18 +496,30 @@ export function useTradingEngine() {
       }).catch(() => {});
     }, 60_000); // 60s
 
+    const mergeWatchlistFromScan = (d: any[]) => {
+      useTradingStore.setState({ scannerResults: d });
+      const currentWl = useTradingStore.getState().watchlist;
+      const existing = new Set(currentWl.map(t => t.symbol));
+      const newEntries = d
+        .filter(r => r?.symbol && !existing.has(r.symbol))
+        .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0 }));
+      if (newEntries.length > 0) {
+        useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
+      }
+    };
+
     // Poll watchlist scanner results every 5 min (matches backend scan cadence)
     const pollWatchlist = setInterval(() => {
       fetch(`${API_BASE}/api/watchlist`)
         .then(r => r.ok ? r.json() : null)
-        .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+        .then(d => { if (Array.isArray(d) && d.length > 0) mergeWatchlistFromScan(d); })
         .catch(() => {});
     }, 300_000); // 5 min
 
     // Initial scanner load
     fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+      .then(d => { if (Array.isArray(d) && d.length > 0) mergeWatchlistFromScan(d); })
       .catch(() => {});
 
     return () => {

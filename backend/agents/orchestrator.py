@@ -32,10 +32,31 @@ import json
 import logging
 import re
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from config import CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT
 
 from agents.factory import swarm_factory
 
 logger = logging.getLogger(__name__)
+
+
+async def _log_llm_cost(response, model_name: str, purpose: str,
+                        price_in: float, price_out: float) -> None:
+    try:
+        usage = getattr(response, "usage_metadata", None) or {}
+        t_in  = usage.get("input_tokens", 0)
+        t_out = usage.get("output_tokens", 0)
+        if not (t_in or t_out):
+            return
+        cost = (t_in * price_in + t_out * price_out) / 1_000_000
+        from db.database import _get_session_factory
+        from db.models import LLMUsage
+        async with _get_session_factory()() as _s:
+            _s.add(LLMUsage(model=model_name, tokens_in=t_in,
+                            tokens_out=t_out, cost_usd=cost, purpose=purpose))
+            await _s.commit()
+    except Exception as exc:
+        logger.debug("[ORCHESTRATOR] cost log skipped: %s", exc)
+
 
 # History window: keep last N messages (each turn = 1 Human + 1 AI = 2 messages)
 HISTORY_WINDOW = 6   # = 3 full turns
@@ -47,8 +68,10 @@ _SIGNAL_MIN_BARS = 201
 
 class OrchestratorEngine:
     def __init__(self):
-        # Standard tier — Gemini 1.5-pro / Claude Sonnet for chat routing
-        self.model = swarm_factory.build_model(model_level="standard")
+        # chat tier — Claude Haiku with prompt caching for command parsing (300t)
+        self.model = swarm_factory.build_model(model_level="chat")
+        # signal tier — Gemini 2.0 Flash for binary APPROVED/REJECTED gate (50t)
+        self.signal_model = swarm_factory.build_model(model_level="signal")
         raw_prompt = swarm_factory.get_system_prompt("orchestrator-agent")
         # Cache the system prompt at Anthropic's ephemeral tier — avoids paying
         # full input token cost (~2k tokens) on every invocation.
@@ -76,6 +99,8 @@ class OrchestratorEngine:
             response = await self.model.ainvoke(messages)
             reply = response.content
             self._history.append(AIMessage(content=reply))
+            await _log_llm_cost(response, CLAUDE_HAIKU_MODEL,
+                                "orchestrator_chat", HAIKU_COST_IN, HAIKU_COST_OUT)
 
             # Parse and execute any embedded commands; collect results
             commands = self._extract_commands(reply)
@@ -127,7 +152,8 @@ class OrchestratorEngine:
                 "signal_event": dict,   # original signal passed through
             }
         """
-        if not self.model:
+        gate_model = self.signal_model or self.model
+        if not gate_model:
             logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s", signal_event.get("asset"))
             return {
                 "llm_decision": "APPROVED",
@@ -166,8 +192,15 @@ class OrchestratorEngine:
             # Use a fresh single-message invocation — do NOT inject into chat
             # history since this is an autonomous pipeline call, not a user turn.
             messages = [self.system_prompt, HumanMessage(content=supervisor_prompt)]
-            response = await self.model.ainvoke(messages)
+            response = await gate_model.ainvoke(messages)
             reply = response.content
+            if self.signal_model:
+                from config import GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT
+                await _log_llm_cost(response, GEMINI_FLASH_MODEL,
+                                    "orchestrator_signal", GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT)
+            else:
+                await _log_llm_cost(response, CLAUDE_HAIKU_MODEL,
+                                    "orchestrator_signal", HAIKU_COST_IN, HAIKU_COST_OUT)
 
             # Parse the decision JSON block
             decision = "ERROR"

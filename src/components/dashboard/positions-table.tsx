@@ -2,12 +2,55 @@
 
 import { API_BASE } from '@/lib/api';
 import * as React from 'react';
+import {
+  useReactTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  flexRender,
+  type ColumnDef,
+  type SortingState,
+} from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
 import { ValueTicker } from '@/components/ui/value-ticker';
+import { parseUtc } from '@/lib/utils';
 
 type Tab = 'positions' | 'orders' | 'history';
+
+interface PositionRow {
+  id: string;
+  symbol: string;
+  side: string;
+  size: number;
+  entryPrice: number;
+  unrealizedPnl: number;
+}
+
+interface OrderRow {
+  id: string;
+  symbol: string;
+  side: string;
+  size: number;
+  status: string;
+  timestamp: string | number;
+}
+
+interface HistoryRow {
+  id: string;
+  symbol: string;
+  side: string;
+  size: number;
+  price: number;
+  slippage_bps: number | null;
+  timestamp: string | number;
+}
+
+function SortIndicator({ sorted }: { sorted: false | 'asc' | 'desc' }) {
+  if (sorted === 'asc')  return <span className="text-[var(--kraken-light)]">▲</span>;
+  if (sorted === 'desc') return <span className="text-[var(--kraken-light)]">▼</span>;
+  return <span className="opacity-20">⇅</span>;
+}
 
 export function PositionsTable() {
   const positions    = useTradingStore(s => s.positions);
@@ -27,10 +70,6 @@ export function PositionsTable() {
     return () => clearInterval(id);
   }, []);
 
-  // Build a realized-PnL lookup from ledger: keyed by Alpaca order_id (first 8 chars)
-  // Ledger rows have fill_price + slippage from the execution agent — we can derive
-  // an approximate per-trade PnL once the backend supplies a paired entry_price.
-  // For now we store slippage_bps (observable) and leave pnl as null until paired.
   const ledgerByOrderId = React.useMemo(() => {
     const map = new Map<string, { slippage_bps: number | null; confidence: number | null }>();
     for (const r of ledgerTrades) {
@@ -40,16 +79,266 @@ export function PositionsTable() {
   }, [ledgerTrades]);
 
   const [activeTab, setActiveTab] = React.useState<Tab>('positions');
+  const [posSorting, setPosSorting]     = React.useState<SortingState>([]);
+  const [orderSorting, setOrderSorting] = React.useState<SortingState>([]);
+  const [histSorting, setHistSorting]   = React.useState<SortingState>([{ id: 'timestamp', desc: true }]);
 
-  // Open orders: no fill price yet (price === 0) or explicitly pending
-  const openOrders = recentTrades.filter(t => t.price === 0 || t.status === 'pending');
-  // History: filled orders with a real fill price
-  const history    = recentTrades.filter(t => t.price > 0 && t.status !== 'pending');
+  const openOrders = recentTrades.filter((t: any) => t.price === 0 || t.status === 'pending');
+  const history    = recentTrades.filter((t: any) => t.price > 0 && t.status !== 'pending');
+
+  // ── Positions columns ──────────────────────────────────────────────────────
+  const posColumns = React.useMemo<ColumnDef<PositionRow>[]>(() => [
+    {
+      accessorKey: 'symbol',
+      header: 'Symbol',
+      cell: ({ getValue }) => (
+        <span className="font-bold text-[var(--foreground)]">{getValue() as string}</span>
+      ),
+    },
+    {
+      accessorKey: 'side',
+      header: 'Side',
+      cell: ({ getValue }) => {
+        const s = getValue() as string;
+        return <Badge variant={s === 'LONG' ? 'success' : 'destructive'} className="text-xs px-1.5">{s}</Badge>;
+      },
+    },
+    {
+      accessorKey: 'size',
+      header: 'Size',
+      cell: ({ getValue }) => (
+        <span className="text-right block font-mono tabular-nums text-[var(--foreground)]">
+          {(getValue() as number).toFixed(4)}
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'entryPrice',
+      header: 'Entry Price',
+      cell: ({ getValue }) => (
+        <span className="text-right block font-mono tabular-nums text-[var(--muted-foreground)]">
+          ${(getValue() as number).toFixed(2)}
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'unrealizedPnl',
+      header: 'Unrealized PnL',
+      cell: ({ getValue }) => (
+        <div className="text-right">
+          <ValueTicker value={getValue() as number} prefix="$" />
+        </div>
+      ),
+    },
+  ], []);
+
+  // ── Open Orders columns ────────────────────────────────────────────────────
+  const orderColumns = React.useMemo<ColumnDef<OrderRow>[]>(() => [
+    {
+      accessorKey: 'symbol',
+      header: 'Symbol',
+      cell: ({ getValue }) => (
+        <span className="font-bold text-[var(--foreground)]">{getValue() as string}</span>
+      ),
+    },
+    {
+      accessorKey: 'side',
+      header: 'Side',
+      cell: ({ getValue }) => {
+        const s = getValue() as string;
+        return (
+          <div className="flex justify-center">
+            <Badge variant={s === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{s}</Badge>
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: 'size',
+      header: 'Qty',
+      cell: ({ getValue }) => (
+        <span className="text-right block font-mono tabular-nums">{(getValue() as number).toFixed(4)}</span>
+      ),
+    },
+    {
+      accessorKey: 'status',
+      header: 'Status',
+      cell: () => (
+        <div className="text-right">
+          <Badge variant="warning" className="text-xs px-1.5 uppercase">PENDING</Badge>
+        </div>
+      ),
+    },
+    {
+      accessorKey: 'timestamp',
+      header: 'Submitted',
+      cell: ({ getValue }) => {
+        const ts = getValue() as string | number;
+        return (
+          <span className="text-right block text-[var(--muted-foreground)] font-mono tabular-nums">
+            {ts ? (parseUtc(ts)?.toLocaleTimeString(undefined, { hour12: false }) ?? '—') : '—'}
+          </span>
+        );
+      },
+    },
+  ], []);
+
+  // ── History columns ────────────────────────────────────────────────────────
+  const histColumns = React.useMemo<ColumnDef<HistoryRow>[]>(() => [
+    {
+      accessorKey: 'symbol',
+      header: 'Symbol',
+      cell: ({ getValue }) => (
+        <span className="font-bold text-[var(--foreground)]">{getValue() as string}</span>
+      ),
+    },
+    {
+      accessorKey: 'side',
+      header: 'Side',
+      cell: ({ getValue }) => {
+        const s = getValue() as string;
+        return (
+          <div className="flex justify-center">
+            <Badge variant={s === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{s}</Badge>
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: 'size',
+      header: 'Qty',
+      cell: ({ getValue }) => (
+        <span className="text-right block font-mono tabular-nums">{(getValue() as number).toFixed(4)}</span>
+      ),
+    },
+    {
+      accessorKey: 'price',
+      header: 'Fill Price',
+      cell: ({ getValue }) => (
+        <span className="text-right block font-mono tabular-nums font-bold text-[var(--foreground)]">
+          ${(getValue() as number).toFixed(2)}
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'slippage_bps',
+      header: 'Slip (bps)',
+      cell: ({ getValue }) => {
+        const v = getValue() as number | null;
+        const cls = v == null ? 'text-[var(--muted-foreground)]'
+          : v < 0 ? 'text-[var(--neon-green)]'
+          : v > 5 ? 'text-[var(--neon-red)]'
+          : 'text-[var(--foreground)]';
+        return (
+          <span className={`text-right block font-mono tabular-nums ${cls}`}>
+            {v != null ? `${v > 0 ? '+' : ''}${v.toFixed(1)}` : '—'}
+          </span>
+        );
+      },
+    },
+    {
+      accessorKey: 'timestamp',
+      header: 'Time',
+      cell: ({ getValue }) => {
+        const ts = getValue() as string | number;
+        return (
+          <span className="text-right block text-[var(--muted-foreground)] font-mono tabular-nums">
+            {ts ? (parseUtc(ts)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}
+          </span>
+        );
+      },
+    },
+  ], []);
+
+  // ── Table instances ────────────────────────────────────────────────────────
+  const posTable = useReactTable({
+    data: positions as PositionRow[],
+    columns: posColumns,
+    state: { sorting: posSorting },
+    onSortingChange: setPosSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  const orderTable = useReactTable({
+    data: openOrders as OrderRow[],
+    columns: orderColumns,
+    state: { sorting: orderSorting },
+    onSortingChange: setOrderSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  const histData = React.useMemo<HistoryRow[]>(() =>
+    history.map((o: any) => {
+      const ledger = ledgerByOrderId.get(o.id?.slice(0, 8));
+      return {
+        id: o.id,
+        symbol: o.symbol,
+        side: o.side,
+        size: o.size,
+        price: o.price,
+        slippage_bps: ledger?.slippage_bps ?? null,
+        timestamp: o.timestamp,
+      };
+    }), [history, ledgerByOrderId]);
+
+  const histTable = useReactTable({
+    data: histData,
+    columns: histColumns,
+    state: { sorting: histSorting },
+    onSortingChange: setHistSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
 
   const tabClass = (tab: Tab) =>
     activeTab === tab
       ? 'text-xs uppercase tracking-wider font-bold text-[var(--kraken-light)] border-b-2 border-[var(--kraken-purple)] pb-1 cursor-pointer'
       : 'text-xs uppercase tracking-wider font-semibold text-[var(--muted-foreground)] cursor-pointer hover:text-[var(--foreground)] pb-1';
+
+  const renderTable = (table: ReturnType<typeof useReactTable<any>>, emptyMsg: string, colSpan: number) => (
+    <table className="w-full text-left text-xs tabular-nums font-mono">
+      <thead className="sticky top-0 bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] shadow-sm">
+        {table.getHeaderGroups().map(hg => (
+          <tr key={hg.id}>
+            {hg.headers.map((header, i) => {
+              const sorted = header.column.getIsSorted();
+              return (
+                <th
+                  key={header.id}
+                  className={`font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`}
+                  onClick={header.column.getToggleSortingHandler()}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    {flexRender(header.column.columnDef.header, header.getContext())}
+                    {header.column.getCanSort() && <SortIndicator sorted={sorted} />}
+                  </span>
+                </th>
+              );
+            })}
+          </tr>
+        ))}
+      </thead>
+      <tbody className="divide-y divide-[var(--border)]/30">
+        {table.getRowModel().rows.length === 0 ? (
+          <tr>
+            <td colSpan={colSpan} className="p-4 text-center text-[var(--muted-foreground)]">
+              {emptyMsg}
+            </td>
+          </tr>
+        ) : table.getRowModel().rows.map(row => (
+          <tr key={row.id} className="hover:bg-[var(--panel-muted)] transition-colors">
+            {row.getVisibleCells().map((cell, i) => (
+              <td key={cell.id} className={`p-2 ${i === 0 ? 'pl-4' : ''} ${i === row.getVisibleCells().length - 1 ? 'pr-4' : ''}`}>
+                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 
   return (
     <Card className="h-full flex flex-col min-h-[250px]">
@@ -78,124 +367,9 @@ export function PositionsTable() {
       </CardHeader>
 
       <CardContent className="flex-1 overflow-y-auto p-0">
-
-        {/* ── POSITIONS TAB ── */}
-        {activeTab === 'positions' && (
-          <table className="w-full text-left text-xs tabular-nums">
-            <thead className="sticky top-0 bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] shadow-sm">
-              <tr>
-                <th className="font-medium p-2 pl-4">Symbol</th>
-                <th className="font-medium p-2">Side</th>
-                <th className="font-medium p-2 text-right">Size</th>
-                <th className="font-medium p-2 text-right">Entry Price</th>
-                <th className="font-medium p-2 pr-4 text-right">Unrealized PnL</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[var(--border)]/30">
-              {positions.length === 0 ? (
-                <tr><td colSpan={5} className="p-4 text-center text-[var(--muted-foreground)]">No open positions</td></tr>
-              ) : positions.map((pos) => (
-                <tr key={pos.id} className="hover:bg-[var(--panel-muted)] transition-colors">
-                  <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{pos.symbol}</td>
-                  <td className="p-2">
-                    <Badge variant={pos.side === 'LONG' ? 'success' : 'destructive'} className="text-xs px-1.5">{pos.side}</Badge>
-                  </td>
-                  <td className="p-2 text-right font-mono text-[var(--foreground)]">{pos.size.toFixed(4)}</td>
-                  <td className="p-2 text-right text-[var(--muted-foreground)]">${pos.entryPrice.toFixed(2)}</td>
-                  <td className="p-2 pr-4 text-right font-mono font-bold">
-                    <ValueTicker value={pos.unrealizedPnl} prefix="$" />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-
-        {/* ── OPEN ORDERS TAB ── */}
-        {activeTab === 'orders' && (
-          <table className="w-full text-left text-xs tabular-nums">
-            <thead className="sticky top-0 bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] shadow-sm">
-              <tr>
-                <th className="font-medium p-2 pl-4">Symbol</th>
-                <th className="font-medium p-2 text-center">Side</th>
-                <th className="font-medium p-2 text-right">Qty</th>
-                <th className="font-medium p-2 text-right">Status</th>
-                <th className="font-medium p-2 pr-4 text-right">Submitted</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[var(--border)]/30">
-              {openOrders.length === 0 ? (
-                <tr><td colSpan={5} className="p-4 text-center text-[var(--muted-foreground)]">No open orders</td></tr>
-              ) : openOrders.map((o) => (
-                <tr key={o.id} className="hover:bg-[var(--panel-muted)] transition-colors">
-                  <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{o.symbol}</td>
-                  <td className="p-2 text-center">
-                    <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{o.side}</Badge>
-                  </td>
-                  <td className="p-2 text-right font-mono">{o.size.toFixed(4)}</td>
-                  <td className="p-2 text-right">
-                    <Badge variant="warning" className="text-xs px-1.5 uppercase">PENDING</Badge>
-                  </td>
-                  <td className="p-2 pr-4 text-right text-[var(--muted-foreground)]">
-                    {new Date(o.timestamp).toLocaleTimeString()}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-
-        {/* ── HISTORY TAB ── */}
-        {activeTab === 'history' && (
-          <table className="w-full text-left text-xs tabular-nums">
-            <thead className="sticky top-0 bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] shadow-sm">
-              <tr>
-                <th className="font-medium p-2 pl-4">Symbol</th>
-                <th className="font-medium p-2 text-center">Side</th>
-                <th className="font-medium p-2 text-right">Qty</th>
-                <th className="font-medium p-2 text-right">Fill Price</th>
-                <th className="font-medium p-2 text-right">Realized P&amp;L</th>
-                <th className="font-medium p-2 text-right">Slip (bps)</th>
-                <th className="font-medium p-2 pr-4 text-right">Time</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[var(--border)]/30">
-              {history.length === 0 ? (
-                <tr><td colSpan={7} className="p-4 text-center text-[var(--muted-foreground)]">No trade history</td></tr>
-              ) : history.map((o) => {
-                const ledger = ledgerByOrderId.get(o.id.slice(0, 8));
-                // Realized PnL: available once backend supplies it; show slippage_bps as proxy
-                const slipBps = ledger?.slippage_bps;
-                return (
-                  <tr key={o.id} className="hover:bg-[var(--panel-muted)] transition-colors">
-                    <td className="p-2 pl-4 font-bold text-[var(--foreground)]">{o.symbol}</td>
-                    <td className="p-2 text-center">
-                      <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{o.side}</Badge>
-                    </td>
-                    <td className="p-2 text-right font-mono">{o.size.toFixed(4)}</td>
-                    <td className="p-2 text-right font-mono font-bold text-[var(--foreground)]">${o.price.toFixed(2)}</td>
-                    <td className="p-2 text-right font-mono text-[var(--muted-foreground)]">
-                      {/* Realized PnL requires paired position cost basis — not yet in order feed */}
-                      —
-                    </td>
-                    <td className={`p-2 text-right font-mono ${
-                      slipBps == null ? 'text-[var(--muted-foreground)]'
-                        : slipBps < 0 ? 'text-[var(--neon-green)]'
-                        : slipBps > 5 ? 'text-[var(--neon-red)]'
-                        : 'text-[var(--foreground)]'
-                    }`}>
-                      {slipBps != null ? `${slipBps > 0 ? '+' : ''}${slipBps.toFixed(1)}` : '—'}
-                    </td>
-                    <td className="p-2 pr-4 text-right text-[var(--muted-foreground)]">
-                      {new Date(o.timestamp).toLocaleString()}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-
+        {activeTab === 'positions' && renderTable(posTable,   'No open positions', 5)}
+        {activeTab === 'orders'    && renderTable(orderTable, 'No open orders',    5)}
+        {activeTab === 'history'   && renderTable(histTable,  'No trade history',  6)}
       </CardContent>
     </Card>
   );

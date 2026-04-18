@@ -6,6 +6,7 @@ import { useTradingStore } from '@/hooks/useTradingStream';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import type { IChartApi, Time } from 'lightweight-charts';
+import { cssVar } from '@/lib/utils';
 
 export function MarketOverview() {
   const ticker        = useTradingStore(s => s.ticker);
@@ -29,15 +30,21 @@ export function MarketOverview() {
 
     chartRef.current?.remove();
 
+    // Resolve CSS variables at effect time — lightweight-charts uses canvas, not CSS
+    const text         = cssVar('--muted-foreground');
+    const border       = cssVar('--border');
+    const purple       = cssVar('--kraken-purple');
+    const purpleFill   = cssVar('--kraken-purple-fill');
+
     const chart = createChart(el, {
       layout: {
         background: { color: 'transparent' },
-        textColor:  'hsl(250,10%,65%)',
+        textColor:  text,
         fontSize:   10,
         fontFamily: 'JetBrains Mono, monospace',
       },
       grid:            { vertLines: { visible: false }, horzLines: { visible: false } },
-      timeScale:       { borderColor: 'hsla(255,40%,40%,0.15)', timeVisible: true },
+      timeScale:       { borderColor: border, timeVisible: true },
       rightPriceScale: { visible: false },
       leftPriceScale:  { visible: false },
       crosshair:       { vertLine: { visible: true }, horzLine: { visible: false } },
@@ -45,9 +52,9 @@ export function MarketOverview() {
     });
 
     const area = chart.addSeries(AreaSeries, {
-      lineColor:        'hsl(264,80%,65%)',
-      topColor:         'hsla(264,80%,65%,0.25)',
-      bottomColor:      'hsla(264,80%,65%,0.0)',
+      lineColor:        purple,
+      topColor:         purpleFill,
+      bottomColor:      'transparent',
       lineWidth:        2,
       priceLineVisible: false,
       lastValueVisible: false,

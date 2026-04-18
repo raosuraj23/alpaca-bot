@@ -115,7 +115,21 @@ class ReflectionLog(Base):
     action = Column(String(10))
     insight = Column(String(500))
     tokens_used = Column(Integer, nullable=True)
+    # Compound / learning fields
+    failure_class = Column(String(30), nullable=True)       # BAD_PREDICTION | TIMING | EXECUTION | MARKET_SHOCK
+    brier_contribution = Column(Numeric(8, 6), nullable=True)  # (forecast - outcome)^2 for this trade
     timestamp = Column(DateTime(timezone=True), default=_utcnow)
+
+
+class CalibrationRecord(Base):
+    """Persists per-strategy calibration snapshots for the Compound learning loop."""
+    __tablename__ = "calibration_records"
+    id = Column(Integer, primary_key=True, index=True)
+    strategy = Column(String(50), index=True)
+    forecast = Column(Numeric(5, 4))       # signal confidence at entry
+    outcome = Column(Integer)              # 1 = profitable, 0 = loss
+    brier_contribution = Column(Numeric(8, 6))  # (forecast - outcome)^2
+    timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
 
 class WatchlistItem(Base):
     __tablename__ = "watchlist_items"

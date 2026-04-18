@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PlayCircle, DatabaseZap } from 'lucide-react';
 import { createChart, LineSeries } from 'lightweight-charts';
+import { cssVar } from '@/lib/utils';
 import type { IChartApi, Time } from 'lightweight-charts';
 
 // ---------------------------------------------------------------------------
@@ -93,23 +94,27 @@ export function BacktestRunner() {
     // Destroy any previous chart instance
     chartRef.current?.remove();
 
+    // Resolve CSS variables at effect time — lightweight-charts uses canvas, not CSS
+    const text   = cssVar('--muted-foreground');
+    const border = cssVar('--border');
+
     const chart = createChart(el, {
       layout: {
         background: { color: 'transparent' },
-        textColor:  'hsl(250,10%,65%)',
+        textColor:  text,
         fontSize:   10,
         fontFamily: 'JetBrains Mono, monospace',
       },
       grid: {
-        vertLines: { color: 'hsla(255,40%,40%,0.06)' },
-        horzLines: { color: 'hsla(255,40%,40%,0.06)' },
+        vertLines: { color: border },
+        horzLines: { color: border },
       },
-      timeScale:       { borderColor: 'hsla(255,40%,40%,0.15)', timeVisible: true },
-      rightPriceScale: { borderColor: 'hsla(255,40%,40%,0.15)' },
+      timeScale:       { borderColor: border, timeVisible: true },
+      rightPriceScale: { borderColor: border },
       autoSize: true,
     });
 
-    const lineColor = result.net_profit >= 0 ? 'hsl(150,80%,45%)' : 'hsl(350,80%,60%)';
+    const lineColor = result.net_profit >= 0 ? cssVar('--neon-green') : cssVar('--neon-red');
     const line = chart.addSeries(LineSeries, {
       color:            lineColor,
       lineWidth:        2,
@@ -270,7 +275,7 @@ export function BacktestRunner() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
                 <StatBlock
                   label="Net Profit"
-                  value={`${result.net_profit >= 0 ? '+' : ''}$${result.net_profit.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                  value={`${result.net_profit >= 0 ? '+' : ''}$${result.net_profit.toLocaleString(undefined, { minimumFractionDigits: 2 })}`}
                   positive={result.net_profit >= 0}
                 />
                 <StatBlock

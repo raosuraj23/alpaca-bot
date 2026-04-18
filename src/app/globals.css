@@ -35,6 +35,16 @@
   --agent-calculate: hsl(220, 70%, 65%);
   --agent-scanner: hsl(190, 70%, 60%);
   --agent-learning: hsl(40, 80%, 60%);
+  --agent-execute: hsl(190, 70%, 60%);
+
+  /* Extended Accents */
+  --neon-blue: hsl(200, 80%, 65%);
+  --warning: hsl(40, 80%, 60%);
+
+  /* Chart fill variants (alpha-modified — needed by canvas-based charts) */
+  --neon-green-fill: hsla(150, 80%, 45%, 0.15);
+  --neon-red-fill: hsla(350, 80%, 60%, 0.12);
+  --kraken-purple-fill: hsla(264, 80%, 65%, 0.25);
 }
 
 body {
