@@ -4,7 +4,7 @@ import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Filter, Download, ArrowUpDown, ChevronDown, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
+import { Filter, Download, ArrowUpDown, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
 import { useTradingStore } from '@/hooks/useTradingStream';
 
 // ---------------------------------------------------------------------------
@@ -12,14 +12,16 @@ import { useTradingStore } from '@/hooks/useTradingStream';
 // ---------------------------------------------------------------------------
 
 interface ClosedTrade {
-  strategy:     string;
-  symbol:       string;
-  entry_price:  number;
-  exit_price:   number;
-  pnl_per_unit: number;
-  entry_time:   string | null;
-  exit_time:    string | null;
-  confidence:   number;
+  strategy:    string;
+  symbol:      string;
+  entry_price: number;
+  exit_price:  number | null;
+  pnl:         number | null;
+  qty:         number | null;
+  entry_time:  string | null;
+  exit_time:   string | null;
+  confidence:  number;
+  open?:       boolean;
 }
 
 interface RealizedPnlData {
@@ -41,8 +43,8 @@ interface AccountData {
 
 function KpiSummary({ data, ledgerCount }: { data: RealizedPnlData | null; ledgerCount: number }) {
   const closed   = data?.trades ?? [];
-  const totalPnl = closed.reduce((s, t) => s + (t.pnl_per_unit ?? 0), 0);
-  const winners  = closed.filter(t => (t.pnl_per_unit ?? 0) > 0).length;
+  const totalPnl = closed.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const winners  = closed.filter(t => (t.pnl ?? 0) > 0).length;
   const winRate  = closed.length > 0 ? (winners / closed.length) * 100 : null;
   const avgPnl   = closed.length > 0 ? totalPnl / closed.length : null;
   const isPos    = totalPnl >= 0;
@@ -100,12 +102,17 @@ function KpiSummary({ data, ledgerCount }: { data: RealizedPnlData | null; ledge
 export function TradeLedger() {
   const ledgerTrades = useTradingStore(s => s.ledgerTrades);
   const fetchLedger  = useTradingStore(s => s.fetchLedger);
+  const positions    = useTradingStore(s => s.positions);
 
   const [realizedData, setRealizedData]   = React.useState<RealizedPnlData | null>(null);
   const [accountData, setAccountData]     = React.useState<AccountData | null>(null);
   const [lastRefresh, setLastRefresh]     = React.useState<Date | null>(null);
   const [refreshing, setRefreshing]       = React.useState(false);
   const [mounted, setMounted]             = React.useState(false);
+
+  // Filter state
+  const [filterSide, setFilterSide]         = React.useState<'ALL' | 'BUY' | 'SELL'>('ALL');
+  const [filterOutcome, setFilterOutcome]   = React.useState<'ALL' | 'WIN' | 'LOSS'>('ALL');
 
   React.useEffect(() => { setMounted(true); }, []);
 
@@ -140,17 +147,17 @@ export function TradeLedger() {
     setRefreshing(false);
   };
 
-  // Initial load + 60s auto-refresh
+  // Initial load + 30s auto-refresh
   React.useEffect(() => {
     loadRealizedPnl();
-    const interval = setInterval(loadRealizedPnl, 60_000);
+    const interval = setInterval(loadRealizedPnl, 30_000);
     return () => clearInterval(interval);
   }, [loadRealizedPnl]);
 
-  // Account balance — initial load + 60s auto-refresh
+  // Account balance — initial load + 30s auto-refresh
   React.useEffect(() => {
     loadAccountData();
-    const interval = setInterval(loadAccountData, 60_000);
+    const interval = setInterval(loadAccountData, 30_000);
     return () => clearInterval(interval);
   }, [loadAccountData]);
 
@@ -167,7 +174,7 @@ export function TradeLedger() {
       .forEach(t => {
         const key = `${t.strategy}|${t.symbol}`;
         if (!queues.has(key)) queues.set(key, []);
-        queues.get(key)!.push(t.pnl_per_unit);
+        queues.get(key)!.push(t.pnl ?? 0);
       });
 
     // Clone queues so we can pop from them
@@ -188,6 +195,35 @@ export function TradeLedger() {
     return result;
   }, [realizedData, ledgerTrades]);
 
+  // Filtered ledger rows
+  const filteredLedger = React.useMemo(() => {
+    return ledgerTrades.filter((r: any) => {
+      if (filterSide !== 'ALL' && r.side !== filterSide) return false;
+      if (filterOutcome !== 'ALL') {
+        const pnl = r.side === 'SELL' ? (realizedPnlByLedgerId.get(r.id) ?? null) : null;
+        if (filterOutcome === 'WIN'  && !(pnl != null && pnl >= 0)) return false;
+        if (filterOutcome === 'LOSS' && !(pnl != null && pnl < 0))  return false;
+      }
+      return true;
+    });
+  }, [ledgerTrades, filterSide, filterOutcome, realizedPnlByLedgerId]);
+
+  // Round-trip rows: closed trades + open positions enriched with live price
+  const roundTripRows = React.useMemo(() => {
+    const closed = (realizedData?.trades ?? []).map(t => ({ ...t, open: false }));
+    const open   = (realizedData?.open_positions ?? []).map(op => {
+      const live = positions.find((p: any) => p.symbol === op.symbol);
+      return {
+        ...op,
+        open: true,
+        qty:            live ? Number(live.size ?? op.qty ?? null) : op.qty ?? null,
+        exit_price:     live ? Number(live.markPrice ?? live.entryPrice ?? 0) : null,
+        unrealized_pnl: live ? Number(live.unrealizedPnl ?? 0) : null,
+      };
+    });
+    return [...closed, ...open];
+  }, [realizedData, positions]);
+
   if (!mounted) return null;
 
   return (
@@ -201,9 +237,32 @@ export function TradeLedger() {
         </div>
 
         <div className="flex items-center space-x-2">
-          {['Asset Class', 'Automated Agent', 'Timeframe', 'Outcome'].map((filter) => (
-            <button key={filter} className="hidden lg:flex items-center px-3 py-1.5 bg-[var(--background)] border border-[var(--border)] rounded-sm text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors">
-              {filter} <ChevronDown className="w-3 h-3 ml-1.5 opacity-60" />
+          {/* Direction filter */}
+          {(['ALL', 'BUY', 'SELL'] as const).map(side => (
+            <button
+              key={side}
+              onClick={() => setFilterSide(side)}
+              className={`hidden lg:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${
+                filterSide === side
+                  ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20'
+                  : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+              }`}
+            >
+              {side}
+            </button>
+          ))}
+          {/* Outcome filter */}
+          {(['ALL', 'WIN', 'LOSS'] as const).map(outcome => (
+            <button
+              key={outcome}
+              onClick={() => setFilterOutcome(outcome)}
+              className={`hidden lg:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${
+                filterOutcome === outcome
+                  ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20'
+                  : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+              }`}
+            >
+              {outcome}
             </button>
           ))}
           {lastRefresh && (
@@ -266,13 +325,13 @@ export function TradeLedger() {
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--border)]/30">
-            {ledgerTrades.length === 0 ? (
+            {filteredLedger.length === 0 ? (
               <tr>
                 <td colSpan={9} className="p-6 text-center text-[var(--muted-foreground)]">
-                  No execution records yet
+                  {ledgerTrades.length === 0 ? 'No execution records yet' : 'No records match filters'}
                 </td>
               </tr>
-            ) : ledgerTrades.map((r: any) => {
+            ) : filteredLedger.map((r: any) => {
               // Enrich SELL rows with matched realized pnl (FIFO-matched by bot+symbol)
               const realPnl = r.side === 'SELL' ? (realizedPnlByLedgerId.get(r.id) ?? null) : null;
 
@@ -330,6 +389,78 @@ export function TradeLedger() {
           </tbody>
         </table>
       </CardContent>
+
+      {/* Trade History — Open & Close Legs */}
+      <div className="shrink-0 border-t border-[var(--border)]">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border)] bg-[var(--panel-muted)]/30">
+          <span className="text-xs uppercase tracking-widest font-mono text-[var(--muted-foreground)]">Trade History — Open &amp; Close Legs</span>
+          <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-40">30s · UTC→local</span>
+        </div>
+        <div className="overflow-auto max-h-[280px]">
+          {roundTripRows.length === 0 ? (
+            <div className="flex items-center justify-center py-8 text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-widest">
+              No trade history yet
+            </div>
+          ) : (
+            <table className="w-full text-xs tabular-nums font-mono whitespace-nowrap min-w-[700px]">
+              <thead className="sticky top-0 bg-[var(--panel-muted)] text-[var(--muted-foreground)] border-b border-[var(--border)]">
+                <tr>
+                  <th className="text-left font-medium p-2 pl-4">Symbol</th>
+                  <th className="text-left font-medium p-2">Bot</th>
+                  <th className="text-right font-medium p-2">Open @ price</th>
+                  <th className="text-right font-medium p-2">Open time</th>
+                  <th className="text-right font-medium p-2">Close @ price</th>
+                  <th className="text-right font-medium p-2">Close time</th>
+                  <th className="text-right font-medium p-2">Qty</th>
+                  <th className="text-right font-medium p-2 pr-4">PnL</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border)]/30">
+                {roundTripRows.map((row: any, i: number) => {
+                  const isOpen    = row.open === true;
+                  const pnl       = isOpen ? (row.unrealized_pnl ?? null) : row.pnl;
+                  const isPnlPos  = pnl != null && pnl >= 0;
+                  const closePrice = isOpen ? row.exit_price : row.exit_price;
+                  return (
+                    <tr key={i} className={`hover:bg-[var(--panel-muted)] transition-colors ${isOpen ? 'opacity-75' : ''}`}>
+                      <td className="p-2 pl-4 font-semibold text-[var(--foreground)]">
+                        <div className="flex items-center gap-1.5">
+                          <span className={`w-1.5 h-1.5 rounded-sm shrink-0 ${isOpen ? 'bg-[var(--neon-green)] animate-pulse' : 'bg-[var(--muted-foreground)] opacity-40'}`} />
+                          {row.symbol}
+                        </div>
+                      </td>
+                      <td className="p-2 text-[var(--muted-foreground)] truncate max-w-[90px]">{row.strategy}</td>
+                      <td className="p-2 text-right text-[var(--foreground)]">
+                        ${Number(row.entry_price).toFixed(4)}
+                      </td>
+                      <td className="p-2 text-right text-[var(--muted-foreground)]">
+                        {row.entry_time ? new Date(row.entry_time).toLocaleString() : '—'}
+                      </td>
+                      <td className="p-2 text-right">
+                        {closePrice != null
+                          ? <span className={isOpen ? 'text-[var(--kraken-light)]' : 'text-[var(--foreground)]'}>${Number(closePrice).toFixed(4)}</span>
+                          : <span className="text-[var(--muted-foreground)] opacity-40">open</span>}
+                      </td>
+                      <td className="p-2 text-right text-[var(--muted-foreground)]">
+                        {isOpen ? (
+                          <span className="text-[var(--neon-green)] opacity-70">live</span>
+                        ) : row.exit_time ? new Date(row.exit_time).toLocaleString() : '—'}
+                      </td>
+                      <td className="p-2 text-right text-[var(--foreground)]">
+                        {row.qty != null ? Number(row.qty).toFixed(6) : '—'}
+                      </td>
+                      <td className={`p-2 pr-4 text-right font-bold ${pnl == null ? 'text-[var(--muted-foreground)] opacity-40' : isPnlPos ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                        {pnl != null ? `${isPnlPos ? '+' : ''}$${pnl.toFixed(4)}` : '—'}
+                        {isOpen && pnl != null && <span className="text-xs ml-1 opacity-50">unr.</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
     </Card>
   );
 }

@@ -216,34 +216,6 @@ export function BotControl() {
           </div>
         )}
 
-        {/* ── All Bots Strip — scrollable compact rows ── */}
-        {bots.length > 1 && (
-          <div className="border-b border-[var(--border)] shrink-0 overflow-y-auto max-h-[112px]">
-            {bots.map(bot => (
-              <button
-                key={bot.id}
-                onClick={() => setSelectedBotId(bot.id)}
-                className={`w-full flex items-center justify-between px-3 py-1 text-xs font-mono transition-colors border-b border-[var(--border)]/40 last:border-b-0 ${
-                  bot.id === selectedBotId
-                    ? 'bg-[var(--kraken-purple)]/10 text-[var(--kraken-light)]'
-                    : 'text-[var(--muted-foreground)] hover:bg-[var(--panel-muted)]'
-                }`}
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className={`w-1 h-1 rounded-sm shrink-0 ${bot.status === 'ACTIVE' ? 'bg-[var(--neon-green)]' : 'bg-[var(--muted-foreground)]'}`} />
-                  <span className="truncate font-semibold">{bot.name}</span>
-                  {bot.assetClass && bot.assetClass !== 'CRYPTO' && (
-                    <span className="text-xs opacity-40 shrink-0">{bot.assetClass}</span>
-                  )}
-                </div>
-                <span className={`tabular-nums font-mono shrink-0 ml-2 ${(bot.yield24h ?? 0) >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-                  {(bot.yield24h ?? 0) >= 0 ? '+' : ''}${Math.abs(bot.yield24h ?? 0).toFixed(2)}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
-
         {/* ── Halt / Resume Controls ── */}
         <div className="px-3 py-2 border-b border-[var(--border)] flex gap-2 shrink-0">
           <Button
@@ -267,7 +239,7 @@ export function BotControl() {
         </div>
 
         {/* ── Console Logs ── */}
-        <div className="flex-1 p-3 bg-[#050505] overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5">
+        <div className="flex-1 p-3 bg-[var(--panel)] overflow-y-auto font-mono text-xs leading-relaxed space-y-0.5">
           {logs.length === 0 && (
             <div className="text-[var(--muted-foreground)] opacity-40">[SYSTEM] Awaiting first bar data from Alpaca stream...</div>
           )}

@@ -33,7 +33,7 @@ LONG = "LONG"
 class BaseStrategy:
     asset_class: str = "CRYPTO"  # Override in equity/options subclasses
 
-    def __init__(self, bot_id: str, name: str, allocation: int, algo_type: str):
+    def __init__(self, bot_id: str, name: str, allocation: int, algo_type: str, **kwargs):
         self.id = bot_id
         self.name = name
         self.allocation = allocation
@@ -44,9 +44,13 @@ class BaseStrategy:
         self.fill_count = 0
         # Per-symbol position state: FLAT means no position held
         self._position_state: dict[str, str] = {}
+        
+        # Allow dynamic parameter overriding from the Portfolio Director
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
-        """Must be overridden by child classes to emit signal dicts."""
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
+        """Asynchronous analysis pipeline to prevent event loop blocking."""
         return None
 
     def get_state(self, symbol: str) -> dict | None:
@@ -100,25 +104,36 @@ class MomentumStrategy(BaseStrategy):
     Confidence is scaled by the magnitude of the crossover spread.
     """
 
-    def __init__(self, bot_id="momentum-alpha", name="Momentum α", allocation=40):
-        super().__init__(bot_id, name, allocation, "EMA Crossover")
+    def __init__(self, bot_id="momentum-alpha", name="Momentum α", allocation=40, **kwargs):
+        super().__init__(bot_id, name, allocation, "EMA Crossover", **kwargs)
         self.ema_short: dict[str, float] = {}
         self.ema_long:  dict[str, float] = {}
-        self._last_cross: dict[str, str] = {}  # prevents duplicate signals
+        self._ticks: dict[str, int] = {}
+        self._last_cross: dict[str, str] = {}
+        
+        self.alpha_short = getattr(self, 'alpha_short', 0.20)
+        self.alpha_long = getattr(self, 'alpha_long', 0.05)
+        self.warmup_ticks = getattr(self, 'warmup_ticks', 40)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self.ema_short:
             self.ema_short[symbol] = price
             self.ema_long[symbol]  = price
+            self._ticks[symbol] = 1
             self._last_cross[symbol] = "NONE"
             return None
 
-        self.ema_short[symbol] = (price * 0.20) + (self.ema_short[symbol] * 0.80)
-        self.ema_long[symbol]  = (price * 0.05) + (self.ema_long[symbol]  * 0.95)
+        self._ticks[symbol] += 1
+        self.ema_short[symbol] = (price * self.alpha_short) + (self.ema_short[symbol] * (1 - self.alpha_short))
+        self.ema_long[symbol]  = (price * self.alpha_long) + (self.ema_long[symbol]  * (1 - self.alpha_long))
+
+        # CRITICAL FIX: Require warmup period for EMA convergence
+        if self._ticks[symbol] < self.warmup_ticks:
+            return None
 
         short = self.ema_short[symbol]
         long_ = self.ema_long[symbol]
-        spread = (short - long_) / long_  # positive = bullish
+        spread = (short - long_) / long_
 
         signal = None
         if spread > 0.002 and self._last_cross.get(symbol) != "BUY" and self._is_flat(symbol):
@@ -188,59 +203,47 @@ class StatArbStrategy(BaseStrategy):
     Variance is tracked via Welford's sliding-window algorithm (O(1) per tick).
     """
 
-    WINDOW = 20
-
-    def __init__(self, bot_id="statarb-gamma", name="StatArb γ", allocation=35):
-        super().__init__(bot_id, name, allocation, "Bollinger Band")
+    def __init__(self, bot_id="statarb-gamma", name="StatArb γ", allocation=35, **kwargs):
+        super().__init__(bot_id, name, allocation, "Bollinger Band", **kwargs)
+        self.WINDOW = getattr(self, 'window', 20)
         self._prices: dict[str, deque] = {}
+        self._welford: dict[str, dict] = {} # Tracks count, mean, M2 for O(1) variance
         self._last_signal: dict[str, str] = {}
-        # Welford sliding-window state per symbol
-        self._w_mean: dict[str, float] = {}
-        self._w_M2:   dict[str, float] = {}
-        self._w_n:    dict[str, int]   = {}
-
-    def _update_welford(self, symbol: str, price: float) -> None:
-        """Welford's sliding-window variance update (O(1)).
-        Must be called BEFORE appending price to self._prices[symbol]."""
-        n_cur = len(self._prices[symbol])
-        if n_cur == 0:
-            self._w_mean[symbol] = price
-            self._w_M2[symbol]   = 0.0
-            self._w_n[symbol]    = 1
-        elif n_cur < self.WINDOW:
-            # Window not yet full: standard incremental Welford's
-            self._w_n[symbol] += 1
-            delta = price - self._w_mean[symbol]
-            self._w_mean[symbol] += delta / self._w_n[symbol]
-            delta2 = price - self._w_mean[symbol]
-            self._w_M2[symbol] += delta * delta2
-        else:
-            # Window full: remove oldest (prices[0]), add newest
-            old_x    = self._prices[symbol][0]
-            old_mean = self._w_mean[symbol]
-            self._w_mean[symbol] = old_mean + (price - old_x) / self.WINDOW
-            self._w_M2[symbol]  += (price - old_x) * (
-                (price - self._w_mean[symbol]) + (old_x - old_mean)
-            )
-            self._w_M2[symbol] = max(0.0, self._w_M2[symbol])
 
     def _bollinger(self, symbol: str) -> tuple[float, float, float]:
         """Returns (sma, upper_band, lower_band) from O(1) Welford state."""
-        mean     = self._w_mean[symbol]
-        variance = self._w_M2[symbol] / self._w_n[symbol]
-        sigma    = math.sqrt(max(0.0, variance))
+        w = self._welford[symbol]
+        mean = w["mean"]
+        variance = w["M2"] / w["count"] if w["count"] > 0 else 0
+        sigma = math.sqrt(max(0.0, variance))
         return mean, mean + 2 * sigma, mean - 2 * sigma
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self._prices:
             self._prices[symbol] = deque(maxlen=self.WINDOW)
+            self._welford[symbol] = {"count": 0, "mean": 0.0, "M2": 0.0}
             self._last_signal[symbol] = "NONE"
 
-        self._update_welford(symbol, price)
-        self._prices[symbol].append(price)
+        prices = self._prices[symbol]
+        w = self._welford[symbol]
 
-        # Need full window before emitting signals
-        if len(self._prices[symbol]) < self.WINDOW:
+        # Welford's Algorithm: Remove old price effect if window is full
+        if len(prices) == self.WINDOW:
+            old_price = prices[0]
+            w["count"] -= 1
+            delta = old_price - w["mean"]
+            w["mean"] -= delta / max(1, w["count"])
+            w["M2"] -= delta * (old_price - w["mean"])
+            w["M2"] = max(0.0, w["M2"])
+
+        # Add new price
+        prices.append(price)
+        w["count"] += 1
+        delta = price - w["mean"]
+        w["mean"] += delta / w["count"]
+        w["M2"] += delta * (price - w["mean"])
+
+        if w["count"] < self.WINDOW:
             return None
 
         sma, upper, lower = self._bollinger(symbol)
@@ -318,13 +321,13 @@ class HighFrequencyStrategy(BaseStrategy):
     COOLDOWN_TICKS = 5             # minimum ticks between signals per symbol
     STOP_LOSS_PCT = 0.005          # 0.5% adverse move forces SELL exit
 
-    def __init__(self, bot_id="hft-sniper", name="HFT Sniper", allocation=25):
-        super().__init__(bot_id, name, allocation, "Micro-Scalp Momentum")
+    def __init__(self, bot_id="hft-sniper", name="HFT Sniper", allocation=25, **kwargs):
+        super().__init__(bot_id, name, allocation, "Micro-Scalp Momentum", **kwargs)
         self._prices: dict[str, deque] = {}
         self._cooldown: dict[str, int] = {}   # ticks since last signal
         self._entry_price: dict[str, float] = {}  # entry price for stop-loss tracking
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self._prices:
             self._prices[symbol] = deque(maxlen=self.MOMENTUM_WINDOW + 1)
             self._cooldown[symbol] = 0
@@ -354,8 +357,8 @@ class HighFrequencyStrategy(BaseStrategy):
         if self._cooldown[symbol] > 0:
             return None
 
-        prices_list = list(self._prices[symbol])
-        prev = prices_list[0]
+        # Fix: O(1) deque access instead of O(N) list conversion
+        prev = self._prices[symbol][0]
         momentum = (price - prev) / prev if prev != 0 else 0.0
 
         signal = None
@@ -400,9 +403,8 @@ class HighFrequencyStrategy(BaseStrategy):
         if symbol not in self._prices or len(self._prices[symbol]) < self.MOMENTUM_WINDOW + 1:
             return {"strategy": self.id, "name": self.name, "status": self.status,
                     "warming_up": True}
-        prices_list = list(self._prices[symbol])
-        prev = prices_list[0]
-        current = prices_list[-1]
+        prev = self._prices[symbol][0]
+        current = self._prices[symbol][-1]
         momentum = (current - prev) / prev if prev else 0
         entry = self._entry_price.get(symbol)
         return {

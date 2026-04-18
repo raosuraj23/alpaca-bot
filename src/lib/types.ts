@@ -184,3 +184,40 @@ export interface BacktestResult {
   /** Equity curve data points [timestamp, equity] */
   equityCurve: [number, number][];
 }
+
+// ---------------------------------------------------------------------------
+// Analytics Types
+// ---------------------------------------------------------------------------
+
+export interface RealizedTrade {
+  id: string;
+  symbol: string;
+  assetClass: AssetClass;
+  strategy: string;
+  side: OrderSide;
+  entryPrice: number;
+  exitPrice: number;
+  qty: number;
+  pnl: number;
+  entryTime: number;
+  exitTime: number;
+  slippage?: number;
+  llmCostUsd?: number;
+}
+
+export interface LLMExecutionRecord {
+  id: string;
+  timestamp: number;
+  strategy: string;
+  latencyMs: number;
+  totalTokens: number;
+  costUsd: number;
+  tradePnl: number | null;
+  assetClass: AssetClass;
+}
+
+export interface PortfolioSnapshot {
+  timestamp: number;
+  equity: number;
+  benchmark?: number;
+}

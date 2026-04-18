@@ -539,39 +539,22 @@ async def get_performance(period: str = "1M"):
         realized_trades: list = []
         try:
             from db.database import _get_session_factory as _gsf
-            from db.models import ExecutionRecord as _ER, SignalRecord as _SR
+            from db.models import ClosedTrade as _CT
             from sqlalchemy import select as _sel
-            from collections import defaultdict as _dd
 
             async def _fetch_trades():
                 async with _gsf()() as _s:
-                    _stmt = (
-                        _sel(_ER.fill_price, _ER.qty, _SR.strategy, _SR.symbol, _SR.action, _ER.timestamp)
-                        .join(_SR, _ER.signal_id == _SR.id)
-                        .where(_ER.status == "FILLED")
-                        .order_by(_SR.strategy, _SR.symbol, _ER.timestamp)
-                    )
-                    return (await _s.execute(_stmt)).all()
+                    _stmt = _sel(_CT).order_by(_CT.exit_time)
+                    return (await _s.execute(_stmt)).scalars().all()
 
             _rows = await _fetch_trades()
-            _groups = _dd(list)
             for _r in _rows:
-                _groups[(_r.strategy, _r.symbol)].append(_r)
-
-            for (_strat, _sym), _grp in _groups.items():
-                _longs: list = []
-                for _r in _grp:
-                    _q = _r.qty or 1.0
-                    if _r.action == "BUY":
-                        _longs.append(_r)
-                    elif _r.action == "SELL" and _longs:
-                        _e = _longs.pop(0)
-                        realized_trades.append({
-                            "strategy": _strat,
-                            "symbol":   _sym,
-                            "pnl":      round((_r.fill_price - _e.fill_price) * (_e.qty or 1.0), 4),
-                            "timestamp": _r.timestamp.isoformat() if _r.timestamp else None,
-                        })
+                realized_trades.append({
+                    "strategy": _r.bot_id,
+                    "symbol":   _r.symbol,
+                    "pnl":      round(float(_r.realized_pnl or 0), 4),
+                    "timestamp": _r.exit_time.isoformat() if _r.exit_time else None,
+                })
         except Exception as _rt_exc:
             logger.debug("[PERFORMANCE] realized_trades fetch failed: %s", _rt_exc)
 
@@ -687,14 +670,14 @@ async def get_llm_cost(period: str = "1M"):
         for ts, cost in cost_rows:
             if ts:
                 day = ts.strftime("%Y-%m-%d")
-                daily_cost[day] = daily_cost.get(day, 0.0) + (cost or 0.0)
+                daily_cost[day] = daily_cost.get(day, 0.0) + float(cost or 0.0)
 
         # Cumulative cost series (epoch ms, running total)
         cum_cost = 0.0
         cost_series: list[list] = []
         for ts, cost in cost_rows:
             if ts:
-                cum_cost += cost or 0
+                cum_cost += float(cost or 0)
                 cost_series.append([int(ts.timestamp() * 1000), round(cum_cost, 6)])
 
         # Fetch portfolio daily PnL from Alpaca
@@ -1090,7 +1073,8 @@ async def stream_manager():
                 # Capture signal_price at emission time for slippage calculation
                 signal_price = price
 
-                for signal in master_engine.process_tick(symbol, price):
+                signals = await master_engine.process_tick(symbol, price)
+                for signal in signals:
                     meta_str = ", ".join(f"{k}={v}" for k, v in signal.get('meta', {}).items())
                     _push_log(
                         f"[{signal['bot'].upper()}] {signal['action']} signal on {symbol} "
@@ -1171,7 +1155,7 @@ async def stream_manager():
                                 )
                                 # Trigger post-trade learning reflection
                                 if _reflection_engine:
-                                    asyncio.create_task(_reflection_engine.learn_from_execution({
+                                    _refl_payload = {
                                         "strategy": signal['bot'],
                                         "symbol": symbol,
                                         "action": approved['action'],
@@ -1179,7 +1163,11 @@ async def stream_manager():
                                         "slippage": exec_result.slippage,
                                         "confidence": signal['confidence'],
                                         "qty": exec_result.qty,
-                                    }))
+                                    }
+                                    if approved['action'] == 'SELL':
+                                        _refl_payload["realized_pnl"] = realized_pnl
+                                        _refl_payload["entry_price"] = entry
+                                    asyncio.create_task(_reflection_engine.learn_from_execution(_refl_payload))
                             else:
                                 _push_log(
                                     f"[EXECUTION] ✗ FAILED {approved['action']} {symbol} "
@@ -1281,7 +1269,8 @@ async def equity_stream_manager():
                     "volume": bar.volume, "timestamp": bar.timestamp.isoformat()
                 }})
                 signal_price = price
-                for signal in master_engine.process_tick(symbol, price):
+                signals = await master_engine.process_tick(symbol, price)
+                for signal in signals:
                     meta_str = ", ".join(f"{k}={v}" for k, v in signal.get("meta", {}).items())
                     _push_log(
                         f"[{signal['bot'].upper()}] {signal['action']} signal on {symbol} "
@@ -1330,6 +1319,21 @@ async def equity_stream_manager():
                                     f"{approved['action']} {symbol} qty={exec_result.qty:.6f} "
                                     f"fill=${exec_result.fill_price:.2f}"
                                 )
+                                # Trigger post-trade learning reflection
+                                if _reflection_engine:
+                                    _refl_eq = {
+                                        "strategy": signal['bot'],
+                                        "symbol": symbol,
+                                        "action": approved['action'],
+                                        "fill_price": exec_result.fill_price,
+                                        "slippage": exec_result.slippage,
+                                        "confidence": signal['confidence'],
+                                        "qty": exec_result.qty,
+                                    }
+                                    if approved['action'] == 'SELL':
+                                        _refl_eq["realized_pnl"] = realized_pnl
+                                        _refl_eq["entry_price"] = entry
+                                    asyncio.create_task(_reflection_engine.learn_from_execution(_refl_eq))
                     else:
                         _push_log(f"[RISK AGENT] \u2717 Blocked {signal['action']} {symbol} \u2014 risk gate rejected.")
 
@@ -1422,106 +1426,102 @@ def _get_positions_for_reflection() -> list:
 @app.get("/api/analytics/realized-pnl")
 async def get_realized_pnl():
     """
-    Pairs BUY → SELL ExecutionRecords (via SignalRecord join) to compute realized P&L per trade.
+    Directly fetches ClosedTrade records.
     Returns a list of closed trades with entry price, exit price, qty, and net P&L.
     Falls back to in-memory _entry_prices for any currently open positions.
     """
     from db.database import _get_session_factory
-    from db.models import ExecutionRecord, SignalRecord
-    from sqlalchemy import select, and_
+    from db.models import ClosedTrade
+    from sqlalchemy import select
 
     try:
         async with _get_session_factory()() as session:
-            # Load all filled execution records joined to their signal for action + strategy + symbol
-            stmt = (
-                select(
-                    ExecutionRecord.id,
-                    ExecutionRecord.fill_price,
-                    ExecutionRecord.qty,
-                    ExecutionRecord.timestamp,
-                    SignalRecord.strategy,
-                    SignalRecord.symbol,
-                    SignalRecord.action,
-                    SignalRecord.confidence,
-                )
-                .join(SignalRecord, ExecutionRecord.signal_id == SignalRecord.id)
-                .where(ExecutionRecord.status == "FILLED")
-                .order_by(SignalRecord.strategy, SignalRecord.symbol, ExecutionRecord.timestamp)
-            )
-            rows = (await session.execute(stmt)).all()
-
-        # Group by (strategy, symbol) and pair BUY → SELL in chronological order (FIFO).
-        # LONG trades: entry=BUY, exit=SELL → pnl = (exit - entry) * qty
-        # SHORT trades: entry=SELL, exit=BUY → pnl = (entry - exit) * qty
-        from collections import defaultdict
-        groups: dict = defaultdict(list)
-        for row in rows:
-            groups[(row.strategy, row.symbol)].append(row)
+            stmt = select(ClosedTrade).order_by(ClosedTrade.exit_time)
+            rows = (await session.execute(stmt)).scalars().all()
 
         trades = []
-        for (strategy, symbol), group_rows in groups.items():
-            open_longs: list  = []  # stack of BUY rows awaiting a SELL
-            open_shorts: list = []  # stack of SELL rows awaiting a BUY (SHORT entry)
-            for row in group_rows:
-                qty = row.qty or 1.0
-                if row.action == "BUY":
-                    if open_shorts:
-                        # Close a SHORT: entry was SELL, exit is BUY
-                        entry_row = open_shorts.pop(0)
-                        entry_qty = entry_row.qty or 1.0
-                        pnl = (entry_row.fill_price - row.fill_price) * entry_qty
-                        trades.append({
-                            "strategy":   strategy,
-                            "symbol":     symbol,
-                            "direction":  "SHORT",
-                            "entry_price": round(entry_row.fill_price, 4),
-                            "exit_price":  round(row.fill_price, 4),
-                            "qty":         round(entry_qty, 6),
-                            "pnl":         round(pnl, 4),
-                            "entry_time":  entry_row.timestamp.isoformat() if entry_row.timestamp else None,
-                            "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
-                            "confidence":  round(entry_row.confidence or 0, 3),
-                        })
-                    else:
-                        open_longs.append(row)
-                elif row.action == "SELL":
-                    if open_longs:
-                        # Close a LONG: entry was BUY, exit is SELL
-                        entry_row = open_longs.pop(0)
-                        entry_qty = entry_row.qty or 1.0
-                        pnl = (row.fill_price - entry_row.fill_price) * entry_qty
-                        trades.append({
-                            "strategy":   strategy,
-                            "symbol":     symbol,
-                            "direction":  "LONG",
-                            "entry_price": round(entry_row.fill_price, 4),
-                            "exit_price":  round(row.fill_price, 4),
-                            "qty":         round(entry_qty, 6),
-                            "pnl":         round(pnl, 4),
-                            "entry_time":  entry_row.timestamp.isoformat() if entry_row.timestamp else None,
-                            "exit_time":   row.timestamp.isoformat() if row.timestamp else None,
-                            "confidence":  round(entry_row.confidence or 0, 3),
-                        })
-                    else:
-                        open_shorts.append(row)
+        for row in rows:
+            trades.append({
+                "strategy":   row.bot_id,
+                "symbol":     row.symbol,
+                "direction":  "LONG",
+                "entry_price": round(float(row.avg_entry_price or 0), 4),
+                "exit_price":  round(float(row.avg_exit_price or 0), 4),
+                "qty":         round(float(row.qty or 0), 6),
+                "pnl":         round(float(row.realized_pnl or 0), 4),
+                "entry_time":  row.entry_time.isoformat() if row.entry_time else None,
+                "exit_time":   row.exit_time.isoformat() if row.exit_time else None,
+                "confidence":  0.0,
+            })
 
-        # Add currently open positions from in-memory dict
-        open_positions = [
-            {
+        open_positions = []
+        for (bot, sym), price in _entry_prices.items():
+            qty = None
+            entry_time = _entry_times.get((bot, sym))
+            if trading_client:
+                try:
+                    for p in trading_client.get_all_positions():
+                        if str(p.symbol) == sym:
+                            qty = round(float(p.qty or 0), 6)
+                            break
+                except Exception:
+                    qty = None
+
+            open_positions.append({
                 "strategy":   bot,
                 "symbol":     sym,
                 "direction":  "LONG",
-                "entry_price": round(price, 4),
+                "entry_price": round(float(price or 0), 4),
                 "exit_price":  None,
-                "qty":         None,
+                "qty":         qty,
                 "pnl":         None,
-                "entry_time":  None,
+                "entry_time":  entry_time,
                 "exit_time":   None,
                 "confidence":  None,
                 "open":        True,
-            }
-            for (bot, sym), price in _entry_prices.items()
-        ]
+            })
+
+        # Fallback: if DB has no closed trades, pull from Alpaca order history and pair BUY/SELL
+        if not trades and trading_client:
+            try:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+                closed_orders = trading_client.get_orders(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+                )
+                # Build paired map: symbol → list of (side, fill_price, qty, filled_at)
+                order_map: dict[str, list] = {}
+                for o in closed_orders:
+                    if o.filled_avg_price is None:
+                        continue
+                    sym = str(o.symbol)
+                    order_map.setdefault(sym, []).append({
+                        "side": str(o.side).split(".")[-1].upper(),
+                        "fill_price": float(o.filled_avg_price),
+                        "qty": float(o.filled_qty or 0),
+                        "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+                    })
+                # Pair SELL orders with preceding BUY orders per symbol (FIFO)
+                for sym, orders in order_map.items():
+                    buys  = [o for o in orders if o["side"] == "BUY"]
+                    sells = [o for o in orders if o["side"] == "SELL"]
+                    for sell in sells:
+                        buy = buys.pop(0) if buys else None
+                        pnl = (sell["fill_price"] - (buy["fill_price"] if buy else sell["fill_price"])) * sell["qty"]
+                        trades.append({
+                            "strategy":    "alpaca-history",
+                            "symbol":      sym,
+                            "direction":   "LONG",
+                            "entry_price": round(buy["fill_price"] if buy else sell["fill_price"], 4),
+                            "exit_price":  round(sell["fill_price"], 4),
+                            "qty":         round(sell["qty"], 6),
+                            "pnl":         round(pnl, 4),
+                            "entry_time":  buy["filled_at"] if buy else None,
+                            "exit_time":   sell["filled_at"],
+                            "confidence":  0.0,
+                        })
+            except Exception as _fb_err:
+                logger.debug("[REALIZED PNL] Alpaca fallback failed: %s", _fb_err)
 
         return {"trades": trades, "open_positions": open_positions, "total_closed": len(trades)}
 
@@ -1541,36 +1541,51 @@ _scanner_agent = None
 _scanner_task: Optional[asyncio.Task] = None
 _ENTRY_PRICES_FILE = os.path.join(os.path.dirname(__file__), "_entry_prices.json")
 
-def _load_entry_prices() -> dict[tuple, float]:
-    """Restores entry prices from disk so restarts don't lose open-position cost basis."""
+def _load_entry_prices() -> "tuple[dict, dict]":
+    """Restores entry prices and times from disk so restarts don't lose open-position cost basis."""
+    prices: dict[tuple, float] = {}
+    times:  dict[tuple, str]   = {}
     try:
         with open(_ENTRY_PRICES_FILE, "r") as f:
-            raw: dict[str, float] = json.load(f)
-        result = {}
-        for k, v in raw.items():
+            raw = json.load(f)
+
+        # Support both old format (flat dict of prices) and new format ({"prices": {}, "times": {}})
+        if "prices" in raw and isinstance(raw["prices"], dict):
+            price_map = raw["prices"]
+            time_map  = raw.get("times", {})
+        else:
+            price_map = raw
+            time_map  = {}
+
+        for k, v in price_map.items():
             parts = k.split("|", 1)
             if len(parts) == 2:
-                result[(parts[0], parts[1])] = float(v)
-        logger.info("[ENTRY PRICES] Restored %d open positions from disk", len(result))
-        return result
+                prices[(parts[0], parts[1])] = float(v)
+        for k, v in time_map.items():
+            parts = k.split("|", 1)
+            if len(parts) == 2:
+                times[(parts[0], parts[1])] = str(v)
+
+        logger.info("[ENTRY PRICES] Restored %d open positions from disk", len(prices))
     except FileNotFoundError:
-        return {}
+        pass
     except Exception as e:
         logger.warning("[ENTRY PRICES] Failed to restore from disk: %s", e)
-        return {}
+    return prices, times
 
 def _persist_entry_prices(entry_prices: dict[tuple, float]):
-    """Writes current entry-price map to disk after every fill."""
+    """Writes current entry-price and entry-time maps to disk after every fill."""
     try:
-        raw = {f"{bot}|{sym}": price for (bot, sym), price in entry_prices.items()}
+        raw = {
+            "prices": {f"{b}|{s}": p for (b, s), p in entry_prices.items()},
+            "times":  {f"{b}|{s}": t for (b, s), t in _entry_times.items()},
+        }
         with open(_ENTRY_PRICES_FILE, "w") as f:
             json.dump(raw, f)
     except Exception as e:
         logger.warning("[ENTRY PRICES] Failed to persist to disk: %s", e)
 
-_entry_prices: dict[tuple, float] = _load_entry_prices()  # (bot_id, symbol) → BUY fill price
-# Tracks BUY fill timestamp for ClosedTrade reconciliation — (bot_id, symbol) → ISO timestamp str
-_entry_times: dict[tuple, str] = {}
+_entry_prices, _entry_times = _load_entry_prices()  # (bot_id, symbol) → BUY fill price / timestamp
 
 
 @app.get("/api/watchlist")
@@ -1801,25 +1816,38 @@ async def _portfolio_snapshot_loop():
     """Background loop: write a PortfolioSnapshot every 60 seconds."""
     from db.database import _get_session_factory
     from db.models import PortfolioSnapshot
-    from risk.kill_switch import global_kill_switch
     await asyncio.sleep(30)  # let streams connect first
     while True:
         try:
-            equity = 0.0
+            total_equity = 0.0
+            cash_balance = 0.0
+            unrealized_pnl = 0.0
+            realized_pnl_day = 0.0
+            
             if trading_client:
                 try:
-                    equity = float(trading_client.get_account().equity)
+                    acc = trading_client.get_account()
+                    total_equity = float(acc.equity or 0.0)
+                    cash_balance = float(acc.cash or 0.0)
+                    
+                    for attr in ('unrealized_pl', 'unrealized_plpc'):
+                        raw = getattr(acc, attr, None)
+                        if attr == 'unrealized_pl' and raw is not None:
+                            try: unrealized_pnl = float(raw)
+                            except Exception: pass
+                            break
+                            
+                    realized_pnl_day = float(getattr(acc, 'realized_pl', 0.0) or 0.0)
                 except Exception:
                     pass
-            drawdown_pct = 0.0
-            try:
-                ks = global_kill_switch
-                if hasattr(ks, 'start_of_day_equity') and ks.start_of_day_equity > 0:
-                    drawdown_pct = max(0.0, (ks.start_of_day_equity - equity) / ks.start_of_day_equity)
-            except Exception:
-                pass
+
             async with _get_session_factory()() as _s:
-                _s.add(PortfolioSnapshot(equity=equity, drawdown_pct=drawdown_pct))
+                _s.add(PortfolioSnapshot(
+                    total_equity=total_equity, 
+                    cash_balance=cash_balance,
+                    unrealized_pnl=unrealized_pnl,
+                    realized_pnl_day=realized_pnl_day
+                ))
                 await _s.commit()
         except Exception as snap_err:
             logger.debug("[SNAPSHOT] %s", snap_err)
@@ -1841,21 +1869,32 @@ async def _write_closed_trade(
     """Persist a FIFO-matched round-trip trade to the closed_trades table."""
     from db.database import _get_session_factory
     from db.models import ClosedTrade
+    from datetime import datetime as _dt
+
+    def _parse_ts(ts) -> "_dt | None":
+        if isinstance(ts, _dt):
+            return ts.replace(tzinfo=None)  # store as naive UTC
+        if isinstance(ts, str):
+            try:
+                return _dt.fromisoformat(ts.replace("Z", "").split("+")[0])
+            except ValueError:
+                return None
+        return None
+
     realized_pnl = (exit_price - entry_price) * qty if direction == "LONG" else (entry_price - exit_price) * qty
     try:
         async with _get_session_factory()() as _s:
             _s.add(ClosedTrade(
                 bot_id=bot_id,
                 symbol=symbol,
-                direction=direction,
-                entry_execution_id=entry_exec_id,
-                exit_execution_id=exit_exec_id,
-                entry_price=entry_price,
-                exit_price=exit_price,
                 qty=qty,
+                avg_entry_price=entry_price,
+                avg_exit_price=exit_price,
                 realized_pnl=realized_pnl,
-                entry_time=entry_time,
-                exit_time=exit_time,
+                net_pnl=realized_pnl,
+                win=(realized_pnl > 0),
+                entry_time=_parse_ts(entry_time),
+                exit_time=_parse_ts(exit_time),
             ))
             await _s.commit()
     except Exception as e:

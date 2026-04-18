@@ -250,8 +250,14 @@ class ReflectionEngine:
         slippage = execution_data.get("slippage", 0)
         confidence = execution_data.get("confidence", 0)
         qty = execution_data.get("qty", 0)
+        realized_pnl = execution_data.get("realized_pnl")   # only for SELL fills
+        entry_price  = execution_data.get("entry_price")    # only for SELL fills
 
         now = datetime.utcnow()
+
+        pnl_pct = 0.0
+        if realized_pnl is not None and entry_price and entry_price > 0 and qty > 0:
+            pnl_pct = (realized_pnl / (entry_price * qty)) * 100
 
         # Try LLM insight (Haiku, max_tokens=100)
         insight = None
@@ -261,18 +267,29 @@ class ReflectionEngine:
             if model:
                 from langchain_core.messages import SystemMessage, HumanMessage
                 sys_msg = SystemMessage(content=(
-                    "You are a quant trading analyst reviewing crypto paper trades. "
-                    "All prices and slippage are in USD. qty is a fractional coin amount "
-                    "(e.g. 0.0003 BTC, 0.005 ETH — never grams or kg). "
-                    "Produce ONE concise sentence (max 30 words) analysing slippage quality, "
-                    "confidence calibration, or market conditions. "
-                    "Reference specific USD figures from the data. No markdown, no preamble."
+                    "You are a quant trading analyst reviewing paper trades (equities and crypto). "
+                    "All prices and slippage are in USD. qty is a fractional amount. "
+                    "For BUY trades: assess entry timing quality — was confidence well-calibrated "
+                    "to market momentum? Was it a good entry point? "
+                    "For SELL trades: assess round-trip profitability — did the exit capture gains "
+                    "well? Was the exit premature or well-timed given the return? "
+                    "Produce ONE concise sentence (max 35 words). "
+                    "Reference specific USD figures and percentages from the data. No markdown, no preamble."
                 ))
-                user_msg = HumanMessage(content=(
-                    f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
-                    f"Qty: {qty:.6f} coins | Fill price: ${fill_price:.2f} USD | "
-                    f"Slippage: ${slippage:.4f} USD | Signal confidence: {confidence:.0%}"
-                ))
+
+                if action == "SELL" and realized_pnl is not None and entry_price is not None:
+                    trade_context = (
+                        f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
+                        f"Qty: {qty:.6f} | Fill: ${fill_price:.2f} | Slippage: ${slippage:.4f} | Conf: {confidence:.0%}\n"
+                        f"Entry: ${entry_price:.2f} | Realized PnL: ${realized_pnl:+.4f} | Return: {pnl_pct:+.2f}%"
+                    )
+                else:
+                    trade_context = (
+                        f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
+                        f"Qty: {qty:.6f} | Fill: ${fill_price:.2f} | Slippage: ${slippage:.4f} | Conf: {confidence:.0%}"
+                    )
+
+                user_msg = HumanMessage(content=trade_context)
                 response = await model.ainvoke(
                     [sys_msg, user_msg],
                     max_tokens=250,
@@ -306,11 +323,19 @@ class ReflectionEngine:
         # Fallback template if no LLM
         if not insight:
             slip_quality = "excellent" if abs(slippage) < 0.5 else "acceptable" if abs(slippage) < 2 else "poor"
-            insight = (
-                f"{strategy} {action} {symbol} filled at ${fill_price:.2f} "
-                f"with {slip_quality} slippage (${slippage:.4f}). "
-                f"Signal confidence was {confidence:.0%}."
-            )
+            if action == "SELL" and realized_pnl is not None:
+                outcome = "profitable" if realized_pnl > 0 else "unprofitable"
+                insight = (
+                    f"{strategy} {action} {symbol} at ${fill_price:.2f}: "
+                    f"{outcome} round-trip (PnL=${realized_pnl:+.4f}, {pnl_pct:+.2f}%) "
+                    f"with {slip_quality} slippage."
+                )
+            else:
+                insight = (
+                    f"{strategy} {action} {symbol} filled at ${fill_price:.2f} "
+                    f"with {slip_quality} slippage (${slippage:.4f}). "
+                    f"Signal confidence was {confidence:.0%}."
+                )
 
         impact = f"Slip=${slippage:.4f} | Conf={confidence:.0%}"
 

@@ -6,24 +6,24 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
 import { ValueTicker } from '@/components/ui/value-ticker';
+import { Sparkles } from 'lucide-react';
 
 interface ScanResult {
-  symbol: string;
-  score: number;
-  signal: 'BUY' | 'SELL' | 'NEUTRAL';
-  verdict: string;
-  price: number;
-  rsi: number | null;
+  symbol:    string;
+  score:     number;
+  signal:    'BUY' | 'SELL' | 'NEUTRAL';
+  verdict:   string;
+  price:     number;
+  rsi:       number | null;
   timestamp: string;
 }
 
 export function SidebarWatchlist() {
   const { watchlist, activeSymbol, setActiveSymbol, assetClass } = useTradingStore();
-  // scannerResults is kept live by the SSE stream in useTradingStream.ts —
-  // "scanner" events from the backend update it automatically every 5 min.
   const scanResults = useTradingStore(s => s.scannerResults) as ScanResult[];
   const [scanning, setScanning] = React.useState(false);
   const [scanError, setScanError] = React.useState(false);
+  const [expanded, setExpanded] = React.useState<string | null>(null);
 
   const triggerScan = async () => {
     setScanning(true);
@@ -31,7 +31,6 @@ export function SidebarWatchlist() {
     try {
       const res = await fetch(`${API_BASE}/api/watchlist/scan`, { method: 'POST' });
       const data = await res.json();
-      // Write directly into the shared Zustand store so all consumers update
       if (Array.isArray(data?.results)) {
         useTradingStore.setState({ scannerResults: data.results });
       }
@@ -42,101 +41,138 @@ export function SidebarWatchlist() {
     }
   };
 
-  // Filter watchlist roughly by asset class static grouping
   const visibleTickers = watchlist.filter(w => {
-    if (assetClass === 'CRYPTO') return w.symbol.includes('USD');
-    if (assetClass === 'EQUITY') return !w.symbol.includes('USD');
-    return true; // Options shows all for now
+    if (assetClass === 'CRYPTO')  return w.symbol.includes('USD');
+    if (assetClass === 'EQUITY')  return !w.symbol.includes('USD');
+    return true;
   });
+
+  // Symbols in scan results but NOT already in the watchlist
+  const scanSymbols = new Set(scanResults.map(r => r.symbol));
+  const watchlistSymbols = new Set(visibleTickers.map(t => t.symbol));
+  const haiquePicks = scanResults.filter(r => !watchlistSymbols.has(r.symbol));
 
   return (
     <Card className="h-full flex flex-col min-w-[240px]">
-      <CardHeader className="py-2.5 px-3">
+      <CardHeader className="py-2 px-3 border-b border-[var(--border)] flex flex-row items-center justify-between">
         <CardTitle className="text-xs uppercase tracking-wider font-semibold text-[var(--muted-foreground)]">Watchlist</CardTitle>
+        <button
+          onClick={triggerScan}
+          disabled={scanning}
+          className="flex items-center gap-1 text-xs font-mono px-2 py-0.5 rounded-sm border border-[var(--kraken-purple)]/50 text-[var(--kraken-light)] hover:bg-[var(--kraken-purple)]/20 disabled:opacity-40 transition-colors"
+        >
+          <Sparkles className="w-3 h-3" />
+          {scanning ? 'SCANNING…' : 'SCAN'}
+        </button>
       </CardHeader>
+
       <CardContent className="flex-1 overflow-y-auto p-0 flex flex-col">
-        {visibleTickers.map((ticker) => (
-          <div
-            key={ticker.symbol}
-            onClick={() => setActiveSymbol(ticker.symbol)}
-            className={`p-3 border-b border-[var(--border)] cursor-pointer transition-colors flex justify-between items-center ${activeSymbol === ticker.symbol ? 'bg-[var(--kraken-purple)]/10 border-l-2 border-l-[var(--kraken-purple)]' : 'hover:bg-[var(--panel-muted)] border-l-2 border-l-transparent'}`}
-          >
-            <div className="flex flex-col">
-              <span className="font-bold text-sm text-[var(--kraken-light)]">{ticker.symbol}</span>
-              <span className="text-xs text-[var(--muted-foreground)] tabular-nums mt-0.5">Vol: {(ticker.volume / 1000).toFixed(1)}k</span>
-            </div>
-            <div className="flex flex-col items-end">
-              <span className="font-mono text-sm font-semibold">
-                <ValueTicker value={ticker.price} />
-              </span>
-              <span className={`text-xs font-mono tabular-nums ${ticker.change24h >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-                {ticker.change24h >= 0 ? '+' : ''}{ticker.change24h.toFixed(2)}%
-              </span>
-            </div>
-          </div>
-        ))}
 
-        {/* ── Scanner Panel ── */}
-        <div className="mt-auto border-t border-[var(--border)] shrink-0">
-          <div className="px-3 py-2 flex items-center justify-between">
-            <span className="text-xs uppercase tracking-wider font-semibold text-[var(--muted-foreground)]">
-              TA Scanner
-            </span>
-            <button
-              onClick={triggerScan}
-              disabled={scanning}
-              className="text-xs font-mono px-2 py-0.5 rounded-sm border border-[var(--kraken-purple)]/50 text-[var(--kraken-light)] hover:bg-[var(--kraken-purple)]/20 disabled:opacity-40 transition-colors"
-            >
-              {scanning ? 'SCANNING…' : 'SCAN'}
-            </button>
-          </div>
-
-          {scanError && (
-            <div className="px-3 pb-2 text-xs text-[var(--neon-red)] font-mono">
-              Scanner offline
+        {/* ── Haiku Picks (scanner results) at the top ── */}
+        {scanResults.length > 0 && (
+          <div className="shrink-0">
+            <div className="px-3 py-1.5 flex items-center gap-1.5 bg-[var(--kraken-purple)]/8 border-b border-[var(--border)]">
+              <Sparkles className="w-3 h-3 text-[var(--kraken-light)]" />
+              <span className="text-xs font-mono uppercase tracking-wider text-[var(--kraken-light)]">Haiku Picks</span>
+              <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40">{scanResults.length}</span>
             </div>
-          )}
-
-          {scanResults.length > 0 && (
-            <div className="flex flex-col">
-              {scanResults.map(r => (
-                <div
-                  key={r.symbol}
-                  className="px-3 py-2 border-t border-[var(--border)]/50 hover:bg-[var(--panel-muted)] transition-colors"
-                >
-                  <div className="flex items-center justify-between mb-0.5">
-                    <span className="text-xs font-bold text-[var(--foreground)]">{r.symbol}</span>
-                    <Badge
-                      variant={r.signal === 'BUY' ? 'success' : r.signal === 'SELL' ? 'destructive' : 'outline'}
-                      className="text-xs py-0 px-1"
-                    >
-                      {r.signal}
-                    </Badge>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)]">
-                      score {r.score >= 0 ? '+' : ''}{r.score.toFixed(2)}
-                    </span>
-                    {r.rsi != null && (
-                      <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)]">
-                        RSI {r.rsi.toFixed(0)}
+            {scanResults.map(r => {
+              const isActive = activeSymbol === r.symbol;
+              const isOpen   = expanded === r.symbol;
+              return (
+                <div key={r.symbol} className={`border-b border-[var(--border)]/60 ${isActive ? 'bg-[var(--kraken-purple)]/10 border-l-2 border-l-[var(--kraken-purple)]' : 'border-l-2 border-l-transparent'}`}>
+                  <div
+                    className="flex items-center justify-between px-3 py-2 cursor-pointer hover:bg-[var(--panel-muted)] transition-colors"
+                    onClick={() => {
+                      setActiveSymbol(r.symbol);
+                      setExpanded(isOpen ? null : r.symbol);
+                    }}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-bold text-sm text-[var(--foreground)]">{r.symbol}</span>
+                      <Badge
+                        variant={r.signal === 'BUY' ? 'success' : r.signal === 'SELL' ? 'destructive' : 'outline'}
+                        className="text-xs py-0 px-1 shrink-0"
+                      >
+                        {r.signal}
+                      </Badge>
+                    </div>
+                    <div className="flex flex-col items-end shrink-0 ml-2">
+                      <span className={`text-xs font-mono tabular-nums font-bold ${r.score >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                        {r.score >= 0 ? '+' : ''}{r.score.toFixed(2)}
                       </span>
+                      {r.rsi != null && (
+                        <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60">
+                          RSI {r.rsi.toFixed(0)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {isOpen && (
+                    <div className="px-3 pb-2 text-xs text-[var(--muted-foreground)] leading-snug bg-[var(--background)]/40 border-t border-[var(--border)]/30">
+                      {r.verdict}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {scanError && (
+          <div className="px-3 py-2 text-xs text-[var(--neon-red)] font-mono shrink-0">
+            Scanner offline — check backend
+          </div>
+        )}
+
+        {/* ── Static Watchlist ── */}
+        {visibleTickers.length > 0 && (
+          <div className="shrink-0">
+            {scanResults.length > 0 && (
+              <div className="px-3 py-1.5 border-b border-[var(--border)] bg-[var(--panel-muted)]/30">
+                <span className="text-xs font-mono uppercase tracking-wider text-[var(--muted-foreground)] opacity-60">Watchlist</span>
+              </div>
+            )}
+            {visibleTickers.map(ticker => (
+              <div
+                key={ticker.symbol}
+                onClick={() => setActiveSymbol(ticker.symbol)}
+                className={`p-3 border-b border-[var(--border)]/60 cursor-pointer transition-colors flex justify-between items-center ${
+                  activeSymbol === ticker.symbol
+                    ? 'bg-[var(--kraken-purple)]/10 border-l-2 border-l-[var(--kraken-purple)]'
+                    : 'hover:bg-[var(--panel-muted)] border-l-2 border-l-transparent'
+                }`}
+              >
+                <div className="flex flex-col">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold text-sm text-[var(--kraken-light)]">{ticker.symbol}</span>
+                    {scanSymbols.has(ticker.symbol) && (
+                      <Sparkles className="w-2.5 h-2.5 text-[var(--kraken-light)] opacity-70" />
                     )}
                   </div>
-                  <p className="text-xs text-[var(--muted-foreground)] opacity-70 mt-0.5 leading-tight line-clamp-2">
-                    {r.verdict}
-                  </p>
+                  <span className="text-xs text-[var(--muted-foreground)] tabular-nums mt-0.5">Vol: {(ticker.volume / 1000).toFixed(1)}k</span>
                 </div>
-              ))}
-            </div>
-          )}
+                <div className="flex flex-col items-end">
+                  <span className="font-mono text-sm font-semibold">
+                    <ValueTicker value={ticker.price} />
+                  </span>
+                  <span className={`text-xs font-mono tabular-nums ${ticker.change24h >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+                    {ticker.change24h >= 0 ? '+' : ''}{ticker.change24h.toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
-          {scanResults.length === 0 && !scanning && !scanError && (
-            <div className="px-3 pb-3 text-xs text-[var(--muted-foreground)] opacity-40 font-mono">
-              Press SCAN to analyse symbols
-            </div>
-          )}
-        </div>
+        {scanResults.length === 0 && !scanning && !scanError && (
+          <div className="flex-1 flex items-end pb-4 px-3">
+            <span className="text-xs text-[var(--muted-foreground)] opacity-40 font-mono">
+              Press SCAN for Haiku analysis
+            </span>
+          </div>
+        )}
+
       </CardContent>
     </Card>
   );

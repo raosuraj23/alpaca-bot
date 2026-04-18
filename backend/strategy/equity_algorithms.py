@@ -3,7 +3,7 @@ Equity Trading Strategy Algorithms
 =====================================
 Three algorithmic strategies for US equity assets (stocks/ETFs).
 All strategies enforce market-hours gating: signals are only emitted
-during regular US equity session (9:30 AM – 4:00 PM ET, Mon–Fri).
+during regular US equity session (9:30 AM - 4:00 PM ET, Mon-Fri).
 
 Position-state tracking: FLAT/LONG per symbol prevents naked SELLs.
 
@@ -29,7 +29,7 @@ EQUITY_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL"]
 
 
 def _is_market_hours() -> bool:
-    """Returns True if current time is within regular US equity market hours (ET, Mon–Fri)."""
+    """Returns True if current time is within regular US equity market hours (ET, Mon-Fri)."""
     now = datetime.now(ET)
     if now.weekday() >= 5:  # Saturday=5, Sunday=6
         return False
@@ -37,44 +37,40 @@ def _is_market_hours() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 4: EMA Momentum Equity (same crossover logic as crypto momentum)
+# Strategy 4: EMA Momentum Equity 
 # ---------------------------------------------------------------------------
 
 class EquityMomentumStrategy(BaseStrategy):
-    """
-    Dual-EMA crossover strategy adapted for US equities.
-
-    Slower EMAs than the crypto variant to suit lower-frequency equity data:
-      - EMA-short (α=0.12, approx 16-period)
-      - EMA-long  (α=0.03, approx 66-period)
-
-    Signal logic (market hours only):
-      BUY  when short crosses above long by > 0.15% AND position FLAT
-      SELL when short crosses below long by > 0.15% AND position LONG
-
-    Starts ACTIVE with 20% allocation.
-    """
-
     asset_class = "EQUITY"
 
-    def __init__(self, bot_id="equity-momentum", name="Equity Momentum", allocation=20):
-        super().__init__(bot_id, name, allocation, "EMA Crossover (Equity)")
+    def __init__(self, bot_id="equity-momentum", name="Equity Momentum", allocation=20, **kwargs):
+        super().__init__(bot_id, name, allocation, "EMA Crossover (Equity)", **kwargs)
         self.ema_short: dict[str, float] = {}
         self.ema_long:  dict[str, float] = {}
+        self._ticks: dict[str, int] = {}
         self._last_cross: dict[str, str] = {}
+        
+        self.alpha_short = getattr(self, 'alpha_short', 0.12)
+        self.alpha_long = getattr(self, 'alpha_long', 0.03)
+        self.warmup_ticks = getattr(self, 'warmup_ticks', 66) # Must wait for long EMA to stabilize
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
 
         if symbol not in self.ema_short:
             self.ema_short[symbol] = price
             self.ema_long[symbol]  = price
+            self._ticks[symbol] = 1
             self._last_cross[symbol] = "NONE"
             return None
 
-        self.ema_short[symbol] = (price * 0.12) + (self.ema_short[symbol] * 0.88)
-        self.ema_long[symbol]  = (price * 0.03) + (self.ema_long[symbol]  * 0.97)
+        self._ticks[symbol] += 1
+        self.ema_short[symbol] = (price * self.alpha_short) + (self.ema_short[symbol] * (1 - self.alpha_short))
+        self.ema_long[symbol]  = (price * self.alpha_long) + (self.ema_long[symbol]  * (1 - self.alpha_long))
+
+        if self._ticks[symbol] < self.warmup_ticks:
+            return None
 
         short = self.ema_short[symbol]
         long_ = self.ema_long[symbol]
@@ -83,26 +79,14 @@ class EquityMomentumStrategy(BaseStrategy):
         signal = None
         if spread > 0.0015 and self._last_cross.get(symbol) != "BUY" and self._is_flat(symbol):
             self._last_cross[symbol] = "BUY"
-            confidence = min(0.95, 0.68 + abs(spread) * 15)
-            signal = {
-                "bot": self.id, "symbol": symbol, "action": "BUY",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"ema_short": round(short, 4), "ema_long": round(long_, 4),
-                         "spread_pct": round(spread * 100, 4), "market_hours": True}
-            }
+            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
         elif spread < -0.0015 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
             self._last_cross[symbol] = "SELL"
-            confidence = min(0.95, 0.68 + abs(spread) * 15)
-            signal = {
-                "bot": self.id, "symbol": symbol, "action": "SELL",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"ema_short": round(short, 4), "ema_long": round(long_, 4),
-                         "spread_pct": round(spread * 100, 4), "market_hours": True}
-            }
+            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
 
         if signal:
             self.signal_count += 1
-            logger.info("[EQUITY-MOMENTUM] %s → %s (conf=%.2f, spread=%.4f%%)",
+            logger.info("[EQUITY-MOMENTUM] %s -> %s (conf=%.2f, spread=%.4f%%)",
                         symbol, signal["action"], signal["confidence"], spread * 100)
         return signal
 
@@ -126,67 +110,54 @@ class EquityMomentumStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Strategy 5: RSI Mean Reversion (Equity)
+# Strategy 5: RSI Mean Reversion (Equity) - O(1) Memory Fix
 # ---------------------------------------------------------------------------
 
 class EquityRSIStrategy(BaseStrategy):
-    """
-    RSI-based mean reversion for individual equities.
-
-    Maintains a 14-period RSI per symbol using Wilder's smoothing.
-
-    Signal logic (market hours only):
-      BUY  when RSI < 30 (oversold) AND position FLAT
-      SELL when RSI > 70 (overbought) AND position LONG
-
-    Confidence scales linearly with RSI extremity:
-      BUY  conf = 0.60 + (30 - RSI) / 30 * 0.35
-      SELL conf = 0.60 + (RSI - 70) / 30 * 0.35
-
-    Allocation: 15% default.
-    """
-
     asset_class = "EQUITY"
-    RSI_PERIOD = 14
-    RSI_OVERSOLD  = 30
-    RSI_OVERBOUGHT = 70
 
-    def __init__(self, bot_id="equity-rsi", name="Equity RSI", allocation=15):
-        super().__init__(bot_id, name, allocation, "RSI Mean Reversion")
-        self._prices: dict[str, deque] = {}
+    def __init__(self, bot_id="equity-rsi", name="Equity RSI", allocation=15, **kwargs):
+        super().__init__(bot_id, name, allocation, "RSI Mean Reversion", **kwargs)
+        self.RSI_PERIOD = getattr(self, 'rsi_period', 14)
+        self.RSI_OVERSOLD = getattr(self, 'rsi_oversold', 30)
+        self.RSI_OVERBOUGHT = getattr(self, 'rsi_overbought', 70)
+        
+        self._prev_price: dict[str, float] = {}
         self._avg_gain: dict[str, float] = {}
         self._avg_loss: dict[str, float] = {}
         self._rsi: dict[str, float] = {}
+        self._ticks: dict[str, int] = {}
         self._last_signal: dict[str, str] = {}
-        self._initialized: dict[str, bool] = {}
 
-    def _update_rsi(self, symbol: str, price: float):
-        """Wilder's smoothed RSI update."""
-        if symbol not in self._prices:
-            self._prices[symbol] = deque(maxlen=self.RSI_PERIOD + 1)
-            self._initialized[symbol] = False
-
-        self._prices[symbol].append(price)
-
-        if len(self._prices[symbol]) < self.RSI_PERIOD + 1:
+    def _update_rsi_o1(self, symbol: str, price: float):
+        """O(1) Wilder's smoothing without needing a deque."""
+        if symbol not in self._prev_price:
+            self._prev_price[symbol] = price
+            self._avg_gain[symbol] = 0.0
+            self._avg_loss[symbol] = 0.0
+            self._ticks[symbol] = 1
             return
 
-        if not self._initialized[symbol]:
-            changes = [self._prices[symbol][i+1] - self._prices[symbol][i]
-                       for i in range(self.RSI_PERIOD)]
-            gains = [c for c in changes if c > 0]
-            losses = [abs(c) for c in changes if c < 0]
-            self._avg_gain[symbol] = sum(gains) / self.RSI_PERIOD
-            self._avg_loss[symbol] = sum(losses) / self.RSI_PERIOD
-            self._initialized[symbol] = True
-        else:
-            prices = list(self._prices[symbol])
-            change = prices[-1] - prices[-2]
-            gain = max(0.0, change)
-            loss = max(0.0, -change)
-            alpha = 1.0 / self.RSI_PERIOD
-            self._avg_gain[symbol] = (self._avg_gain[symbol] * (1 - alpha)) + (gain * alpha)
-            self._avg_loss[symbol] = (self._avg_loss[symbol] * (1 - alpha)) + (loss * alpha)
+        self._ticks[symbol] += 1
+        change = price - self._prev_price[symbol]
+        self._prev_price[symbol] = price
+
+        gain = max(0.0, change)
+        loss = max(0.0, -change)
+
+        # Simple SMA for the first RSI_PERIOD ticks
+        if self._ticks[symbol] <= self.RSI_PERIOD:
+            self._avg_gain[symbol] += gain
+            self._avg_loss[symbol] += loss
+            if self._ticks[symbol] == self.RSI_PERIOD:
+                self._avg_gain[symbol] /= self.RSI_PERIOD
+                self._avg_loss[symbol] /= self.RSI_PERIOD
+            return
+
+        # Wilder's Smoothing thereafter
+        alpha = 1.0 / self.RSI_PERIOD
+        self._avg_gain[symbol] = (self._avg_gain[symbol] * (1 - alpha)) + (gain * alpha)
+        self._avg_loss[symbol] = (self._avg_loss[symbol] * (1 - alpha)) + (loss * alpha)
 
         if self._avg_loss[symbol] == 0:
             self._rsi[symbol] = 100.0
@@ -194,11 +165,11 @@ class EquityRSIStrategy(BaseStrategy):
             rs = self._avg_gain[symbol] / self._avg_loss[symbol]
             self._rsi[symbol] = 100 - (100 / (1 + rs))
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
 
-        self._update_rsi(symbol, price)
+        self._update_rsi_o1(symbol, price)
 
         if symbol not in self._rsi:
             return None
@@ -207,25 +178,15 @@ class EquityRSIStrategy(BaseStrategy):
         signal = None
 
         if rsi < self.RSI_OVERSOLD and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
-            confidence = min(0.95, 0.60 + (self.RSI_OVERSOLD - rsi) / 30 * 0.35)
             self._last_signal[symbol] = "BUY"
-            signal = {
-                "bot": self.id, "symbol": symbol, "action": "BUY",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"rsi": round(rsi, 2), "zone": "OVERSOLD"}
-            }
+            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.60 + (self.RSI_OVERSOLD - rsi) / 30 * 0.35), "price": price}
         elif rsi > self.RSI_OVERBOUGHT and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
-            confidence = min(0.95, 0.60 + (rsi - self.RSI_OVERBOUGHT) / 30 * 0.35)
             self._last_signal[symbol] = "SELL"
-            signal = {
-                "bot": self.id, "symbol": symbol, "action": "SELL",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"rsi": round(rsi, 2), "zone": "OVERBOUGHT"}
-            }
+            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.60 + (rsi - self.RSI_OVERBOUGHT) / 30 * 0.35), "price": price}
 
         if signal:
             self.signal_count += 1
-            logger.info("[EQUITY-RSI] %s → %s (conf=%.2f, RSI=%.1f)",
+            logger.info("[EQUITY-RSI] %s -> %s (conf=%.2f, RSI=%.1f)",
                         symbol, signal["action"], signal["confidence"], rsi)
         return signal
 
@@ -245,68 +206,27 @@ class EquityRSIStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Strategy 6: Equity Pairs Mean Reversion (SPY / QQQ spread)
+# Strategy 6: Equity Pairs Mean Reversion (Welford's O(1) Fix)
 # ---------------------------------------------------------------------------
 
 class EquityPairsStrategy(BaseStrategy):
-    """
-    Statistical pairs trading between two correlated ETFs (default: SPY / QQQ).
-
-    Maintains a rolling 30-period z-score of the price spread ratio (SPY / QQQ).
-
-    Signal logic:
-      When z-score < -2.0 (SPY cheap vs QQQ):
-        BUY  SPY  (expect spread to revert upward)
-      When z-score > +2.0 (SPY expensive vs QQQ):
-        SELL SPY  (expect spread to revert downward — exit LONG)
-
-    Only SPY signals are emitted here (QQQ is the reference leg).
-    Allocation: 10% default.
-
-    Spread variance tracked via Welford's sliding-window algorithm (O(1) per tick).
-    """
-
     asset_class = "EQUITY"
-    WINDOW = 30
-    Z_THRESHOLD = 2.0
 
-    def __init__(self, bot_id="equity-pairs", name="Pairs SPY/QQQ", allocation=10,
-                 leg_a="SPY", leg_b="QQQ"):
-        super().__init__(bot_id, name, allocation, "Pairs Mean Reversion")
-        self.leg_a = leg_a
-        self.leg_b = leg_b
+    def __init__(self, bot_id="equity-pairs", name="Pairs SPY/QQQ", allocation=10, **kwargs):
+        super().__init__(bot_id, name, allocation, "Pairs Mean Reversion", **kwargs)
+        self.leg_a = getattr(self, 'leg_a', "SPY")
+        self.leg_b = getattr(self, 'leg_b', "QQQ")
+        self.WINDOW = getattr(self, 'window', 30)
+        self.Z_THRESHOLD = getattr(self, 'z_threshold', 2.0)
+        
         self._price_a: float | None = None
         self._price_b: float | None = None
-        self._spread_history: deque = deque(maxlen=self.WINDOW)
+        
+        self._spreads = deque(maxlen=self.WINDOW)
+        self._welford = {"count": 0, "mean": 0.0, "M2": 0.0}
         self._last_signal: str = "NONE"
-        # Welford sliding-window state for spread variance
-        self._w_mean: float = 0.0
-        self._w_M2:   float = 0.0
-        self._w_n:    int   = 0
 
-    def _update_welford(self, spread: float) -> None:
-        """Welford's sliding-window variance update (O(1)).
-        Must be called BEFORE appending spread to self._spread_history."""
-        n_cur = len(self._spread_history)
-        if n_cur == 0:
-            self._w_mean = spread
-            self._w_M2   = 0.0
-            self._w_n    = 1
-        elif n_cur < self.WINDOW:
-            self._w_n += 1
-            delta = spread - self._w_mean
-            self._w_mean += delta / self._w_n
-            self._w_M2   += delta * (spread - self._w_mean)
-        else:
-            old_x    = self._spread_history[0]
-            old_mean = self._w_mean
-            self._w_mean += (spread - old_x) / self.WINDOW
-            self._w_M2   += (spread - old_x) * (
-                (spread - self._w_mean) + (old_x - old_mean)
-            )
-            self._w_M2 = max(0.0, self._w_M2)
-
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
 
@@ -321,43 +241,45 @@ class EquityPairsStrategy(BaseStrategy):
             return None
 
         spread = self._price_a / self._price_b
-        self._update_welford(spread)
-        self._spread_history.append(spread)
+        w = self._welford
 
-        if len(self._spread_history) < self.WINDOW:
+        # Welford's Algorithm for O(1) Variance
+        if len(self._spreads) == self.WINDOW:
+            old_spread = self._spreads[0]
+            w["count"] -= 1
+            delta = old_spread - w["mean"]
+            w["mean"] -= delta / w["count"]
+            w["M2"] -= delta * (old_spread - w["mean"])
+
+        self._spreads.append(spread)
+        w["count"] += 1
+        delta = spread - w["mean"]
+        w["mean"] += delta / w["count"]
+        w["M2"] += delta * (spread - w["mean"])
+
+        if w["count"] < self.WINDOW:
             return None
 
-        # Only emit signal on leg_a tick to avoid double-firing
+        # Only emit on leg_a tick to avoid double-firing
         if symbol != self.leg_a:
             return None
 
-        mean    = self._w_mean
-        std     = math.sqrt(self._w_M2 / self.WINDOW) if self._w_M2 > 0 else 1e-9
+        mean = w["mean"]
+        variance = w["M2"] / w["count"]
+        std = math.sqrt(variance) if variance > 0 else 1e-9
         z_score = (spread - mean) / std
 
         signal = None
         if z_score < -self.Z_THRESHOLD and self._last_signal != "BUY" and self._is_flat(self.leg_a):
-            confidence = min(0.93, 0.65 + abs(z_score) * 0.08)
             self._last_signal = "BUY"
-            signal = {
-                "bot": self.id, "symbol": self.leg_a, "action": "BUY",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"z_score": round(z_score, 3), "spread_ratio": round(spread, 4),
-                         "mean": round(mean, 4), "std": round(std, 4)}
-            }
+            signal = {"bot": self.id, "symbol": self.leg_a, "action": "BUY", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price}
         elif z_score > self.Z_THRESHOLD and self._last_signal != "SELL" and self._is_long(self.leg_a):
-            confidence = min(0.93, 0.65 + abs(z_score) * 0.08)
             self._last_signal = "SELL"
-            signal = {
-                "bot": self.id, "symbol": self.leg_a, "action": "SELL",
-                "confidence": round(confidence, 3), "price": price,
-                "meta": {"z_score": round(z_score, 3), "spread_ratio": round(spread, 4),
-                         "mean": round(mean, 4), "std": round(std, 4)}
-            }
+            signal = {"bot": self.id, "symbol": self.leg_a, "action": "SELL", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price}
 
         if signal:
             self.signal_count += 1
-            logger.info("[EQUITY-PAIRS] %s/%s z=%.2f → %s %s (conf=%.2f)",
+            logger.info("[EQUITY-PAIRS] %s/%s z=%.2f -> %s %s (conf=%.2f)",
                         self.leg_a, self.leg_b, z_score,
                         signal["action"], self.leg_a, signal["confidence"])
         return signal
@@ -366,10 +288,11 @@ class EquityPairsStrategy(BaseStrategy):
         if symbol not in (self.leg_a, self.leg_b):
             return None
         z_score = None
-        if len(self._spread_history) >= self.WINDOW and self._w_M2 > 0:
-            std     = math.sqrt(self._w_M2 / self.WINDOW)
-            spread  = self._spread_history[-1]
-            z_score = round((spread - self._w_mean) / std, 3)
+        w = self._welford
+        if w["count"] >= self.WINDOW and w["M2"] > 0:
+            std = math.sqrt(w["M2"] / w["count"])
+            spread = self._spreads[-1]
+            z_score = round((spread - w["mean"]) / std, 3)
         return {
             "strategy": self.id,
             "name": self.name,
@@ -380,6 +303,6 @@ class EquityPairsStrategy(BaseStrategy):
             "price_b": self._price_b,
             "z_score": z_score,
             "position_state": self._position_state.get(self.leg_a, FLAT),
-            "ticks_collected": len(self._spread_history),
+            "ticks_collected": w["count"],
             "market_hours": _is_market_hours(),
         }

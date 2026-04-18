@@ -54,8 +54,23 @@ All colors are defined as CSS custom properties in `src/app/globals.css`.
 | Neon Green | `--neon-green` | `hsl(150, 80%, 45%)` | LONG direction, positive PnL, BUY orders, upward delta, profit values. |
 | Neon Red | `--neon-red` | `hsl(350, 80%, 60%)` | SHORT direction, negative PnL, SELL orders, downward delta, loss values. |
 
+### Agent / Reflection Type Colors
+
+Used exclusively in the Brain tab (BotReflections) to color-code agent thought types.
+Defined as CSS variables — never use raw Tailwind palette names (`text-purple-400` is forbidden).
+
+| Token | CSS Variable | Value | Role |
+|-------|-------------|-------|------|
+| Agent Observe | `--agent-observe` | `hsl(270, 60%, 65%)` | OBSERVE — market scan events |
+| Agent Calculate | `--agent-calculate` | `hsl(220, 70%, 65%)` | POSITION — Kelly/sizing events |
+| Agent Scanner | `--agent-scanner` | `hsl(190, 70%, 60%)` | SCANNER — Haiku symbol ranking |
+| Agent Learning | `--agent-learning` | `hsl(40, 80%, 60%)` | LEARNED — strategy amendment |
+
+DECISION (neon-green) and DIRECTOR (kraken-light) reuse existing tokens.
+
 ### Usage Rules
 - **Never use raw hex/RGB** — always reference CSS variable tokens.
+- **Never use raw Tailwind palette colors** (`text-purple-400`, `text-blue-400`, `text-amber-400`, `text-cyan-400`) — define a CSS variable and reference it. Audit finding: `bot-reflections.tsx` originally violated this.
 - **Neon green = LONG/profit only.** Do not use for generic "success" states unrelated to market direction.
 - **Neon red = SHORT/loss only.** Do not use for generic "error" or "danger" states unrelated to market.
 - **Purple = system/brand.** Used for UI chrome, active states, and AI/orchestrator elements.
@@ -140,6 +155,8 @@ Five semantic variants (defined in `src/components/ui/badge.tsx`):
 | `warning` | Amber | Degraded, pending, approaching limit |
 | `outline` | Muted | Inactive, neutral, disabled |
 
+| `purple` | Kraken purple | AI/orchestrator actions, learning events |
+
 All badges: `text-xs font-mono uppercase tracking-wider`
 
 ### 4.4 Inputs
@@ -186,6 +203,26 @@ Defined in `src/components/ui/value-ticker.tsx`. Animated price display with dir
 - Steady state: `text-[var(--foreground)]`
 - Always: `font-mono tabular-nums`
 
+### 4.7b TanStack Table (BotPerformanceMatrix and sortable data tables)
+
+When a data table requires column sorting, use `@tanstack/react-table` with `getSortedRowModel`.
+
+```tsx
+import { useReactTable, getCoreRowModel, getSortedRowModel, flexRender } from '@tanstack/react-table';
+
+// Sort indicator in header cell:
+<th onClick={header.column.getToggleSortingHandler()} className="cursor-pointer select-none">
+  {flexRender(header.column.columnDef.header, header.getContext())}
+  {{ asc: ' ▲', desc: ' ▼' }[header.column.getIsSorted() as string] ?? ''}
+</th>
+```
+
+Rules:
+
+- Do NOT add `ArrowUpDown` icons to column headers that are not wired to actual sorting — it creates false affordance.
+- Table wrapper: `overflow-hidden` when row count ≤ 10; add `overflow-y-auto` only when row count > 10.
+- Sticky header: `sticky top-0 bg-[var(--panel-muted)] z-10`
+
 ### 4.8 Scrollbars
 
 All scrollable containers must use exactly:
@@ -197,6 +234,38 @@ All scrollable containers must use exactly:
 ```
 
 Global default in `globals.css`. Do not override to wider widths in components.
+
+### 4.9 EmptyState Component
+
+All empty/awaiting-data states must use the shared `src/components/ui/empty-state.tsx` component. Do not create bespoke inline empty divs per-component.
+
+```tsx
+<EmptyState
+  icon={<Activity className="w-6 h-6" />}
+  title="Awaiting Execution Data"
+  subtitle="Empty states appear here until the strategy engine connects"
+/>
+```
+
+Visual rules:
+
+- Icon: `opacity-20`, `text-[var(--muted-foreground)]`
+- Title: `text-xs font-mono uppercase tracking-widest text-[var(--muted-foreground)] opacity-50`
+- Subtitle: `text-xs text-[var(--muted-foreground)] opacity-30` (optional)
+- Container: `flex flex-col items-center justify-center gap-2 h-full`
+
+### 4.10 KpiCard Component
+
+The standard KPI metric cell used in GlobalKPIs, TradeLedger, and AnalyticsDashboard. Defined in `src/components/ui/kpi-card.tsx`.
+
+```tsx
+<KpiCard label="Sharpe Ratio" value="1.84" colorClass="text-[var(--neon-green)]" />
+```
+
+Layout: `flex flex-col bg-[var(--panel)] border border-[var(--border)] rounded-sm p-2.5 gap-1`
+
+- Label: `text-xs text-[var(--muted-foreground)] uppercase tracking-wider`
+- Value: `text-sm font-bold font-mono tabular-nums` + semantic color class
 
 ---
 
@@ -237,7 +306,104 @@ Global default in `globals.css`. Do not override to wider widths in components.
 
 ---
 
-## 6. Depth & Elevation
+## 6. Charting Guidelines
+
+### 6.1 Library Roles
+
+| Library                   | Use Case                                                                                                        |
+|---------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `lightweight-charts` (v5) | Real-time OHLCV price charts, equity curves, drawdown panes — time axis, crosshair, live streaming tick updates |
+| `recharts`                | Statistical analytics — histograms, scatter plots, donut/pie attribution, cumulative line charts                |
+
+Never mix both libraries on the same data series. Recharts for analytics; lightweight-charts for price action.
+
+### 6.2 Recharts — Critical Container Rule (width(-1) fix)
+
+`ResponsiveContainer` measures its parent's `offsetHeight`. If the parent's height is resolved via `flex-1` alone (without a committed pixel height in the flex chain), it reports `-1` and the chart renders blank.
+
+**Required pattern:**
+
+```tsx
+{/* Explicit pixel height on the direct parent div */}
+<div style={{ height: 260 }}>
+  <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+    <AreaChart ...>
+```
+
+Never rely solely on `flex-1` for chart container height. Always set `style={{ height: 'Xpx' }}` on the immediate wrapper `div`.
+
+### 6.3 lightweight-charts (v5) — React Integration Pattern
+
+Follow the pattern established in `src/components/dashboard/market-overview.tsx`:
+
+```tsx
+const containerRef = React.useRef<HTMLDivElement>(null);
+const chartRef = React.useRef<IChartApi | null>(null);
+
+React.useEffect(() => {
+  const el = containerRef.current;
+  if (!el || data.length === 0) return;
+  chartRef.current?.remove();
+
+  const chart = createChart(el, {
+    layout: { background: { color: 'transparent' }, textColor: 'hsl(250,10%,65%)', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+    grid:   { vertLines: { visible: false }, horzLines: { visible: false } },
+    autoSize: true,
+  });
+
+  const series = chart.addSeries(AreaSeries, { lineColor: 'var(--neon-green)', ... });
+  series.setData(data);
+  chart.timeScale().fitContent();
+  chartRef.current = chart;
+
+  return () => { chart.remove(); chartRef.current = null; };
+}, [data]);
+
+return <div ref={containerRef} style={{ height: 280 }} />;
+```
+
+Key rules:
+
+- Always call `chart.remove()` in the cleanup function.
+- Use `autoSize: true` — do not set explicit `width`/`height` in chart options.
+- The container `div` must have an explicit `style={{ height: 'Xpx' }}`.
+- Time values must be Unix seconds (`Math.floor(ms / 1000) as Time`), not milliseconds.
+
+### 6.4 Dual-Pane Chart (EquityCurveTerminal)
+
+For the Analytics equity curve with a synced drawdown pane, create two separate `lightweight-charts` instances and sync crosshairs manually:
+
+```tsx
+chart1.subscribeCrosshairMove(param => {
+  if (param.time) chart2.setCrosshairPosition(param.point?.x ?? 0, param.point?.y ?? 0, series2);
+  else chart2.clearCrosshairPosition();
+});
+```
+
+Pane proportions: top equity pane `65%` height, bottom drawdown pane `35%`. Both in a `flex-col` wrapper with explicit total height.
+
+### 6.5 Chart Color Tokens
+
+Always use HSL values (not CSS var references) inside `lightweight-charts` options, since the chart renders to a canvas and cannot read CSS variables:
+
+| Semantic      | Value to use                              |
+|---------------|-------------------------------------------|
+| Equity up     | `hsl(150, 80%, 45%)` (neon-green)         |
+| Equity down   | `hsl(350, 80%, 60%)` (neon-red)           |
+| Benchmark     | `hsl(264, 80%, 65%)` (kraken-purple)      |
+| Drawdown fill | `hsla(350, 80%, 60%, 0.25)`               |
+| Grid / axis   | `hsla(255, 40%, 40%, 0.15)` (border)      |
+| Label text    | `hsl(250, 10%, 65%)` (muted-foreground)   |
+
+For recharts, CSS variables work fine in `stroke` and `fill` props since they resolve in the SVG context.
+
+### 6.6 No Inner Scroll on Charts or Short Tables
+
+Charts must never have a scroll container. Tables with 10 or fewer rows must not scroll — use `overflow-hidden` on the table wrapper. Only add `overflow-y-auto` when row count exceeds 10.
+
+---
+
+## 7. Depth & Elevation
 
 ### Surface Hierarchy
 
@@ -268,26 +434,38 @@ Global default in `globals.css`. Do not override to wider widths in components.
 ## 7. Do's and Don'ts
 
 ### DO
+
 - Use `rounded-sm` (2px) as the maximum corner radius everywhere.
 - Apply `tabular-nums font-mono` to every price, size, percentage, and timestamp.
-- Use CSS variable tokens for every color — no raw hex in component files.
+- Use CSS variable tokens for every color — no raw hex or raw Tailwind palette names in component files.
 - Use `gap-1` or `gap-2` inside panels; `p-3` for card content padding.
 - Use framer-motion for tab transitions and micro-interactions (opacity + Y offset).
 - Show `SYNCING...` or a loading skeleton when data is not yet available.
 - Use the `useEffect(() => setMounted(true), [])` pattern for any value that differs between server and client render (clocks, random seeds, live prices).
 - Scroll containers get `overflow-y-auto` + 2px scrollbar only.
+- Wrap every recharts `ResponsiveContainer` parent in a `div` with explicit `style={{ height: 'Xpx' }}`.
+- Wrap every `lightweight-charts` container `div` with explicit `style={{ height: 'Xpx' }}` and `autoSize: true`.
+- Use `@tanstack/react-table` for any table that requires column sorting.
+- Use the shared `EmptyState` component for all awaiting-data fallbacks.
+- Use the shared `KpiCard` component for all label/value metric cells.
+- Centralize all polling intervals (`setInterval`) inside `useTradingEngine()` — never in individual view components.
 
 ### DON'T
+
 - **Never** use `rounded`, `rounded-md`, `rounded-lg`, or `rounded-full` for UI containers.
 - **Never** use arbitrary border-radius values like `rounded-[6px]`.
-- **Never** use arbitrary font sizes like `text-[13px]` — use the type hierarchy scale.
-- **Never** use raw hex colors in JSX className strings.
+- **Never** use arbitrary font sizes like `text-[13px]` or `text-[10px]` — use the type hierarchy scale.
+- **Never** use raw hex colors or raw Tailwind palette names (`text-purple-400`, `text-blue-400`, `text-amber-400`) in JSX className strings — define a CSS variable.
 - **Never** use `suppressHydrationWarning` as a patch for dynamic content — fix the hydration root cause.
 - **Never** render prices or live numbers during SSR without a mount guard.
 - **Never** use green/red for generic UI states unrelated to market direction.
 - **Never** use `gap-4` or larger inside panel components.
 - **Never** add `rounded-full` to badges or status indicators.
 - **Never** display raw API error objects — surface user-friendly status text.
+- **Never** place a `ResponsiveContainer` inside a flex container that has no committed pixel height in the flex chain.
+- **Never** add sort icons (`ArrowUpDown`) to table column headers that are not wired to actual sort handlers.
+- **Never** add a `max-h` scroll zone inside an already-scrollable card — it creates double-scroll UX.
+- **Never** create per-component `setInterval` timers for API polling — register them in `useTradingEngine()`.
 
 ---
 
@@ -388,8 +566,62 @@ if (!mounted) return null; // or a static skeleton
 ### Status Badge Usage
 ```tsx
 import { Badge } from "@/components/ui/badge";
-<Badge variant="success">ACTIVE</Badge>   // running strategy
-<Badge variant="destructive">HALTED</Badge> // stopped
-<Badge variant="warning">DEGRADED</Badge>  // partial failure
-<Badge variant="outline">IDLE</Badge>      // not running
+<Badge variant="success">ACTIVE</Badge>      // running strategy
+<Badge variant="destructive">HALTED</Badge>  // stopped
+<Badge variant="warning">DEGRADED</Badge>    // partial failure
+<Badge variant="outline">IDLE</Badge>        // not running
+<Badge variant="purple">LEARNED</Badge>      // AI/orchestrator action
+```
+
+### Recharts Chart Container Template
+
+```tsx
+{/* Always use explicit pixel height on the wrapper — never flex-1 alone */}
+<div style={{ height: 260 }}>
+  <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+    <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: 48 }}
+               style={{ background: 'transparent', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
+      <CartesianGrid strokeDasharray="4 4" stroke="var(--border)" strokeOpacity={0.4} vertical={false} />
+      <XAxis tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} stroke="var(--border)" tickLine={false} axisLine={false} />
+      <YAxis tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} stroke="var(--border)" tickLine={false} axisLine={false} />
+      <Tooltip contentStyle={{ background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 2 }} />
+    </AreaChart>
+  </ResponsiveContainer>
+</div>
+```
+
+### Agent Reflection Type Filter Button Template
+
+```tsx
+{/* Use CSS variable tokens — never raw Tailwind palette classes */}
+<button
+  onClick={() => setFilter(type)}
+  className={`px-2 py-0.5 text-xs rounded-sm font-mono transition-all ${
+    active ? 'text-[var(--agent-observe)] bg-white/10' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+  }`}
+>
+  {label}
+</button>
+```
+
+### TanStack Sortable Table Template
+
+```tsx
+import { useReactTable, getCoreRowModel, getSortedRowModel, flexRender,
+         createColumnHelper, SortingState } from '@tanstack/react-table';
+
+const [sorting, setSorting] = React.useState<SortingState>([]);
+const table = useReactTable({
+  data, columns,
+  state: { sorting },
+  onSortingChange: setSorting,
+  getCoreRowModel: getCoreRowModel(),
+  getSortedRowModel: getSortedRowModel(),
+});
+
+// Header cell with sort indicator:
+<th onClick={h.column.getToggleSortingHandler()} className="cursor-pointer select-none text-left p-2 text-xs uppercase tracking-wider text-[var(--muted-foreground)]">
+  {flexRender(h.column.columnDef.header, h.getContext())}
+  {({ asc: ' ▲', desc: ' ▼' } as Record<string, string>)[h.column.getIsSorted() as string] ?? ''}
+</th>
 ```

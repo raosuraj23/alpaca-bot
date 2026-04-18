@@ -135,11 +135,15 @@ class ExecutionAgent:
             from alpaca.trading.enums import OrderSide, TimeInForce
 
             side  = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+            # Alpaca requires DAY for fractional equity orders (error 42210000 with GTC)
+            is_crypto    = "/" in symbol
+            is_fractional = (qty % 1) != 0
+            tif = TimeInForce.DAY if (not is_crypto and is_fractional) else TimeInForce.GTC
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=side,
-                time_in_force=TimeInForce.GTC,
+                time_in_force=tif,
             )
 
             result = trading_client.submit_order(order_data=order)

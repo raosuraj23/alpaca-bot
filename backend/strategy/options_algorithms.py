@@ -79,8 +79,8 @@ class CoveredCallStrategy(BaseStrategy):
     MAX_RSI         = 68.0
     COOLDOWN_TICKS  = 50
 
-    def __init__(self, bot_id="covered-call", name="Covered Call Writer", allocation=5):
-        super().__init__(bot_id, name, allocation, "Covered Call")
+    def __init__(self, bot_id="covered-call", name="Covered Call Writer", allocation=5, **kwargs):
+        super().__init__(bot_id, name, allocation, "Covered Call", **kwargs)
         self._ema_short:   dict[str, float] = {}
         self._ema_long:    dict[str, float] = {}
         self._prices:      dict[str, deque] = {}
@@ -122,7 +122,7 @@ class CoveredCallStrategy(BaseStrategy):
         loss = self._avg_loss[symbol]
         self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
         self._update_ema(symbol, price)
@@ -207,8 +207,8 @@ class ProtectivePutStrategy(BaseStrategy):
     COOLDOWN_TICKS   = 30
     ANNUALISE_FACTOR = 252 ** 0.5
 
-    def __init__(self, bot_id="protective-put", name="Protective Put", allocation=3):
-        super().__init__(bot_id, name, allocation, "Protective Put")
+    def __init__(self, bot_id="protective-put", name="Protective Put", allocation=3, **kwargs):
+        super().__init__(bot_id, name, allocation, "Protective Put", **kwargs)
         self._returns:    dict[str, deque] = {}
         self._last_price: dict[str, float] = {}
         self._rsi_prices: dict[str, deque] = {}
@@ -283,7 +283,7 @@ class ProtectivePutStrategy(BaseStrategy):
         loss = self._avg_loss[symbol]
         self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
         ann_vol = self._update_vol(symbol, price)

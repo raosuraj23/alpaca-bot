@@ -1,5 +1,6 @@
 "use client"
 
+import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -12,7 +13,19 @@ export function PositionsTable() {
   const positions    = useTradingStore(s => s.positions);
   const recentTrades = useTradingStore(s => s.recentTrades);
   const ledgerTrades = useTradingStore(s => s.ledgerTrades);
-  const performance  = useTradingStore(s => s.performance);
+
+  const [todayPl, setTodayPl] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    const load = () =>
+      fetch(`${API_BASE}/api/account`, { signal: AbortSignal.timeout(8000) })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) setTodayPl(Number(d.today_pl ?? 0)); })
+        .catch(() => {});
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   // Build a realized-PnL lookup from ledger: keyed by Alpaca order_id (first 8 chars)
   // Ledger rows have fill_price + slippage from the execution agent — we can derive
@@ -54,9 +67,13 @@ export function PositionsTable() {
         </div>
         <div className="text-xs font-mono font-bold text-[var(--foreground)]">
           DAY PNL:{' '}
-          <span className={performance.net_pnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
-            {performance.net_pnl >= 0 ? '+' : ''}${performance.net_pnl.toFixed(2)}
-          </span>
+          {todayPl != null ? (
+            <span className={todayPl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
+              {todayPl >= 0 ? '+' : ''}${todayPl.toFixed(2)}
+            </span>
+          ) : (
+            <span className="text-[var(--muted-foreground)] opacity-40">—</span>
+          )}
         </div>
       </CardHeader>
 

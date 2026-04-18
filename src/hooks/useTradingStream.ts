@@ -114,12 +114,15 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   fetchMarketHistory: async (s: string) => {
     try {
       const encoded = encodeURIComponent(s);
-      const res = await fetch(`${API_BASE}/api/market/history?symbol=${encoded}`);
+      const res = await fetch(`${API_BASE}/api/market/history?symbol=${encoded}`, {
+        signal: AbortSignal.timeout(5000)
+      });
       if (res.ok) {
         set({ marketHistory: await res.json() });
       }
     } catch (err) {
       console.error('[ORCHESTRATOR] Error fetching market history', err);
+      // Don't retry immediately, let the periodic refresh handle it
     }
   },
 

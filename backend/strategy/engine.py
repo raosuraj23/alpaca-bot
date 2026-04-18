@@ -7,6 +7,9 @@ bot lifecycle management (halt, resume, allocation updates).
 """
 
 import logging
+import asyncio
+from typing import Callable, Optional
+
 from strategy.algorithms import MomentumStrategy, StatArbStrategy, HighFrequencyStrategy
 from strategy.equity_algorithms import EquityMomentumStrategy, EquityRSIStrategy, EquityPairsStrategy, EQUITY_SYMBOLS
 from strategy.options_algorithms import CoveredCallStrategy, ProtectivePutStrategy
@@ -18,21 +21,29 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyEngine:
-    def __init__(self):
+    def __init__(self, ws_subscribe_callback: Optional[Callable[[list[str]], None]] = None):
+        self.ws_subscribe_callback = ws_subscribe_callback
         # Start with the base crypto set; scanner discovery updates this at runtime
         self.active_crypto_symbols: set[str] = set(CRYPTO_SYMBOLS_BASE)
-        self.bots: dict = {
+        
+        # Refactor: Use a registry/factory for clean instantiation
+        self._strategy_classes = {
             # ── Crypto ────────────────────────────────────────────────────
-            "momentum-alpha":   MomentumStrategy(),
-            "statarb-gamma":    StatArbStrategy(),
-            "hft-sniper":       HighFrequencyStrategy(),
+            "momentum-alpha":   MomentumStrategy,
+            "statarb-gamma":    StatArbStrategy,
+            "hft-sniper":       HighFrequencyStrategy,
             # ── Equity ────────────────────────────────────────────────────
-            "equity-momentum":  EquityMomentumStrategy(),
-            "equity-rsi":       EquityRSIStrategy(),
-            "equity-pairs":     EquityPairsStrategy(),
+            "equity-momentum":  EquityMomentumStrategy,
+            "equity-rsi":       EquityRSIStrategy,
+            "equity-pairs":     EquityPairsStrategy,
             # ── Options ───────────────────────────────────────────────────
-            "covered-call":     CoveredCallStrategy(),
-            "protective-put":   ProtectivePutStrategy(),
+            "covered-call":     CoveredCallStrategy,
+            "protective-put":   ProtectivePutStrategy,
+        }
+        
+        # Instantiate base bots
+        self.bots: dict = {
+            name: cls() for name, cls in self._strategy_classes.items()
         }
         self._last_prices: dict[str, float] = {}  # last known tick price per symbol
 
@@ -57,8 +68,7 @@ class StrategyEngine:
         return True
 
     def spawn_variant(self, source_bot_id: str, new_bot_id: str, params: dict) -> bool:
-        """Instantiate a fresh strategy variant from the same class as source_bot_id.
-        Returns False if source bot not found or new_bot_id already exists."""
+        """Properly instantiate a new bot using the factory pattern."""
         if new_bot_id in self.bots:
             logger.warning("[ENGINE] spawn_variant: %s already exists", new_bot_id)
             return False
@@ -66,26 +76,35 @@ class StrategyEngine:
         if not source:
             logger.warning("[ENGINE] spawn_variant: source %s not found", source_bot_id)
             return False
-        StrategyClass = type(source)
-        variant = StrategyClass(
-            bot_id=new_bot_id,
-            name=f"{source.name} [variant]",
-            allocation=source.allocation,
-        )
+            
+        # Get the class type of the source bot
+        bot_class = type(source)
+        
+        # Clean instantiation
+        variant = bot_class()
+        variant.id = new_bot_id
+        variant.name = f"{source.name} [variant]"
+        variant.allocation = getattr(source, "allocation", 0.0)
         variant.status = "ACTIVE"
         variant.update_params(params)
+        
         self.bots[new_bot_id] = variant
         logger.info("[ENGINE] Spawned variant %s from %s with params %s",
                     new_bot_id, source_bot_id, params)
         return True
 
     def set_active_crypto_symbols(self, symbols: set[str]) -> None:
-        """Called by the scanner agent when it discovers new high-priority symbols.
-        Always merges with the base set so BTC/ETH/SOL are never dropped."""
+        """Merges new symbols and commands the WebSocket to subscribe."""
         merged = CRYPTO_SYMBOLS_BASE | {s for s in symbols if s.endswith("/USD")}
-        if merged != self.active_crypto_symbols:
-            logger.info("[ENGINE] Crypto symbol set updated: %s", sorted(merged))
+        new_symbols = merged - self.active_crypto_symbols
+        
+        if new_symbols:
+            logger.info("[ENGINE] Discovering new symbols: %s", list(new_symbols))
             self.active_crypto_symbols = merged
+            
+            # CRITICAL FIX: Actually subscribe to the data stream!
+            if self.ws_subscribe_callback:
+                self.ws_subscribe_callback(list(new_symbols))
 
     # ------------------------------------------------------------------
     # State Queries
@@ -203,41 +222,42 @@ class StrategyEngine:
         """Returns the most recently seen tick price for a symbol, or None."""
         return self._last_prices.get(symbol)
 
-    def process_tick(self, symbol: str, price: float) -> list[dict]:
-        """
-        Feeds a price tick to ACTIVE strategies whose asset class matches the symbol.
-
-        Routing:
-          Crypto symbols  → CRYPTO bots only
-          Equity symbols  → EQUITY + OPTIONS bots only
-        """
+    async def process_tick(self, symbol: str, price: float) -> list[dict]:
+        """Asynchronously dispatches price updates to active bots."""
         self._last_prices[symbol] = price
-        signals = []
-
+        
         is_crypto = symbol in self.active_crypto_symbols
         is_equity = symbol in EQUITY_SYMBOL_SET
 
+        # Filter active bots relevant to this asset class
+        active_bots = []
         for bot in self.bots.values():
             if bot.status != "ACTIVE":
                 continue
-
             asset_class = getattr(bot, "asset_class", "CRYPTO")
+            if is_crypto and asset_class == "CRYPTO":
+                active_bots.append(bot)
+            elif is_equity and asset_class in ("EQUITY", "OPTIONS"):
+                active_bots.append(bot)
 
-            if is_crypto and asset_class != "CRYPTO":
-                continue
-            if is_equity and asset_class not in ("EQUITY", "OPTIONS"):
-                continue
-            if not is_crypto and not is_equity:
-                continue  # unknown symbol — skip
+        if not active_bots:
+            return []
 
-            signal = bot.analyze(symbol, price)
+        # Run analysis concurrently to prevent event loop blocking
+        # If bot.analyze is heavy math, it should ideally be run in asyncio.to_thread()
+        tasks = [bot.aanalyze(symbol, price) for bot in active_bots]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        valid_signals = []
+        for bot, signal in zip(active_bots, results):
+            if isinstance(signal, Exception):
+                logger.error(f"[ENGINE] {bot.name} crashed on tick: {signal}")
+                continue
             if signal:
-                logger.info(
-                    "[ENGINE] %s → %s %s @ $%.4f (conf=%.2f)",
-                    bot.name, signal["action"], symbol, price, signal["confidence"]
-                )
-                signals.append(signal)
-        return signals
+                logger.info("[ENGINE] %s -> %s %s", bot.name, signal["action"], symbol)
+                valid_signals.append(signal)
+
+        return valid_signals
 
 
 # Global singleton — shared across FastAPI request handlers and the stream manager.

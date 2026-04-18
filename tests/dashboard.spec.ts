@@ -10,7 +10,7 @@ test.describe('Automated Bot Terminal Verification', () => {
 
     // Verify Tab routing
     await expect(page.locator('text=Desk')).toBeVisible();
-    await expect(page.locator('text=Analysis')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Analysis' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Bots' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Ledger' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Brain' })).toBeVisible();
@@ -28,11 +28,30 @@ test.describe('Automated Bot Terminal Verification', () => {
     await page.goto('/');
     
     // Tap the Analysis tab
-    await page.locator('text=Analysis').click();
+    await page.getByRole('button', { name: 'Analysis' }).click();
     
-    // Validate the Strategy attribution module loaded correctly (analyst dashboard)
-    await expect(page.locator('text=Strategy Attribution')).toBeVisible();
+    // Validate the Analytics dashboard loaded correctly
     await expect(page.locator('text=Equity Curve')).toBeVisible();
+    await expect(page.locator('text=Bot Performance Matrix')).toBeVisible();
+  });
+
+  test('Analysis charts render with valid bounds and no zero-size warnings', async ({ page }) => {
+    const messages: string[] = [];
+    page.on('console', msg => {
+      if (msg.type() === 'warning' || msg.type() === 'error') {
+        messages.push(msg.text());
+      }
+    });
+
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Analysis' }).click();
+
+    await expect(page.locator('text=Return Distribution')).toBeVisible();
+    await expect(page.locator('text=Cumulative PnL').first()).toBeVisible();
+    await expect(page.locator('text=Equity Curve')).toBeVisible();
+
+    await page.waitForTimeout(500);
+    expect(messages).not.toContainEqual(expect.stringContaining('The width(-1) and height(-1) of chart should be greater than 0'));
   });
 
 });

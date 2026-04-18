@@ -3,7 +3,7 @@
 import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot } from 'lucide-react';
+import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot, Sparkles } from 'lucide-react';
 import { Badge } from "@/components/ui/badge";
 import { useTradingStore } from '@/hooks/useTradingStream';
 
@@ -40,6 +40,7 @@ const TYPE_STYLES: Record<string, { icon: typeof Zap; label: string; color: stri
   decision:  { icon: Zap,            label: 'DECISION',  color: 'text-[var(--neon-green)]',           border: 'border-[var(--neon-green)]/40',       bg: 'bg-[var(--neon-green)]/5' },
   learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-amber-400',                     border: 'border-amber-500/30',                 bg: 'bg-amber-500/5' },
   director:  { icon: Bot,            label: 'DIRECTOR',  color: 'text-[var(--kraken-light)]',         border: 'border-[var(--kraken-purple)]/50',    bg: 'bg-[var(--kraken-purple)]/8' },
+  scanner:   { icon: Sparkles,       label: 'SCANNER',   color: 'text-cyan-400',                      border: 'border-cyan-500/30',                  bg: 'bg-cyan-500/5' },
 };
 
 function getTypeStyle(type: string | undefined) {
@@ -60,6 +61,18 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
   const time = formatTimestamp(r.timestamp);
   const strategy = r.strategy ?? 'system';
   const symbol = r.symbol ?? '';
+
+  // Scanner events — Haiku-ranked symbol picks
+  if (r.type === 'scanner') {
+    const results = (r as any).results as any[] | undefined;
+    if (results && results.length > 0) {
+      const top = results[0];
+      const picks = results.slice(0, 3).map((x: any) => `${x.symbol}(${x.signal})`).join(' · ');
+      const text = `Top picks: ${picks} — ${top.symbol}: ${top.verdict ?? top.summary ?? ''}`;
+      return { time, type: 'scanner', text, strategy: 'scanner', symbol: top.symbol ?? '' };
+    }
+    return { time, type: 'scanner', text: r.text ?? 'Scanner update', strategy: 'scanner', symbol: '' };
+  }
 
   // Director autonomous action events
   if (r.type === 'director') {
@@ -96,7 +109,7 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
 // ---------------------------------------------------------------------------
 // Filter types
 // ---------------------------------------------------------------------------
-type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director';
+type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director' | 'scanner';
 const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
   { value: 'ALL',       label: 'All',        color: 'text-[var(--foreground)]' },
   { value: 'observe',   label: 'Observe',    color: 'text-purple-400' },
@@ -104,6 +117,7 @@ const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
   { value: 'decision',  label: 'Decision',   color: 'text-[var(--neon-green)]' },
   { value: 'learning',  label: 'Learning',   color: 'text-amber-400' },
   { value: 'director',  label: 'Director',   color: 'text-[var(--kraken-light)]' },
+  { value: 'scanner',   label: 'Scanner',    color: 'text-cyan-400' },
 ];
 
 // ---------------------------------------------------------------------------

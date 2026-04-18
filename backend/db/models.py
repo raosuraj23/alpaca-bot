@@ -1,132 +1,128 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey, Index
+from decimal import Decimal
+from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey
 from db.database import Base
-
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+# ---------------------------------------------------------
+# SIGNAL & EXECUTION LAYER
+# ---------------------------------------------------------
 
 class SignalRecord(Base):
-    """Tracks generated sub-signals from the Strategy Engine."""
+    """Tracks generated sub-signals natively from the Strategy Engine."""
     __tablename__ = "signals"
 
-    id         = Column(Integer, primary_key=True, index=True)
-    strategy   = Column(String(50), index=True)
-    symbol     = Column(String(20), index=True)
-    action     = Column(String(10))  # BUY/SELL/HALT
-    confidence = Column(Numeric(6, 4), default=0.0)
-    timestamp  = Column(DateTime(timezone=True), default=_utcnow, index=True)
-    processed  = Column(Boolean, default=False)
-
+    id = Column(Integer, primary_key=True, index=True)
+    strategy = Column(String(50), index=True)
+    symbol = Column(String(20), index=True)
+    action = Column(String(10)) # BUY/SELL/HALT
+    confidence = Column(Numeric(5, 4)) # e.g., 0.9521
+    timestamp = Column(DateTime(timezone=True), default=_utcnow)
+    processed = Column(Boolean, default=False)
 
 class ExecutionRecord(Base):
     """Tracks physical Alpaca executions correlating to algorithmic signals."""
     __tablename__ = "executions"
 
-    id               = Column(Integer, primary_key=True, index=True)
-    signal_id        = Column(Integer, ForeignKey("signals.id"))
-    alpaca_order_id  = Column(String(50), nullable=True, index=True)
-    fill_price       = Column(Numeric(18, 8), default=0.0)
-    qty              = Column(Numeric(18, 8), default=1.0)
-    slippage         = Column(Numeric(18, 8), default=0.0)
-    status           = Column(String(20), default="FILLED")
-    failure_reason   = Column(String(500), nullable=True)
-    timestamp        = Column(DateTime(timezone=True), default=_utcnow)
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, ForeignKey("signals.id"))
+    alpaca_order_id = Column(String(50), unique=True, index=True) # CRITICAL: Indexed for Webhooks
+    side = Column(String(10)) # BUY / SELL
+    fill_price = Column(Numeric(18, 8), default=Decimal('0.0'))   # Precision for Crypto/Equities
+    qty = Column(Numeric(18, 8), default=Decimal('0.0'))          
+    commission = Column(Numeric(10, 4), default=Decimal('0.0'))   # Must track fees for Net PnL
+    slippage = Column(Numeric(18, 8), default=Decimal('0.0'))
+    status = Column(String(20), default="FILLED")
+    failure_reason = Column(String(500), nullable=True)
+    timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
 
+# ---------------------------------------------------------
+# PNL & PORTFOLIO LAYER (NEW - FIXES THE BUG)
+# ---------------------------------------------------------
 
 class ClosedTrade(Base):
-    """Full round-trip trade record (FIFO BUY→SELL reconciliation)."""
+    """Tracks a full round-trip trade for highly accurate Realized PnL reporting."""
     __tablename__ = "closed_trades"
 
-    id                  = Column(Integer, primary_key=True, index=True)
-    bot_id              = Column(String(50), index=True)
-    symbol              = Column(String(20), index=True)
-    direction           = Column(String(10), default="LONG")   # LONG | SHORT
-    entry_execution_id  = Column(Integer, ForeignKey("executions.id"), nullable=True)
-    exit_execution_id   = Column(Integer, ForeignKey("executions.id"), nullable=True)
-    entry_price         = Column(Numeric(18, 8), default=0.0)
-    exit_price          = Column(Numeric(18, 8), default=0.0)
-    qty                 = Column(Numeric(18, 8), default=0.0)
-    realized_pnl        = Column(Numeric(18, 8), default=0.0)
-    entry_time          = Column(DateTime(timezone=True), nullable=True)
-    exit_time           = Column(DateTime(timezone=True), nullable=True, index=True)
-
-
-# Composite index for efficient bot+symbol closed-trade lookups
-Index("ix_closed_trades_bot_symbol", ClosedTrade.bot_id, ClosedTrade.symbol)
-
+    id = Column(Integer, primary_key=True, index=True)
+    bot_id = Column(String(50), ForeignKey("bot_states.bot_id"), index=True)
+    symbol = Column(String(20), index=True)
+    entry_time = Column(DateTime(timezone=True))
+    exit_time = Column(DateTime(timezone=True), index=True)
+    qty = Column(Numeric(18, 8))
+    avg_entry_price = Column(Numeric(18, 8))
+    avg_exit_price = Column(Numeric(18, 8))
+    realized_pnl = Column(Numeric(18, 4))        # Gross PnL
+    net_pnl = Column(Numeric(18, 4))             # Realized PnL minus commissions
+    win = Column(Boolean)                        # Fast querying for win-rate
 
 class PortfolioSnapshot(Base):
-    """60-second equity snapshots for Sharpe/Sortino and drawdown tracking."""
+    """Time-series equity curve for fast UI rendering (bypasses Alpaca API limits)."""
     __tablename__ = "portfolio_snapshots"
 
-    id           = Column(Integer, primary_key=True, index=True)
-    equity       = Column(Numeric(18, 2), default=0.0)
-    drawdown_pct = Column(Numeric(10, 6), default=0.0)
-    timestamp    = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    total_equity = Column(Numeric(18, 4))
+    cash_balance = Column(Numeric(18, 4))
+    unrealized_pnl = Column(Numeric(18, 4))
+    realized_pnl_day = Column(Numeric(18, 4))
 
-
-class BotAmend(Base):
-    """Tracks deep historical parameter adjustments from Agent insights."""
-    __tablename__ = "bot_amends"
-
-    id          = Column(Integer, primary_key=True, index=True)
-    model       = Column(String(50))
-    action      = Column(String(50))
-    target_bot  = Column(String(50), nullable=True)
-    reason      = Column(String(500))
-    impact      = Column(String(100))
-    params_json = Column(String(500), nullable=True)
-    timestamp   = Column(DateTime(timezone=True), default=_utcnow)
-
+# ---------------------------------------------------------
+# AGENT & SYSTEM LAYER
+# ---------------------------------------------------------
 
 class BotState(Base):
     """Persists bot halt/resume state across server restarts."""
     __tablename__ = "bot_states"
 
-    id         = Column(Integer, primary_key=True)
-    bot_id     = Column(String(50), unique=True, index=True)
-    status     = Column(String(20), default="ACTIVE")  # ACTIVE | HALTED
-    allocation = Column(Numeric(8, 4), default=0.0)
+    id = Column(Integer, primary_key=True)
+    bot_id = Column(String(50), unique=True, index=True)
+    status = Column(String(20), default="ACTIVE")     
+    allocation = Column(Numeric(18, 4), default=Decimal('0.0')) # Swapped to Numeric
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
-
-class ReflectionLog(Base):
-    """Stores post-trade AI insights with optional FK to the triggering execution."""
-    __tablename__ = "reflection_logs"
-
-    id           = Column(Integer, primary_key=True, index=True)
-    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
-    strategy     = Column(String(50), index=True)
-    symbol       = Column(String(20))
-    action       = Column(String(10))
-    insight      = Column(String(500))
-    tokens_used  = Column(Integer, nullable=True)
-    timestamp    = Column(DateTime(timezone=True), default=_utcnow)
-
-
 class LLMUsage(Base):
-    """Tracks per-call LLM token consumption and USD cost."""
+    """Tracks per-call LLM token consumption and USD cost for cost-vs-PnL analysis."""
     __tablename__ = "llm_usage"
 
-    id         = Column(Integer, primary_key=True, index=True)
-    model      = Column(String(50))
-    tokens_in  = Column(Integer, default=0)
+    id = Column(Integer, primary_key=True, index=True)
+    model = Column(String(50))                          
+    tokens_in = Column(Integer, default=0)
     tokens_out = Column(Integer, default=0)
-    cost_usd   = Column(Numeric(10, 6), default=0.0)
-    purpose    = Column(String(50))  # "reflection" | "scanner" | "orchestrator"
-    timestamp  = Column(DateTime(timezone=True), default=_utcnow)
+    cost_usd = Column(Numeric(10, 6), default=Decimal('0.0')) # 6 decimal places for micro-cents
+    purpose = Column(String(50))                          
+    timestamp = Column(DateTime(timezone=True), default=_utcnow)
 
+class BotAmend(Base):
+    __tablename__ = "bot_amends"
+    id = Column(Integer, primary_key=True, index=True)
+    model = Column(String(50))
+    action = Column(String(50))
+    target_bot = Column(String(50), nullable=True)       
+    reason = Column(String(500))
+    impact = Column(String(100))                     
+    params_json = Column(String(500), nullable=True)      
+    timestamp = Column(DateTime(timezone=True), default=_utcnow)
+
+class ReflectionLog(Base):
+    __tablename__ = "reflection_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
+    strategy = Column(String(50), index=True)
+    symbol = Column(String(20))
+    action = Column(String(10))
+    insight = Column(String(500))
+    tokens_used = Column(Integer, nullable=True)
+    timestamp = Column(DateTime(timezone=True), default=_utcnow)
 
 class WatchlistItem(Base):
-    """Scanner Agent output — persisted symbol scores and Haiku verdicts."""
     __tablename__ = "watchlist_items"
-
-    id           = Column(Integer, primary_key=True, index=True)
-    symbol       = Column(String(20), unique=True, index=True)
-    score        = Column(Numeric(8, 4), default=0.0)
-    signal       = Column(String(10), default="NEUTRAL")  # BUY / SELL / NEUTRAL
-    verdict      = Column(String(200), nullable=True)
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), unique=True, index=True)
+    score = Column(Numeric(5, 4), default=Decimal('0.0')) 
+    signal = Column(String(10), default="NEUTRAL") 
+    verdict = Column(String(200), nullable=True)   
     last_scanned = Column(DateTime(timezone=True), default=_utcnow)
-    active       = Column(Boolean, default=True)
+    active = Column(Boolean, default=True)

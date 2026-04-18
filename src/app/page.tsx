@@ -131,7 +131,7 @@ export default function AppShell() {
       </header>
 
       {/* Main Viewport Container */}
-      <main className="flex-1 overflow-hidden relative p-4">
+      <main className="flex-1 overflow-hidden relative p-4 min-h-0">
         <AnimatePresence mode="wait">
           <motion.div
             key={activeTab}
@@ -139,7 +139,7 @@ export default function AppShell() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -5 }}
             transition={{ duration: 0.15, ease: "easeOut" }}
-            className="h-full"
+            className="h-full min-h-0"
           >
             {renderView()}
           </motion.div>
@@ -161,7 +161,7 @@ function TabButton({ active, onClick, children, icon }: { active: boolean, onCli
         }
       `}
     >
-      <span className="w-3 h-3 shrink-0 opacity-75">{icon}</span>
+      <span className="inline-flex items-center shrink-0 opacity-75 [&>svg]:w-3 [&>svg]:h-3">{icon}</span>
       <span>{children}</span>
       {active && (
         <motion.div
