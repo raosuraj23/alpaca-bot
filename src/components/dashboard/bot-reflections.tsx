@@ -2,6 +2,14 @@
 
 import { API_BASE } from '@/lib/api';
 import * as React from 'react';
+import {
+  useReactTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  flexRender,
+  type ColumnDef,
+  type SortingState,
+} from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot, Sparkles, Activity } from 'lucide-react';
 import { Badge } from "@/components/ui/badge";
@@ -66,7 +74,6 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
   const strategy = r.strategy ?? 'system';
   const symbol   = r.symbol ?? '';
 
-  // Scanner events — Haiku-ranked symbol picks
   if (r.type === 'scanner') {
     const results = (r as any).results as any[] | undefined;
     if (results && results.length > 0) {
@@ -80,19 +87,16 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
     return { time, type: 'scanner', text: r.text ?? 'Scanner update', strategy: 'scanner', symbol: '' };
   }
 
-  // Director autonomous action events
   if (r.type === 'director') {
     const status = r.success === false ? '✗' : '✓';
     const text   = `[${status}] ${r.action ?? 'ACTION'} → ${r.target_bot ?? 'portfolio'}: ${r.reason ?? ''}`;
     return { time, type: 'director', text, strategy: 'director', symbol: r.target_bot ?? '' };
   }
 
-  // Pre-formatted text field
   if (r.text) {
     return { time, type: r.type ?? 'observe', text: r.text, strategy, symbol };
   }
 
-  // Legacy format: action + symbol signals
   if (r.action && r.symbol) {
     const meta    = r.meta ?? {};
     const metaStr = Object.entries(meta)
@@ -126,7 +130,7 @@ const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Director Status Strip — surfaces last director actions prominently
+// Director Status Strip
 // ---------------------------------------------------------------------------
 
 function DirectorStatus({ entries }: { entries: ReturnType<typeof reflectionToDisplay>[] }) {
@@ -155,6 +159,227 @@ function DirectorStatus({ entries }: { entries: ReturnType<typeof reflectionToDi
 }
 
 // ---------------------------------------------------------------------------
+// Strategy Mental Model Row type
+// ---------------------------------------------------------------------------
+
+type MentalModelRow = {
+  symbol: string;
+  strategyId: string;
+  name: string;
+  botStatus: string;
+  summary: string;
+  biasColor: string;
+};
+
+function buildMentalModelRow(symbol: string, state: any): MentalModelRow {
+  const strategyId = state.strategy ?? 'unknown';
+  const name       = state.name ?? strategyId;
+  const botStatus  = state.bot_status ?? 'UNKNOWN';
+
+  let summary   = '';
+  let biasColor = 'text-[var(--muted-foreground)]';
+
+  if (strategyId === 'momentum-alpha') {
+    const spread = state.spread_pct ?? 0;
+    const bias   = state.bias ?? 'NEUTRAL';
+    const near   = state.near_crossover;
+    summary = `EMA spread: ${spread > 0 ? '+' : ''}${spread.toFixed(4)}%`;
+    if (near) summary += ' ⚡ Near crossover';
+    summary += ` | Bias: ${bias}`;
+    biasColor = bias === 'BULLISH'
+      ? 'text-[var(--neon-green)]'
+      : bias === 'BEARISH'
+      ? 'text-[var(--neon-red)]'
+      : 'text-[var(--muted-foreground)]';
+  } else if (strategyId === 'statarb-gamma') {
+    if (state.status === 'warming_up') {
+      summary = `Warming up (${state.ticks_collected ?? 0}/20 ticks)`;
+    } else {
+      const pos  = state.position_in_band_pct ?? 50;
+      const zone = state.zone ?? 'NEUTRAL';
+      summary   = `BB position: ${pos.toFixed(0)}th pctile | Zone: ${zone}`;
+      biasColor  = zone === 'OVERSOLD'
+        ? 'text-[var(--neon-green)]'
+        : zone === 'OVERBOUGHT'
+        ? 'text-[var(--neon-red)]'
+        : 'text-[var(--muted-foreground)]';
+    }
+  } else if (strategyId === 'hft-sniper') {
+    if (botStatus === 'HALTED') {
+      summary   = 'HALTED — awaiting activation';
+      biasColor = 'text-[var(--muted-foreground)]';
+    } else {
+      const mom = state.momentum_pct ?? 0;
+      summary   = `Momentum: ${mom > 0 ? '+' : ''}${mom.toFixed(5)}%`;
+    }
+  }
+
+  return { symbol, strategyId, name, botStatus, summary, biasColor };
+}
+
+// ---------------------------------------------------------------------------
+// Strategy Mental Model Panel — TanStack React Table
+// ---------------------------------------------------------------------------
+
+function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
+  const symbols = Object.keys(states);
+
+  const rows = React.useMemo<MentalModelRow[]>(() =>
+    Object.entries(states).flatMap(([symbol, stateArr]) =>
+      (stateArr ?? []).map(state => buildMentalModelRow(symbol, state))
+    ),
+    [states]
+  );
+
+  const [sorting, setSorting] = React.useState<SortingState>([
+    { id: 'botStatus', desc: false },
+  ]);
+
+  const columns = React.useMemo<ColumnDef<MentalModelRow>[]>(() => [
+    {
+      id: 'botStatus',
+      accessorKey: 'botStatus',
+      header: '',
+      size: 32,
+      cell: ({ row }) => {
+        const active = row.original.botStatus === 'ACTIVE';
+        return (
+          <div className={`w-2 h-2 rounded-sm shrink-0 mx-auto ${
+            active
+              ? 'bg-[var(--neon-green)] shadow-[0_0_6px_rgba(0,255,136,0.5)]'
+              : 'bg-[var(--muted-foreground)] opacity-40'
+          }`} />
+        );
+      },
+      sortingFn: (a, b) => {
+        const order = (s: string) => s === 'ACTIVE' ? 0 : 1;
+        return order(a.original.botStatus) - order(b.original.botStatus);
+      },
+    },
+    {
+      id: 'symbol',
+      accessorKey: 'symbol',
+      header: 'Symbol',
+      size: 88,
+      cell: ({ getValue }) => (
+        <span className="font-mono tabular-nums text-xs text-[var(--muted-foreground)]">
+          {getValue() as string}
+        </span>
+      ),
+    },
+    {
+      id: 'name',
+      accessorKey: 'name',
+      header: 'Strategy',
+      cell: ({ getValue }) => (
+        <span className="text-xs font-bold text-[var(--foreground)]">
+          {getValue() as string}
+        </span>
+      ),
+    },
+    {
+      id: 'details',
+      accessorKey: 'summary',
+      header: 'State',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <span className={`font-mono text-xs leading-relaxed ${row.original.biasColor}`}>
+          {row.original.summary || '—'}
+        </span>
+      ),
+    },
+  ], []);
+
+  const table = useReactTable({
+    data: rows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  if (symbols.length === 0) {
+    return (
+      <Card className="bg-[var(--panel)] border-[var(--border)]">
+        <CardHeader className="py-3 border-b border-[var(--border)] flex flex-row items-center space-x-3">
+          <BrainCircuit className="w-4 h-4 text-[var(--kraken-purple)]" />
+          <CardTitle className="text-xs tracking-wide uppercase">Strategy Mental Model</CardTitle>
+        </CardHeader>
+        <CardContent className="py-3">
+          <p className="text-xs text-[var(--muted-foreground)] italic opacity-60">
+            Awaiting market data — strategy states will appear once the stream connects...
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="bg-[var(--panel)] border-[var(--border)]">
+      <CardHeader className="py-3 border-b border-[var(--kraken-purple)]/20 flex flex-row items-center justify-between bg-gradient-to-r from-[var(--kraken-purple)]/5 to-transparent">
+        <div className="flex items-center space-x-3">
+          <BrainCircuit className="w-4 h-4 text-[var(--kraken-purple)]" />
+          <CardTitle className="text-xs tracking-wide uppercase">Strategy Mental Model</CardTitle>
+        </div>
+        <span className="font-mono tabular-nums text-xs text-[var(--muted-foreground)] opacity-50">
+          {rows.length} states
+        </span>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="overflow-x-auto overflow-y-auto max-h-[220px]">
+          <table className="w-full border-collapse">
+            <thead className="sticky top-0 z-10">
+              {table.getHeaderGroups().map(hg => (
+                <tr key={hg.id} className="border-b border-[var(--border)] bg-[var(--panel)]">
+                  {hg.headers.map(header => (
+                    <th
+                      key={header.id}
+                      style={{ width: header.column.getSize() !== 150 ? header.column.getSize() : undefined }}
+                      className="py-1.5 px-3 text-left text-xs uppercase tracking-wide text-[var(--muted-foreground)] font-normal select-none"
+                    >
+                      {header.column.getCanSort() ? (
+                        <button
+                          onClick={header.column.getToggleSortingHandler()}
+                          className="flex items-center gap-1 hover:text-[var(--foreground)] transition-colors"
+                        >
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                          <span className="opacity-50">
+                            {header.column.getIsSorted() === 'asc' ? '▲' : header.column.getIsSorted() === 'desc' ? '▼' : '⇅'}
+                          </span>
+                        </button>
+                      ) : (
+                        flexRender(header.column.columnDef.header, header.getContext())
+                      )}
+                    </th>
+                  ))}
+                </tr>
+              ))}
+            </thead>
+            <tbody>
+              {table.getRowModel().rows.map((row, i) => (
+                <tr
+                  key={row.id}
+                  className={`border-b border-[var(--border)]/50 last:border-b-0 hover:bg-[var(--panel-muted)]/20 transition-colors ${
+                    i % 2 === 0 ? '' : 'bg-[var(--panel-muted)]/10'
+                  }`}
+                >
+                  {row.getVisibleCells().map(cell => (
+                    <td key={cell.id} className="py-1.5 px-3">
+                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -168,28 +393,37 @@ export function BotReflections() {
 
   React.useEffect(() => { setMounted(true); }, []);
 
-  const entries = React.useMemo(() => {
-    return learningHistory
-      .map(reflectionToDisplay)
-      .filter(e => filter === 'ALL' || e.type === filter)
-      .filter(e => strategyFilter === 'ALL' || e.strategy === strategyFilter);
-  }, [learningHistory, filter, strategyFilter]);
+  // All entries before type/strategy filter — used for counts
+  const allEntries = React.useMemo(() =>
+    learningHistory.map(reflectionToDisplay),
+    [learningHistory]
+  );
 
-  // Auto-scroll to top (newest first)
+  const countByType = React.useMemo(() => {
+    const m: Record<string, number> = {};
+    allEntries.forEach(e => { m[e.type] = (m[e.type] ?? 0) + 1; });
+    return m;
+  }, [allEntries]);
+
+  const entries = React.useMemo(() =>
+    allEntries
+      .filter(e => filter === 'ALL' || e.type === filter)
+      .filter(e => strategyFilter === 'ALL' || e.strategy === strategyFilter),
+    [allEntries, filter, strategyFilter]
+  );
+
   React.useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = 0;
     }
   }, [entries.length]);
 
-  // Collect unique strategies from history
   const strategies = React.useMemo(() => {
     const set = new Set<string>();
     learningHistory.forEach(r => { if (r.strategy) set.add(r.strategy); });
     return Array.from(set);
   }, [learningHistory]);
 
-  // Pulse indicator: stream is live if we have any entries
   const isLive = entries.length > 0;
 
   if (!mounted) return (
@@ -205,31 +439,24 @@ export function BotReflections() {
   return (
     <div className="flex h-full gap-4">
 
-      {/* ------------------------------------------------------------------ */}
-      {/* Left: Historical Amends (DB-backed via /api/reflections)            */}
-      {/* ------------------------------------------------------------------ */}
+      {/* Left: Historical Amends */}
       <HistoricalAmends />
 
-      {/* ------------------------------------------------------------------ */}
       {/* Right: Strategy Mental Model + Director Status + Live Thought Matrix */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="flex-[2] flex flex-col gap-3">
+      <div className="flex-[2] flex flex-col gap-3 min-h-0">
 
-        {/* Strategy Mental Model Panel — shows all symbols */}
         <StrategyMentalModel states={strategyStates} />
 
-        {/* Director Status Strip — last 2 director actions */}
         <DirectorStatus entries={entries} />
 
         {/* Live Thought Stream */}
-        <Card className="flex-1 flex flex-col bg-[var(--panel)]">
+        <Card className="flex-1 min-h-0 flex flex-col bg-[var(--panel)]">
           <CardHeader className="py-3 border-b border-[var(--border)] flex flex-row items-center justify-between">
             <div className="flex items-center space-x-3">
               <SearchCode className="w-5 h-5 text-[var(--kraken-light)]" />
               <div className="flex flex-col">
                 <div className="flex items-center gap-2">
                   <CardTitle className="text-sm tracking-wide">Live Thought Matrix</CardTitle>
-                  {/* SSE live indicator */}
                   <div className={`w-1.5 h-1.5 rounded-sm ${isLive ? 'bg-[var(--neon-green)] animate-pulse' : 'bg-[var(--muted-foreground)]'}`} />
                   {entries.length > 0 && (
                     <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60">
@@ -243,23 +470,33 @@ export function BotReflections() {
               </div>
             </div>
 
-            {/* Filter bar */}
+            {/* Filter bar with counts */}
             <div className="flex items-center gap-2">
               <Filter className="w-3.5 h-3.5 text-[var(--muted-foreground)]" />
               <div className="flex gap-1">
-                {FILTER_OPTIONS.map(opt => (
-                  <button
-                    key={opt.value}
-                    onClick={() => setFilter(opt.value)}
-                    className={`px-2 py-0.5 text-xs rounded-sm font-mono transition-all duration-200 ${
-                      filter === opt.value
-                        ? `${opt.color} bg-white/10 shadow-sm`
-                        : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-white/5'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
+                {FILTER_OPTIONS.map(opt => {
+                  const count = opt.value === 'ALL'
+                    ? allEntries.length
+                    : (countByType[opt.value] ?? 0);
+                  return (
+                    <button
+                      key={opt.value}
+                      onClick={() => setFilter(opt.value)}
+                      className={`flex items-center gap-1 px-2 py-0.5 text-xs rounded-sm font-mono transition-all duration-200 ${
+                        filter === opt.value
+                          ? `${opt.color} bg-white/10 shadow-sm`
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-white/5'
+                      }`}
+                    >
+                      {opt.label}
+                      {count > 0 && (
+                        <span className="tabular-nums text-[var(--muted-foreground)] opacity-60">
+                          {count}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
               {strategies.length > 1 && (
                 <select
@@ -334,112 +571,7 @@ export function BotReflections() {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy Mental Model Panel — shows ALL symbols (was limited to first only)
-// ---------------------------------------------------------------------------
-
-function StrategyMentalModel({ states }: { states: Record<string, any[]> }) {
-  const symbols = Object.keys(states);
-
-  if (symbols.length === 0) {
-    return (
-      <Card className="bg-[var(--panel)] border-[var(--border)]">
-        <CardHeader className="py-3 border-b border-[var(--border)] flex flex-row items-center space-x-3">
-          <BrainCircuit className="w-4 h-4 text-[var(--kraken-purple)]" />
-          <CardTitle className="text-xs tracking-wide uppercase">Strategy Mental Model</CardTitle>
-        </CardHeader>
-        <CardContent className="py-3">
-          <p className="text-xs text-[var(--muted-foreground)] italic opacity-60">
-            Awaiting market data — strategy states will appear once the stream connects...
-          </p>
-        </CardContent>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="bg-[var(--panel)] border-[var(--border)]">
-      <CardHeader className="py-3 border-b border-[var(--kraken-purple)]/20 flex flex-row items-center space-x-3 bg-gradient-to-r from-[var(--kraken-purple)]/5 to-transparent">
-        <BrainCircuit className="w-4 h-4 text-[var(--kraken-purple)]" />
-        <CardTitle className="text-xs tracking-wide uppercase">Strategy Mental Model</CardTitle>
-      </CardHeader>
-      <CardContent className="py-3 px-4">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          {/* Fixed: iterate ALL symbols, not just the first one */}
-          {symbols.map(symbol =>
-            (states[symbol] ?? []).map((state: any, idx: number) => {
-              const strategyId = state.strategy ?? 'unknown';
-              const name       = state.name ?? strategyId;
-              const botStatus  = state.bot_status ?? 'UNKNOWN';
-
-              let summary  = '';
-              let biasColor = 'text-[var(--muted-foreground)]';
-
-              if (strategyId === 'momentum-alpha') {
-                const spread = state.spread_pct ?? 0;
-                const bias   = state.bias ?? 'NEUTRAL';
-                const near   = state.near_crossover;
-                summary = `EMA spread: ${spread > 0 ? '+' : ''}${spread.toFixed(4)}%`;
-                if (near) summary += ' ⚡ Near crossover';
-                summary += ` | Bias: ${bias}`;
-                biasColor = bias === 'BULLISH'
-                  ? 'text-[var(--neon-green)]'
-                  : bias === 'BEARISH'
-                  ? 'text-[var(--neon-red)]'
-                  : 'text-[var(--muted-foreground)]';
-              } else if (strategyId === 'statarb-gamma') {
-                if (state.status === 'warming_up') {
-                  summary = `Warming up (${state.ticks_collected ?? 0}/20 ticks)`;
-                } else {
-                  const pos  = state.position_in_band_pct ?? 50;
-                  const zone = state.zone ?? 'NEUTRAL';
-                  summary   = `BB position: ${pos.toFixed(0)}th pctile | Zone: ${zone}`;
-                  biasColor  = zone === 'OVERSOLD'
-                    ? 'text-[var(--neon-green)]'
-                    : zone === 'OVERBOUGHT'
-                    ? 'text-[var(--neon-red)]'
-                    : 'text-[var(--muted-foreground)]';
-                }
-              } else if (strategyId === 'hft-sniper') {
-                if (botStatus === 'HALTED') {
-                  summary   = 'HALTED — awaiting activation';
-                  biasColor = 'text-[var(--muted-foreground)]';
-                } else {
-                  const mom = state.momentum_pct ?? 0;
-                  summary   = `Momentum: ${mom > 0 ? '+' : ''}${mom.toFixed(5)}%`;
-                }
-              }
-
-              const statusDot = botStatus === 'ACTIVE'
-                ? 'bg-[var(--neon-green)] shadow-[0_0_6px_rgba(0,255,136,0.5)]'
-                : 'bg-[var(--muted-foreground)]';
-
-              return (
-                <div
-                  key={`${symbol}-${strategyId}-${idx}`}
-                  className="flex items-start space-x-3 p-2.5 rounded-sm border border-[var(--border)] bg-[var(--panel-muted)]/20"
-                >
-                  <div className={`w-2 h-2 mt-1 rounded-sm ${statusDot} shrink-0`} />
-                  <div className="flex flex-col min-w-0">
-                    <span className="text-xs font-bold text-[var(--foreground)] truncate">
-                      {name}
-                      <span className="ml-1 text-[var(--muted-foreground)] font-normal opacity-60">{symbol}</span>
-                    </span>
-                    <span className={`text-xs font-mono ${biasColor} leading-relaxed mt-0.5`}>
-                      {summary}
-                    </span>
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Historical Amends column — fetches /api/reflections every 30s
+// Historical Amends column
 // ---------------------------------------------------------------------------
 
 function HistoricalAmends() {
@@ -484,30 +616,35 @@ function HistoricalAmends() {
           <div className="text-xs text-[var(--muted-foreground)] opacity-50 italic">
             No learning records yet — amends are generated after strategy performance analysis.
           </div>
-        ) : amends.map((item, i) => (
-          <div key={i} className="relative pl-6 pb-2 border-l border-[var(--border)] last:border-l-transparent">
-            <div className="absolute left-[-5px] top-1 w-2.5 h-2.5 rounded-sm bg-[var(--kraken-purple)] shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
-            <div className="flex justify-between items-start mb-1">
-              <div className="flex items-center space-x-2">
-                <Badge variant="purple" className="px-1.5 py-0 text-xs">
-                  {item.action ?? 'LEARNED'}
-                </Badge>
-                <span className="text-xs text-[var(--foreground)] font-bold">
-                  {item.model ?? 'Orchestrator'}
+        ) : amends.map((item, i) => {
+          const impactColor = item.impact?.startsWith('-')
+            ? 'text-[var(--neon-red)]'
+            : 'text-[var(--neon-green)]';
+          return (
+            <div key={i} className="relative pl-6 pb-2 border-l border-[var(--border)] last:border-l-transparent">
+              <div className="absolute left-[-5px] top-1 w-2.5 h-2.5 rounded-sm bg-[var(--kraken-purple)] shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
+              <div className="flex justify-between items-start mb-1">
+                <div className="flex items-center space-x-2">
+                  <Badge variant="purple" className="px-1.5 py-0 text-xs">
+                    {item.action ?? 'LEARNED'}
+                  </Badge>
+                  <span className="text-xs text-[var(--foreground)] font-bold">
+                    {item.model ?? 'Orchestrator'}
+                  </span>
+                </div>
+                <span className="text-xs text-[var(--muted-foreground)] font-mono tabular-nums">
+                  {item.date ? (parseUtc(item.date)?.toLocaleString(undefined, { hour12: false }) ?? 'Live') : 'Live'}
                 </span>
               </div>
-              <span className="text-xs text-[var(--muted-foreground)] font-mono tabular-nums">
-                {item.date ? (parseUtc(item.date)?.toLocaleString(undefined, { hour12: false }) ?? 'Live') : 'Live'}
-              </span>
+              <p className="text-xs text-[var(--muted-foreground)] mb-2 mt-2 leading-relaxed">
+                {item.reason}
+              </p>
+              <div className={`text-xs font-mono tracking-wider font-bold ${impactColor}`}>
+                IMPACT: {item.impact ?? 'Analyzing...'}
+              </div>
             </div>
-            <p className="text-xs text-[var(--muted-foreground)] mb-2 mt-2 leading-relaxed">
-              {item.reason}
-            </p>
-            <div className="text-xs text-[var(--neon-green)] font-mono tracking-wider font-bold">
-              IMPACT: {item.impact ?? 'Analyzing...'}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </CardContent>
     </Card>
   );

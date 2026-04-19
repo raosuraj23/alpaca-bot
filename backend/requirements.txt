@@ -2,6 +2,10 @@
 vectorbt>=0.26.0
 yfinance>=0.2.40
 
+# XGBoost probability gate (Predict skill)
+xgboost>=2.0.0
+joblib>=1.3.0
+
 # Technical Analysis
 # TA-Lib requires the pre-compiled C library. Install first; if compilation
 # fails in your environment, comment it out and uncomment pandas-ta below.

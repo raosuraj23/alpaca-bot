@@ -135,6 +135,9 @@ class MomentumStrategy(BaseStrategy):
         long_ = self.ema_long[symbol]
         spread = (short - long_) / long_
 
+        # momentum_z: normalise EMA spread to a rough z-score (0.5% spread ≈ 1σ typical)
+        momentum_z = round(max(-4.0, min(4.0, spread / 0.005)), 4)
+
         signal = None
         if spread > 0.002 and self._last_cross.get(symbol) != "BUY" and self._is_flat(symbol):
             self._last_cross[symbol] = "BUY"
@@ -142,7 +145,10 @@ class MomentumStrategy(BaseStrategy):
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "BUY",
                 "confidence": round(confidence, 3), "price": price,
-                "meta": {"ema_short": round(short, 2), "ema_long": round(long_, 2), "spread_pct": round(spread * 100, 4)}
+                "meta": {
+                    "ema_short": round(short, 2), "ema_long": round(long_, 2),
+                    "spread_pct": round(spread * 100, 4), "momentum_z": momentum_z,
+                }
             }
         elif spread < -0.002 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
             self._last_cross[symbol] = "SELL"
@@ -150,7 +156,10 @@ class MomentumStrategy(BaseStrategy):
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "SELL",
                 "confidence": round(confidence, 3), "price": price,
-                "meta": {"ema_short": round(short, 2), "ema_long": round(long_, 2), "spread_pct": round(spread * 100, 4)}
+                "meta": {
+                    "ema_short": round(short, 2), "ema_long": round(long_, 2),
+                    "spread_pct": round(spread * 100, 4), "momentum_z": momentum_z,
+                }
             }
 
         if signal:
@@ -264,6 +273,12 @@ class StatArbStrategy(BaseStrategy):
         sma, upper, lower = self._bollinger(symbol)
 
         signal = None
+        band_width = upper - lower if upper != lower else 1.0
+        bb_pos = round(max(0.0, min(1.0, (price - lower) / band_width)), 4)
+        variance = w["M2"] / w["count"] if w["count"] > 0 else 0.0
+        sigma = math.sqrt(max(0.0, variance))
+        mom_z = round(max(-4.0, min(4.0, (price - sma) / sigma)) if sigma > 0 else 0.0, 4)
+
         if price < lower and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
             deviation_sigma = (lower - price) / max((upper - lower) / 4, 0.001)
             confidence = min(0.95, 0.65 + deviation_sigma * 0.15)
@@ -271,8 +286,11 @@ class StatArbStrategy(BaseStrategy):
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "BUY",
                 "confidence": round(confidence, 3), "price": price,
-                "meta": {"sma": round(sma, 2), "upper": round(upper, 2),
-                         "lower": round(lower, 2), "deviation_σ": round(deviation_sigma, 3)}
+                "meta": {
+                    "sma": round(sma, 2), "upper": round(upper, 2),
+                    "lower": round(lower, 2), "deviation_σ": round(deviation_sigma, 3),
+                    "bb_position": bb_pos, "momentum_z": mom_z,
+                }
             }
         elif price > upper and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
             deviation_sigma = (price - upper) / max((upper - lower) / 4, 0.001)
@@ -281,8 +299,11 @@ class StatArbStrategy(BaseStrategy):
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "SELL",
                 "confidence": round(confidence, 3), "price": price,
-                "meta": {"sma": round(sma, 2), "upper": round(upper, 2),
-                         "lower": round(lower, 2), "deviation_σ": round(deviation_sigma, 3)}
+                "meta": {
+                    "sma": round(sma, 2), "upper": round(upper, 2),
+                    "lower": round(lower, 2), "deviation_σ": round(deviation_sigma, 3),
+                    "bb_position": bb_pos, "momentum_z": mom_z,
+                }
             }
 
         if signal:
@@ -430,4 +451,345 @@ class HighFrequencyStrategy(BaseStrategy):
             "cooldown_remaining": self._cooldown.get(symbol, 0),
             "position_state": self._position_state.get(symbol, FLAT),
             "entry_price": round(entry, 4) if entry else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: Crypto Pairs (generic spread mean-reversion, no market-hours gate)
+# ---------------------------------------------------------------------------
+
+class CryptoPairsStrategy(BaseStrategy):
+    """
+    Pairs mean-reversion for any two crypto symbols (e.g. BTC/ETH, SOL/AVAX).
+
+    Identical math to EquityPairsStrategy but with asset_class = "CRYPTO" and
+    no market-hours gate. leg_a and leg_b are fully patchable so the director
+    can instantiate any cross-asset spread at runtime.
+
+    Params (all patchable):
+      leg_a        str    First leg symbol (default "BTC/USD")
+      leg_b        str    Second leg symbol (default "ETH/USD")
+      window       int    Rolling spread window (default 30)
+      z_threshold  float  Z-score entry threshold (default 2.0)
+    """
+
+    def __init__(self, bot_id="crypto-pairs", name="Crypto Pairs", allocation=15, **kwargs):
+        super().__init__(bot_id, name, allocation, "Pairs Mean Reversion", **kwargs)
+        self.leg_a       = getattr(self, 'leg_a',       "BTC/USD")
+        self.leg_b       = getattr(self, 'leg_b',       "ETH/USD")
+        self.WINDOW      = getattr(self, 'window',      30)
+        self.Z_THRESHOLD = getattr(self, 'z_threshold', 2.0)
+        self._reset_pair_state()
+
+    def _reset_pair_state(self) -> None:
+        self._price_a: float | None = None
+        self._price_b: float | None = None
+        self._spreads  = deque(maxlen=self.WINDOW)
+        self._welford  = {"count": 0, "mean": 0.0, "M2": 0.0}
+        self._last_signal: str = "NONE"
+
+    def update_params(self, params: dict) -> None:
+        """Reset spread history when legs change."""
+        legs_changed = "leg_a" in params or "leg_b" in params
+        super().update_params(params)
+        if legs_changed:
+            self._reset_pair_state()
+            logger.info("[%s] Pair legs changed → state reset (leg_a=%s, leg_b=%s)",
+                        self.name, self.leg_a, self.leg_b)
+
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
+        if symbol == self.leg_a:
+            self._price_a = price
+        elif symbol == self.leg_b:
+            self._price_b = price
+        else:
+            return None
+
+        if self._price_a is None or self._price_b is None or self._price_b == 0:
+            return None
+
+        spread = self._price_a / self._price_b
+        w = self._welford
+
+        if len(self._spreads) == self.WINDOW:
+            old = self._spreads[0]
+            w["count"] -= 1
+            d = old - w["mean"]
+            w["mean"] -= d / max(1, w["count"])
+            w["M2"]   -= d * (old - w["mean"])
+
+        self._spreads.append(spread)
+        w["count"] += 1
+        d = spread - w["mean"]
+        w["mean"] += d / w["count"]
+        w["M2"]   += d * (spread - w["mean"])
+
+        if w["count"] < self.WINDOW or symbol != self.leg_a:
+            return None
+
+        std     = math.sqrt(w["M2"] / w["count"]) if w["M2"] > 0 else 1e-9
+        z_score = (spread - w["mean"]) / std
+
+        signal = None
+        if z_score < -self.Z_THRESHOLD and self._last_signal != "BUY" and self._is_flat(self.leg_a):
+            self._last_signal = "BUY"
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": self.leg_a, "action": "BUY",
+                "confidence": round(min(0.93, 0.65 + abs(z_score) * 0.08), 3), "price": price,
+                "meta": {"z_score": round(z_score, 3), "spread": round(spread, 6)},
+            }
+        elif z_score > self.Z_THRESHOLD and self._last_signal != "SELL" and self._is_long(self.leg_a):
+            self._last_signal = "SELL"
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": self.leg_a, "action": "SELL",
+                "confidence": round(min(0.93, 0.65 + abs(z_score) * 0.08), 3), "price": price,
+                "meta": {"z_score": round(z_score, 3), "spread": round(spread, 6)},
+            }
+
+        if signal:
+            logger.info("[CRYPTO-PAIRS] %s/%s z=%.2f → %s (conf=%.2f)",
+                        self.leg_a, self.leg_b, z_score, signal["action"], signal["confidence"])
+        return signal
+
+    def get_state(self, symbol: str) -> dict | None:
+        if symbol not in (self.leg_a, self.leg_b):
+            return None
+        w = self._welford
+        z_score = None
+        if w["count"] >= self.WINDOW and w["M2"] > 0:
+            z_score = round((self._spreads[-1] - w["mean"]) / math.sqrt(w["M2"] / w["count"]), 3)
+        return {
+            "strategy": self.id, "name": self.name,
+            "leg_a": self.leg_a, "leg_b": self.leg_b,
+            "price_a": self._price_a, "price_b": self._price_b,
+            "z_score": z_score,
+            "ticks_collected": w["count"],
+            "position_state": self._position_state.get(self.leg_a, FLAT),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: News Momentum (short-burst directional bet, research-edge gated)
+# ---------------------------------------------------------------------------
+
+class NewsMomentumStrategy(BaseStrategy):
+    """
+    Short-burst directional bet activated when the ResearchAgent reports a
+    high edge (model_probability − market_implied_probability) for this symbol.
+
+    Logic:
+      - BUY  when momentum_ticks-tick momentum is positive AND research edge > threshold
+      - Forced close (SELL) after hold_limit_ticks regardless of P&L
+      - Edge check delegates to an injected callable so this class stays stateless
+        with respect to the research brief.
+
+    Params (all patchable via update_params):
+      edge_threshold   float   Minimum edge to allow entry (default 0.06)
+      momentum_ticks   int     Rolling tick window for directional confirmation (default 5)
+      hold_limit_ticks int     Max ticks to hold before forced exit (default 30)
+    """
+
+    def __init__(self, bot_id="news-momentum", name="News Momentum", allocation=15, **kwargs):
+        super().__init__(bot_id, name, allocation, "News Momentum", **kwargs)
+        self.edge_threshold   = getattr(self, 'edge_threshold',   0.06)
+        self.momentum_ticks   = getattr(self, 'momentum_ticks',   5)
+        self.hold_limit_ticks = getattr(self, 'hold_limit_ticks', 30)
+
+        self._prices:     dict[str, deque] = {}
+        self._hold_count: dict[str, int]   = {}   # ticks since entry (forced exit guard)
+        # Callable injected by engine: (symbol) -> float | None (returns edge or None)
+        self._get_edge:   dict[str, float] = {}   # edge cache, populated externally
+
+    def set_edge(self, symbol: str, edge: float) -> None:
+        """Called by engine/director after each research cycle to update edge cache."""
+        self._get_edge[symbol] = edge
+
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
+        if symbol not in self._prices:
+            self._prices[symbol]     = deque(maxlen=self.momentum_ticks + 1)
+            self._hold_count[symbol] = 0
+
+        self._prices[symbol].append(price)
+
+        # Forced exit: position held too long
+        if self._is_long(symbol):
+            self._hold_count[symbol] += 1
+            if self._hold_count[symbol] >= self.hold_limit_ticks:
+                self._hold_count[symbol] = 0
+                self.signal_count += 1
+                logger.info("[NEWS-MOM] Forced close %s after %d ticks", symbol, self.hold_limit_ticks)
+                return {
+                    "bot": self.id, "symbol": symbol, "action": "SELL",
+                    "confidence": 0.80, "price": price,
+                    "meta": {"trigger": "hold_limit", "hold_ticks": self.hold_limit_ticks},
+                }
+
+        if len(self._prices[symbol]) < self.momentum_ticks + 1:
+            return None
+
+        edge = self._get_edge.get(symbol, 0.0)
+        if abs(edge) < self.edge_threshold:
+            return None
+
+        prev = self._prices[symbol][0]
+        momentum = (price - prev) / prev if prev else 0.0
+
+        signal = None
+        if edge > self.edge_threshold and momentum > 0 and self._is_flat(symbol):
+            confidence = min(0.95, 0.65 + edge * 3)
+            self._hold_count[symbol] = 0
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "BUY",
+                "confidence": round(confidence, 3), "price": price,
+                "meta": {"edge": round(edge, 4), "momentum_pct": round(momentum * 100, 4)},
+            }
+        elif edge < -self.edge_threshold and momentum < 0 and self._is_long(symbol):
+            confidence = min(0.95, 0.65 + abs(edge) * 3)
+            self._hold_count[symbol] = 0
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "SELL",
+                "confidence": round(confidence, 3), "price": price,
+                "meta": {"edge": round(edge, 4), "momentum_pct": round(momentum * 100, 4)},
+            }
+
+        if signal:
+            logger.info("[NEWS-MOM] %s → %s (edge=%.3f, conf=%.2f)",
+                        symbol, signal["action"], edge, signal["confidence"])
+        return signal
+
+    def get_state(self, symbol: str) -> dict | None:
+        return {
+            "strategy": self.id,
+            "name": self.name,
+            "edge": round(self._get_edge.get(symbol, 0.0), 4),
+            "hold_ticks": self._hold_count.get(symbol, 0),
+            "position_state": self._position_state.get(symbol, FLAT),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: Crypto Range Scalp (tight Bollinger scalp for consolidating crypto)
+# ---------------------------------------------------------------------------
+
+class CryptoRangeScalpStrategy(BaseStrategy):
+    """
+    Bollinger Band scalp intended for crypto in sideways/consolidating regimes.
+    Differs from StatArb Gamma by using tighter bands (1.5σ) and a regime gate:
+    entry is only allowed when the last min_range_ticks ticks show no EMA crossover
+    (i.e., asset is range-bound, not trending).
+
+    Params (all patchable):
+      bb_period        int    Bollinger window (default 20)
+      bb_sigma         float  Band width in σ (default 1.5)
+      min_range_ticks  int    Ticks without EMA crossover required (default 10)
+      cooldown_ticks   int    Ticks to wait after a signal (default 8)
+    """
+
+    def __init__(self, bot_id="crypto-range-scalp", name="Crypto Range Scalp", allocation=20, **kwargs):
+        super().__init__(bot_id, name, allocation, "Range Scalp", **kwargs)
+        self.bb_period       = getattr(self, 'bb_period',       20)
+        self.bb_sigma        = getattr(self, 'bb_sigma',        1.5)
+        self.min_range_ticks = getattr(self, 'min_range_ticks', 10)
+        self.cooldown_ticks  = getattr(self, 'cooldown_ticks',  8)
+
+        self._prices:       dict[str, deque] = {}
+        self._welford:      dict[str, dict]  = {}
+        self._ema_fast:     dict[str, float] = {}  # α=0.10
+        self._ema_slow:     dict[str, float] = {}  # α=0.03
+        self._range_ticks:  dict[str, int]   = {}  # consecutive non-crossover ticks
+        self._cooldown:     dict[str, int]   = {}
+        self._last_signal:  dict[str, str]   = {}
+
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
+        if symbol not in self._prices:
+            self._prices[symbol]      = deque(maxlen=self.bb_period)
+            self._welford[symbol]     = {"count": 0, "mean": 0.0, "M2": 0.0}
+            self._ema_fast[symbol]    = price
+            self._ema_slow[symbol]    = price
+            self._range_ticks[symbol] = 0
+            self._cooldown[symbol]    = 0
+            self._last_signal[symbol] = "NONE"
+            return None
+
+        self._cooldown[symbol] = max(0, self._cooldown[symbol] - 1)
+
+        # Update EMAs for regime detection
+        self._ema_fast[symbol] = price * 0.10 + self._ema_fast[symbol] * 0.90
+        self._ema_slow[symbol] = price * 0.03 + self._ema_slow[symbol] * 0.97
+        trending = abs(self._ema_fast[symbol] - self._ema_slow[symbol]) / self._ema_slow[symbol] > 0.002
+        self._range_ticks[symbol] = 0 if trending else self._range_ticks[symbol] + 1
+
+        # Welford rolling variance
+        w = self._welford[symbol]
+        if len(self._prices[symbol]) == self.bb_period:
+            old = self._prices[symbol][0]
+            w["count"] -= 1
+            d = old - w["mean"]
+            w["mean"] -= d / max(1, w["count"])
+            w["M2"]   -= d * (old - w["mean"])
+            w["M2"]    = max(0.0, w["M2"])
+
+        self._prices[symbol].append(price)
+        w["count"] += 1
+        d = price - w["mean"]
+        w["mean"] += d / w["count"]
+        w["M2"]   += d * (price - w["mean"])
+
+        if w["count"] < self.bb_period:
+            return None
+        if self._range_ticks[symbol] < self.min_range_ticks:
+            return None
+        if self._cooldown[symbol] > 0:
+            return None
+
+        sigma = math.sqrt(max(0.0, w["M2"] / w["count"]))
+        upper = w["mean"] + self.bb_sigma * sigma
+        lower = w["mean"] - self.bb_sigma * sigma
+
+        signal = None
+        if price < lower and self._last_signal[symbol] != "BUY" and self._is_flat(symbol):
+            dev = (lower - price) / max(sigma, 1e-9)
+            self._last_signal[symbol] = "BUY"
+            self._cooldown[symbol] = self.cooldown_ticks
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "BUY",
+                "confidence": round(min(0.92, 0.62 + dev * 0.10), 3), "price": price,
+                "meta": {"upper": round(upper, 4), "lower": round(lower, 4),
+                         "range_ticks": self._range_ticks[symbol]},
+            }
+        elif price > upper and self._last_signal[symbol] != "SELL" and self._is_long(symbol):
+            dev = (price - upper) / max(sigma, 1e-9)
+            self._last_signal[symbol] = "SELL"
+            self._cooldown[symbol] = self.cooldown_ticks
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "SELL",
+                "confidence": round(min(0.92, 0.62 + dev * 0.10), 3), "price": price,
+                "meta": {"upper": round(upper, 4), "lower": round(lower, 4),
+                         "range_ticks": self._range_ticks[symbol]},
+            }
+
+        if signal:
+            logger.info("[RANGE-SCALP] %s → %s (conf=%.2f, range_ticks=%d)",
+                        symbol, signal["action"], signal["confidence"], self._range_ticks[symbol])
+        return signal
+
+    def get_state(self, symbol: str) -> dict | None:
+        if symbol not in self._welford:
+            return None
+        w = self._welford[symbol]
+        sigma = math.sqrt(max(0.0, w["M2"] / w["count"])) if w["count"] > 0 else 0
+        return {
+            "strategy": self.id,
+            "name": self.name,
+            "mean": round(w["mean"], 4),
+            "sigma": round(sigma, 4),
+            "range_ticks": self._range_ticks.get(symbol, 0),
+            "cooldown_remaining": self._cooldown.get(symbol, 0),
+            "position_state": self._position_state.get(symbol, FLAT),
         }

@@ -155,7 +155,7 @@ export function OrchestratorChat() {
         whileHover={{ scale: 1.05 }}
         whileTap={{ scale: 0.95 }}
         onClick={() => setIsOpen(!isOpen)}
-        className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-[var(--kraken-purple)] rounded-full flex items-center justify-center shadow-lg shadow-[var(--kraken-purple)]/40 hover:bg-[var(--kraken-light)] transition-colors border border-white/10"
+        className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-[var(--kraken-purple)] rounded-sm flex items-center justify-center shadow-lg shadow-[var(--kraken-purple)]/40 hover:bg-[var(--kraken-light)] transition-colors border border-white/10"
       >
         {isOpen ? <X className="w-6 h-6 text-white" /> : <MessageSquare className="w-6 h-6 text-white" />}
       </motion.button>

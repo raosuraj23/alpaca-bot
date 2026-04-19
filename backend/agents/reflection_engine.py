@@ -13,7 +13,9 @@ momentum readings). No LLM calls, no cost.
 """
 
 import asyncio
+import json
 import logging
+import pathlib
 from datetime import datetime
 from enum import Enum
 from typing import Callable, Optional
@@ -280,10 +282,16 @@ class ReflectionEngine:
         slippage = execution_data.get("slippage", 0)
         confidence = execution_data.get("confidence", 0)
         qty = execution_data.get("qty", 0)
-        realized_pnl = execution_data.get("realized_pnl")   # only for SELL fills
-        entry_price  = execution_data.get("entry_price")    # only for SELL fills
+        realized_pnl      = execution_data.get("realized_pnl")       # only for SELL fills
+        entry_price       = execution_data.get("entry_price")        # only for SELL fills
+        market_conditions = execution_data.get("market_conditions")  # JSON string from execution agent
 
         now = datetime.utcnow()
+
+        # Compute hold duration for SELL fills (async DB lookup)
+        hold_duration_min = execution_data.get("hold_duration_min")
+        if hold_duration_min is None and action == "SELL":
+            hold_duration_min = await self._compute_hold_duration(strategy, symbol)
 
         pnl_pct = 0.0
         if realized_pnl is not None and entry_price and entry_price > 0 and qty > 0:
@@ -411,6 +419,10 @@ class ReflectionEngine:
                     tokens_used=execution_data.get("_tokens_used"),
                     failure_class=failure_cls,
                     brier_contribution=brier_contrib,
+                    entry_price=entry_price,
+                    exit_price=fill_price if action == "SELL" else None,
+                    hold_duration_min=hold_duration_min,
+                    market_conditions=market_conditions,
                     timestamp=now,
                 ))
                 if realized_pnl is not None:
@@ -423,6 +435,12 @@ class ReflectionEngine:
                 await session.commit()
         except Exception as e:
             logger.warning("[REFLECTION] Failed to persist BotAmend/ReflectionLog: %s", e)
+
+        # Compound learning: invoke post_mortem agent for losing trades and persist to knowledge base
+        if realized_pnl is not None and realized_pnl < 0 and failure_cls is not None:
+            pm_result = await self._invoke_post_mortem(execution_data, failure_cls)
+            if pm_result and pm_result.get("knowledge_entry"):
+                self._append_knowledge(pm_result, execution_data)
 
         # Push to SSE stream
         self._push({
@@ -438,6 +456,125 @@ class ReflectionEngine:
         })
 
         logger.info("[REFLECTION] Trade learning: %s", insight[:80])
+
+    # ------------------------------------------------------------------
+    # Compound Learning (Post-Mortem → Knowledge Base)
+    # ------------------------------------------------------------------
+
+    async def _invoke_post_mortem(self, execution_data: dict, failure_cls: str) -> Optional[dict]:
+        """
+        Calls the post_mortem agent persona with losing trade data.
+        Returns parsed JSON dict (failure_class, root_cause, adjustment, knowledge_entry)
+        or None on any failure. Budget: 200 tokens via fast tier (Haiku).
+        """
+        try:
+            from agents.factory import swarm_factory
+            from langchain_core.messages import HumanMessage
+
+            model = swarm_factory.build_model(model_level="fast", max_tokens=200)
+            if not model:
+                return None
+
+            system_msg = swarm_factory.get_system_prompt("post_mortem")
+            if not system_msg:
+                logger.debug("[REFLECTION] post_mortem persona not found in factory")
+                return None
+
+            trade_payload = json.dumps({
+                "strategy":          execution_data.get("strategy", "unknown"),
+                "symbol":            execution_data.get("symbol", "?"),
+                "signal_confidence": execution_data.get("confidence", 0),
+                "realized_pnl":      execution_data.get("realized_pnl", 0),
+                "slippage_pct":      abs(execution_data.get("slippage", 0) /
+                                         max(execution_data.get("signal_price",
+                                             execution_data.get("fill_price", 1)) or 1, 0.01)),
+                "entry_price":       execution_data.get("entry_price", 0),
+                "exit_price":        execution_data.get("fill_price", 0),
+                "hold_duration_min": execution_data.get("hold_duration_min", 0),
+                "news_items":        [],
+                "failure_class":     failure_cls,
+            })
+
+            response = await model.ainvoke(
+                [system_msg, HumanMessage(content=trade_payload)],
+                max_tokens=200,
+            )
+
+            try:
+                usage = getattr(response, "usage_metadata", None) or {}
+                t_in  = usage.get("input_tokens", 0)
+                t_out = usage.get("output_tokens", 0)
+                cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
+                from db.database import _get_session_factory
+                from db.models import LLMUsage
+                async with _get_session_factory()() as _s:
+                    _s.add(LLMUsage(
+                        model=CLAUDE_HAIKU_MODEL,
+                        tokens_in=t_in, tokens_out=t_out,
+                        cost_usd=cost, purpose="post_mortem",
+                    ))
+                    await _s.commit()
+            except Exception as _le:
+                logger.debug("[REFLECTION] Post-mortem cost log failed: %s", _le)
+
+            raw = response.content.strip()
+            # Strip markdown fences if the model wraps in ```json ... ```
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
+
+        except Exception as exc:
+            logger.debug("[REFLECTION] Post-mortem invocation failed: %s", exc)
+            return None
+
+    def _append_knowledge(self, entry: dict, execution_data: dict) -> None:
+        """Appends one structured entry to backend/knowledge/failure_log.jsonl."""
+        kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+        kb_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp":       datetime.utcnow().isoformat() + "Z",
+            "strategy":        execution_data.get("strategy", "unknown"),
+            "symbol":          execution_data.get("symbol", "?"),
+            "failure_class":   entry.get("failure_class", "UNKNOWN"),
+            "knowledge_entry": entry.get("knowledge_entry", ""),
+            "adjustment":      entry.get("adjustment", ""),
+        }
+        try:
+            with open(kb_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            logger.info("[REFLECTION] Knowledge appended: %s", record["knowledge_entry"][:80])
+        except Exception as exc:
+            logger.warning("[REFLECTION] Failed to append knowledge: %s", exc)
+
+    async def _compute_hold_duration(self, bot_id: str, symbol: str) -> int | None:
+        """Returns minutes between the last BUY fill and now for this bot+symbol pair."""
+        try:
+            from db.database import _get_session_factory
+            from db.models import SignalRecord, ExecutionRecord as _ER
+            from sqlalchemy import select, and_
+            async with _get_session_factory()() as session:
+                stmt = (
+                    select(_ER.timestamp)
+                    .join(SignalRecord, _ER.signal_id == SignalRecord.id)
+                    .where(and_(
+                        SignalRecord.strategy == bot_id,
+                        SignalRecord.symbol   == symbol,
+                        SignalRecord.action   == "BUY",
+                        _ER.status            == "FILLED",
+                    ))
+                    .order_by(_ER.timestamp.desc())
+                    .limit(1)
+                )
+                row = (await session.execute(stmt)).scalar_one_or_none()
+                if row:
+                    ts = row.replace(tzinfo=None) if row.tzinfo else row
+                    delta = datetime.utcnow() - ts
+                    return max(1, int(delta.total_seconds() / 60))
+        except Exception as exc:
+            logger.debug("[REFLECTION] hold_duration_min lookup failed: %s", exc)
+        return None
 
     def stop(self):
         self._running = False

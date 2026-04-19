@@ -20,7 +20,9 @@ Portfolio integration:
 """
 
 import asyncio
+import json
 import logging
+import pathlib
 import pandas as pd
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -47,17 +49,55 @@ _EQUITY_SEED: list[str] = [
 # Module-level mutable universe — grows as research/scanner surface new symbols
 _dynamic_universe: set[str] = set(_CRYPTO_SEED + _EQUITY_SEED)
 
+_KB_PATH = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
 
-def expand_universe(symbols: list[str]) -> None:
+
+def _load_knowledge_context(n: int = 20) -> str:
+    """
+    Reads the last N entries from backend/knowledge/failure_log.jsonl.
+    Returns a compact string for injection into LLM prompts, or "" if file absent/empty.
+    """
+    if not _KB_PATH.exists():
+        return ""
+    try:
+        lines = _KB_PATH.read_text(encoding="utf-8").strip().splitlines()
+        if not lines:
+            return ""
+        entries = []
+        for line in lines[-n:]:
+            try:
+                rec = json.loads(line)
+                ke = rec.get("knowledge_entry", "").strip()
+                if ke:
+                    entries.append(
+                        f"[{rec.get('failure_class', '?')}] {rec.get('symbol', '?')}: {ke}"
+                    )
+            except Exception:
+                pass
+        if not entries:
+            return ""
+        return "Past failure knowledge (apply to avoid repeat mistakes):\n" + "\n".join(entries)
+    except Exception:
+        return ""
+
+
+def expand_universe(symbols: list[str], engine=None) -> None:
     """Add newly discovered symbols to the active evaluation universe.
 
     Called by ResearchAgent after each brief and by ScannerAgent after discovery.
     Thread-safe for asyncio single-threaded event loop.
+
+    If engine is provided, brand-new (non-seed) symbols are quarantined via
+    engine.add_to_pending() so the Portfolio Director can assign them a strategy
+    before any trades are placed.
     """
     new = [s for s in symbols if s and s not in _dynamic_universe]
     if new:
         logger.info("[SCANNER] Universe expanded: +%s", new)
         _dynamic_universe.update(new)
+        if engine is not None:
+            for sym in new:
+                engine.add_to_pending(sym)
 
 
 def get_universe() -> list[str]:
@@ -384,6 +424,8 @@ class ScannerAgent:
                 f"price=${s['price']:,.2f}  RSI={s.get('rsi') or 'N/A'}"
                 for s in sorted(scored, key=lambda x: abs(x["score"]), reverse=True)
             )
+            knowledge_ctx = _load_knowledge_context(20)
+            knowledge_section = f"\n\n{knowledge_ctx}" if knowledge_ctx else ""
 
             response = await model.ainvoke([
                 SystemMessage(content=(
@@ -398,7 +440,7 @@ class ScannerAgent:
                     "Respond ONLY with a comma-separated list of symbols in priority order. "
                     "Example: BTC/USD, AAPL, ETH/USD, SPY"
                 )),
-                HumanMessage(content=f"Universe TA scores:\n{universe_str}{research_context}"),
+                HumanMessage(content=f"Universe TA scores:\n{universe_str}{research_context}{knowledge_section}"),
             ])
 
             # Parse comma-separated symbol list from response

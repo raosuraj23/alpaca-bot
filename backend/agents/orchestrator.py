@@ -28,11 +28,15 @@ Signal approval pipeline (from process_signal):
                     → REJECTED → QuantSignal.llm_approved = 'REJECTED', logged
 """
 
+import asyncio
 import json
 import logging
 import re
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from config import CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT
+from config import (
+    CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT,
+    GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT,
+)
 
 from agents.factory import swarm_factory
 
@@ -70,8 +74,10 @@ class OrchestratorEngine:
     def __init__(self):
         # chat tier — Claude Haiku with prompt caching for command parsing (300t)
         self.model = swarm_factory.build_model(model_level="chat")
-        # signal tier — Gemini 2.0 Flash for binary APPROVED/REJECTED gate (50t)
+        # signal tier — Gemini 2.5 Flash primary voter (50t)
         self.signal_model = swarm_factory.build_model(model_level="signal")
+        # second voter — Claude Haiku independent signal approval (100t)
+        self.haiku_voter = swarm_factory.build_model(model_level="chat", max_tokens=100)
         raw_prompt = swarm_factory.get_system_prompt("orchestrator-agent")
         # Cache the system prompt at Anthropic's ephemeral tier — avoids paying
         # full input token cost (~2k tokens) on every invocation.
@@ -152,14 +158,38 @@ class OrchestratorEngine:
                 "signal_event": dict,   # original signal passed through
             }
         """
-        gate_model = self.signal_model or self.model
-        if not gate_model:
-            logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s", signal_event.get("asset"))
+        if not self.signal_model and not self.haiku_voter and not self.model:
+            logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s",
+                           signal_event.get("asset"))
             return {
                 "llm_decision": "APPROVED",
                 "rationale":    "LLM offline — signal auto-approved by default.",
                 "signal_event": signal_event,
             }
+
+        # --- XGBoost probability gate (runs before LLM spend) ---
+        try:
+            from predict.feature_extractor import extract_features, compute_market_implied_prob
+            from predict.xgboost_classifier import xgb_classifier
+            _feats = extract_features(signal_event)
+            _mkt_p = compute_market_implied_prob(_feats)
+            _gate  = xgb_classifier.gate(_feats, _mkt_p)
+            signal_event["xgboost_prob"]        = _gate["xgboost_prob"]
+            signal_event["market_implied_prob"] = _gate["market_implied_prob"]
+            signal_event["edge"]                = _gate["edge"]
+            signal_event["market_edge"]         = _gate["edge"]   # alias for DB column
+            signal_event["mispricing_z_score"]  = _gate.get("mispricing_z_score")
+            signal_event["signal_features"]     = _feats.tolist()
+            if not _gate["approved"]:
+                logger.info("[ORCHESTRATOR] XGBoost gate rejected signal — %s", _gate["reason"])
+                return {
+                    "llm_decision": "REJECTED",
+                    "rationale":    f"[XGBOOST GATE] {_gate['reason']}",
+                    "signal_event": signal_event,
+                }
+        except Exception as _xgb_exc:
+            logger.debug("[ORCHESTRATOR] XGBoost gate skipped: %s", _xgb_exc)
+        # --- End XGBoost gate ---
 
         asset      = signal_event.get("asset", "UNKNOWN")
         signal_ts  = signal_event.get("timestamp", "")
@@ -188,51 +218,81 @@ class OrchestratorEngine:
             f"Be brief. The math is already confirmed — your role is sentiment/context validation only."
         )
 
-        try:
-            # Use a fresh single-message invocation — do NOT inject into chat
-            # history since this is an autonomous pipeline call, not a user turn.
-            messages = [self.system_prompt, HumanMessage(content=supervisor_prompt)]
-            response = await gate_model.ainvoke(messages)
-            reply = response.content
-            if self.signal_model:
-                from config import GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT
-                await _log_llm_cost(response, GEMINI_FLASH_MODEL,
-                                    "orchestrator_signal", GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT)
-            else:
-                await _log_llm_cost(response, CLAUDE_HAIKU_MODEL,
-                                    "orchestrator_signal", HAIKU_COST_IN, HAIKU_COST_OUT)
-
-            # Parse the decision JSON block
-            decision = "ERROR"
+        def _parse_voter_reply(reply: str) -> tuple[str, str]:
+            """Extract decision and rationale from a voter's response."""
+            decision  = "ERROR"
             rationale = "Could not parse LLM response."
-            pattern = r"```json\s*(\{.*?\})\s*```"
+            pattern   = r"```json\s*(\{.*?\})\s*```"
             for match in re.finditer(pattern, reply, re.DOTALL):
                 try:
-                    parsed = json.loads(match.group(1))
+                    parsed    = json.loads(match.group(1))
                     decision  = parsed.get("llm_decision", "ERROR").upper()
                     rationale = parsed.get("rationale", rationale)
                     break
                 except json.JSONDecodeError:
                     pass
-
-            # Normalise: only APPROVED passes through; anything else is REJECTED
             if decision not in ("APPROVED", "REJECTED"):
-                decision = "REJECTED"
-                rationale = f"Unrecognised LLM response — defaulting to REJECTED. Raw: {reply[:200]}"
+                decision  = "REJECTED"
+                rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
+            return decision, rationale
 
-            logger.info(
-                "[ORCHESTRATOR] Signal %s %s → LLM decision: %s | %s",
-                asset, signal_ts, decision, rationale,
+        async def _call_voter(model, model_name: str, price_in: float, price_out: float):
+            """Invoke one voter and return (decision, rationale), or ('ERROR', reason)."""
+            if not model:
+                return "ERROR", f"{model_name} unavailable"
+            try:
+                response = await model.ainvoke(
+                    [self.system_prompt, HumanMessage(content=supervisor_prompt)]
+                )
+                await _log_llm_cost(response, model_name,
+                                    "orchestrator_signal_vote", price_in, price_out)
+                return _parse_voter_reply(response.content)
+            except Exception as exc:
+                logger.error("[ORCHESTRATOR] Voter %s failed: %s", model_name, exc)
+                return "ERROR", str(exc)
+
+        try:
+            gemini_decision, gemini_rationale = "ERROR", "Gemini unavailable"
+            haiku_decision,  haiku_rationale  = "ERROR", "Haiku unavailable"
+
+            # Run both voters concurrently — total latency = max(gemini, haiku), not sum
+            gemini_result, haiku_result = await asyncio.gather(
+                _call_voter(self.signal_model or self.model,
+                            GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT),
+                _call_voter(self.haiku_voter or self.model,
+                            CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT),
             )
+            gemini_decision, gemini_rationale = gemini_result
+            haiku_decision,  haiku_rationale  = haiku_result
+
+            # AND logic: both must APPROVE; disagreement → REJECT
+            if gemini_decision == "APPROVED" and haiku_decision == "APPROVED":
+                final_decision  = "APPROVED"
+                final_rationale = f"Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
+            else:
+                final_decision = "REJECTED"
+                if gemini_decision != haiku_decision:
+                    final_rationale = (
+                        f"[VOTER DISAGREEMENT] Gemini={gemini_decision} ({gemini_rationale}) | "
+                        f"Haiku={haiku_decision} ({haiku_rationale})"
+                    )
+                    logger.warning("[ORCHESTRATOR] Voter disagreement on %s: %s", asset, final_rationale)
+                else:
+                    final_rationale = (
+                        f"Both rejected — Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
+                    )
+
+            logger.info("[ORCHESTRATOR] Signal %s %s → ensemble: %s | %s",
+                        asset, signal_ts, final_decision, final_rationale[:120])
 
             return {
-                "llm_decision": decision,
-                "rationale":    rationale,
+                "llm_decision": final_decision,
+                "rationale":    final_rationale,
                 "signal_event": signal_event,
             }
 
         except Exception as exc:
-            logger.error("[ORCHESTRATOR] process_signal LLM call failed: %s", exc)
+            logger.error("[ORCHESTRATOR] process_signal ensemble failed: %s", exc)
             return {
                 "llm_decision": "ERROR",
                 "rationale":    str(exc),

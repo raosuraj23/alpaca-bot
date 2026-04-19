@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
-from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey, JSON
 from db.database import Base
 
 def _utcnow() -> datetime:
@@ -21,6 +21,14 @@ class SignalRecord(Base):
     confidence = Column(Numeric(5, 4)) # e.g., 0.9521
     timestamp = Column(DateTime(timezone=True), default=_utcnow)
     processed = Column(Boolean, default=False)
+    # Formula metrics — captured at signal generation time
+    expected_value      = Column(Numeric(8, 4), nullable=True)   # EV = p*b - (1-p)
+    kelly_fraction      = Column(Numeric(5, 4), nullable=True)   # half-Kelly sizing fraction
+    market_edge         = Column(Numeric(5, 4), nullable=True)   # p_model - p_mkt
+    market_implied_prob = Column(Numeric(5, 4), nullable=True)   # p_mkt from scanner/research
+    mispricing_z_score  = Column(Numeric(8, 4), nullable=True)   # (p_model - p_mkt) / rolling_sigma
+    xgboost_prob        = Column(Numeric(5, 4), nullable=True)   # XGBoost P(win) at signal time
+    signal_features     = Column(JSON, nullable=True)            # TA feature vector used by XGBoost
 
 class ExecutionRecord(Base):
     """Tracks physical Alpaca executions correlating to algorithmic signals."""
@@ -57,6 +65,11 @@ class ClosedTrade(Base):
     realized_pnl = Column(Numeric(18, 4))        # Gross PnL
     net_pnl = Column(Numeric(18, 4))             # Realized PnL minus commissions
     win = Column(Boolean)                        # Fast querying for win-rate
+    # Formula metrics — snapshotted from entry signal for post-trade analysis
+    entry_ev           = Column(Numeric(8, 4), nullable=True)   # EV at entry
+    entry_kelly        = Column(Numeric(5, 4), nullable=True)   # Kelly fraction at entry
+    entry_edge         = Column(Numeric(5, 4), nullable=True)   # market_edge at entry
+    brier_contribution = Column(Numeric(8, 6), nullable=True)   # (confidence - outcome)^2
 
 class PortfolioSnapshot(Base):
     """Time-series equity curve for fast UI rendering (bypasses Alpaca API limits)."""
@@ -116,9 +129,14 @@ class ReflectionLog(Base):
     insight = Column(String(500))
     tokens_used = Column(Integer, nullable=True)
     # Compound / learning fields
-    failure_class = Column(String(30), nullable=True)       # BAD_PREDICTION | TIMING | EXECUTION | MARKET_SHOCK
-    brier_contribution = Column(Numeric(8, 6), nullable=True)  # (forecast - outcome)^2 for this trade
-    timestamp = Column(DateTime(timezone=True), default=_utcnow)
+    failure_class      = Column(String(30), nullable=True)      # BAD_PREDICTION | TIMING | EXECUTION | MARKET_SHOCK
+    brier_contribution = Column(Numeric(8, 6), nullable=True)   # (forecast - outcome)^2 for this trade
+    # Rich trade context (populated for all SELL fills)
+    entry_price        = Column(Numeric(18, 8), nullable=True)  # avg entry price for the round-trip
+    exit_price         = Column(Numeric(18, 8), nullable=True)  # fill price on exit
+    hold_duration_min  = Column(Integer, nullable=True)         # minutes between entry and exit
+    market_conditions  = Column(String(500), nullable=True)     # JSON: {rsi, ema_spread, volume_ratio}
+    timestamp          = Column(DateTime(timezone=True), default=_utcnow)
 
 
 class CalibrationRecord(Base):
@@ -135,8 +153,23 @@ class WatchlistItem(Base):
     __tablename__ = "watchlist_items"
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), unique=True, index=True)
-    score = Column(Numeric(5, 4), default=Decimal('0.0')) 
-    signal = Column(String(10), default="NEUTRAL") 
-    verdict = Column(String(200), nullable=True)   
+    score = Column(Numeric(5, 4), default=Decimal('0.0'))
+    signal = Column(String(10), default="NEUTRAL")
+    verdict = Column(String(200), nullable=True)
     last_scanned = Column(DateTime(timezone=True), default=_utcnow)
     active = Column(Boolean, default=True)
+
+
+class SymbolStrategyAssignment(Base):
+    """Tracks per-symbol strategy assignments created by the Portfolio Director."""
+    __tablename__ = "symbol_strategy_assignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), index=True)
+    bot_id = Column(String(80))                      # e.g. "equity-breakout-nvda-v1"
+    algorithm_type = Column(String(50))              # e.g. "equity-breakout"
+    assigned_by = Column(String(20), default="director")  # "director" | "manual"
+    rationale = Column(String(500), nullable=True)
+    params_json = Column(String(1000), nullable=True)     # JSON-encoded custom params
+    active = Column(Boolean, default=True, index=True)
+    assigned_at = Column(DateTime(timezone=True), default=_utcnow, index=True)

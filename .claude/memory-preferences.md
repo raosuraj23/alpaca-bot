@@ -105,6 +105,7 @@ what was shipped, and any follow-on items discovered during implementation.
 | 2026-04-17 | Phase 3 · OHLCV | /api/ohlcv extended to support equity symbols via StockHistoricalDataClient + StockBarsRequest | None |
 | 2026-04-17 | Phase 3 · Nivo removal | Confirmed no Nivo imports; lightweight-charts used instead | None |
 | 2026-04-17 | Phase 4 · Backtest + URL cleanup | backend/backtest/runner.py (VectorBT); POST /api/backtest with SSE progress; BacktestRunner.tsx wired to real endpoint; all hardcoded localhost URLs → API_BASE/WS_BASE env constants | 50/50 Playwright tests passing |
+| 2026-04-18 | Phase 3+ · Per-Symbol Strategy Assignment | New `SymbolStrategyAssignment` DB table; 4 new algorithm classes (EquityBreakout, VWAPReversion, NewsMomentum, CryptoRangeScalp); StrategyEngine quarantine + per-symbol routing + factory; PortfolioDirector new commands (ASSIGN_EXISTING_STRATEGY, CREATE_NEW_STRATEGY_INSTANCE, UNASSIGN_STRATEGY) + research-edge context; scanner quarantine trigger; startup restore; GET /api/symbol-strategies + GET /api/algorithms | Scanner-discovered symbols are quarantined until Director assigns strategy. Seed symbols use backward-compat asset-class routing. Director now has 12 algorithm templates to choose from. |
 
 **How to update this table:**
 

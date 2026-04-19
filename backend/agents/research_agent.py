@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import re
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -40,7 +42,7 @@ MIN_EDGE = settings.min_edge
 _ALPACA_NEWS_URL = settings.alpaca_news_endpoint
 
 # Symbols covered in research brief
-from agents.scanner_agent import get_universe, expand_universe  # noqa: E402
+from agents.scanner_agent import get_universe, expand_universe, _load_knowledge_context  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +216,20 @@ class ResearchAgent:
     # ------------------------------------------------------------------
 
     async def _run_research_cycle(self) -> None:
-        news_items = await self._fetch_news_items()
+        alpaca_items = await self._fetch_news_items()
+        rss_items    = await self._fetch_rss_items(get_universe())
+
+        # Merge and deduplicate by first 60 chars of headline, cap at 40 items
+        seen: set[str] = set()
+        news_items: list[dict] = []
+        for item in alpaca_items + rss_items:
+            key = item.get("headline", "")[:60].lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                news_items.append(item)
+            if len(news_items) >= 40:
+                break
+
         buffer = self._get_buffer()
         ta_summary = self._build_ta_summary(buffer)
         trade_perf = await self._fetch_recent_performance()
@@ -282,8 +297,14 @@ class ResearchAgent:
                 "timestamp":        datetime.now(timezone.utc).isoformat(),
             }, default=str)
 
+            knowledge_ctx = _load_knowledge_context(20)
+            system_content = (
+                _RESEARCH_SYSTEM_PROMPT + "\n\n" + knowledge_ctx
+                if knowledge_ctx else _RESEARCH_SYSTEM_PROMPT
+            )
+
             result: ResearchBrief = await structured.ainvoke([
-                SystemMessage(content=_RESEARCH_SYSTEM_PROMPT),
+                SystemMessage(content=system_content),
                 HumanMessage(content=user_payload),
             ])
 
@@ -320,6 +341,56 @@ class ResearchAgent:
         except Exception as exc:
             logger.debug("[RESEARCH] News fetch failed: %s", exc)
         return []
+
+    async def _fetch_rss_items(self, symbols: list[str]) -> list[dict]:
+        """
+        Fetches financial news from 3 RSS feeds using stdlib only (no new pip deps).
+        Filters items where a bare ticker appears in title or summary.
+        All errors caught silently — cycle continues with Alpaca-only news on failure.
+        """
+        feeds = [
+            ("Yahoo Finance",    "https://finance.yahoo.com/rss/topfinstories"),
+            ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+            ("Seeking Alpha",    "https://seekingalpha.com/market_currents.xml"),
+        ]
+        bare = {s.replace("/USD", "").replace("/", "") for s in symbols}
+        items: list[dict] = []
+        loop = asyncio.get_event_loop()
+
+        for feed_name, url in feeds:
+            try:
+                def _fetch(u=url):
+                    req = urllib.request.Request(
+                        u, headers={"User-Agent": "AlpacaBot/1.0 RSS reader"}
+                    )
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        return resp.read()
+
+                raw_bytes = await loop.run_in_executor(None, _fetch)
+                root = ET.fromstring(raw_bytes.decode("utf-8", errors="replace"))
+
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                raw_items = root.findall(".//item") or root.findall(".//atom:entry", ns)
+
+                for item in raw_items[:20]:
+                    title   = (item.findtext("title") or
+                               item.findtext("atom:title", namespaces=ns) or "").strip()
+                    summary = (item.findtext("description") or
+                               item.findtext("atom:summary", namespaces=ns) or "").strip()
+                    link    = (item.findtext("link") or "").strip()
+
+                    combined = (title + " " + summary).upper()
+                    if any(sym in combined for sym in bare):
+                        items.append({"headline": title, "source": feed_name, "url": link})
+
+                logger.debug("[RESEARCH] RSS %s: %d relevant items", feed_name, sum(
+                    1 for _ in raw_items[:20]
+                    if any(sym in (_.findtext("title") or "").upper() for sym in bare)
+                ))
+            except Exception as exc:
+                logger.debug("[RESEARCH] RSS feed %s failed: %s", feed_name, exc)
+
+        return items
 
     def _build_ta_summary(self, buffer) -> str:
         """Compact per-symbol price/ema snapshot for the research prompt."""

@@ -277,6 +277,21 @@ def get_bots():
     return master_engine.get_bot_states()
 
 
+@app.get("/api/symbol-strategies")
+def get_symbol_strategies():
+    """Returns current per-symbol strategy assignments and pending quarantine list."""
+    return {
+        "symbol_strategy_map": master_engine.get_symbol_strategy_map(),
+        "pending_assignment":  master_engine.get_pending_assignment(),
+    }
+
+
+@app.get("/api/algorithms")
+def get_available_algorithms():
+    """Returns all algorithm types available for director-driven strategy instantiation."""
+    return {"algorithms": master_engine.get_available_algorithms()}
+
+
 # ==========================================
 # RISK STATUS
 # ==========================================
@@ -560,11 +575,65 @@ async def get_performance(period: str = "1M"):
         except Exception as _rt_exc:
             logger.debug("[PERFORMANCE] realized_trades fetch failed: %s", _rt_exc)
 
+        # Brier score (mean calibration error) and total closed trades
+        brier_score  = None
+        total_trades = 0
+        try:
+            from db.database import _get_session_factory as _gsf
+            from db.models import CalibrationRecord as _CR, ClosedTrade as _CT2
+            from sqlalchemy import select as _sel2
+
+            async def _fetch_calibration():
+                async with _gsf()() as _s:
+                    return (await _s.execute(_sel2(_CR))).scalars().all()
+
+            async def _count_trades():
+                async with _gsf()() as _s:
+                    return len((await _s.execute(_sel2(_CT2))).scalars().all())
+
+            _cal_rows = await _fetch_calibration()
+            if _cal_rows:
+                brier_score = round(
+                    sum(float(r.brier_contribution or 0) for r in _cal_rows) / len(_cal_rows), 4
+                )
+            total_trades = await _count_trades()
+        except Exception as _be:
+            logger.debug("[PERFORMANCE] brier_score/total_trades fetch failed: %s", _be)
+
+        # Formula metrics aggregate from ClosedTrade table
+        formula_metrics: dict = {}
+        try:
+            from db.database import _get_session_factory as _gsf3
+            from db.models import ClosedTrade as _CT3
+            from sqlalchemy import select as _sel3
+
+            async def _fetch_formula():
+                async with _gsf3()() as _s:
+                    return (await _s.execute(_sel3(_CT3))).scalars().all()
+
+            _frows = await _fetch_formula()
+            if _frows:
+                def _avg(vals):
+                    filtered = [v for v in vals if v is not None]
+                    return round(sum(filtered) / len(filtered), 4) if filtered else None
+
+                formula_metrics = {
+                    "avg_ev":          _avg([float(r.entry_ev) for r in _frows if r.entry_ev is not None]),
+                    "avg_kelly":       _avg([float(r.entry_kelly) for r in _frows if r.entry_kelly is not None]),
+                    "avg_market_edge": _avg([float(r.entry_edge) for r in _frows if r.entry_edge is not None]),
+                    "avg_brier":       _avg([float(r.brier_contribution) for r in _frows if r.brier_contribution is not None]),
+                }
+        except Exception as _fm_exc:
+            logger.debug("[PERFORMANCE] formula_metrics fetch failed: %s", _fm_exc)
+
         return {
             "history": curve, "net_pnl": net_pnl,
             "drawdown": round(max_dd, 4), "has_data": len(curve) > 0,
             "sharpe": sharpe, "sortino": sortino,
             "realized_trades": realized_trades,
+            "brier_score": brier_score,
+            "total_trades": total_trades,
+            "formula_metrics": formula_metrics or None,
         }
     except Exception as e:
         logger.error("[PERFORMANCE] %s", e)
@@ -630,6 +699,142 @@ async def get_return_distribution():
     except Exception as e:
         logger.error("[ANALYTICS] returns distribution failed: %s", e)
         return {"buckets": [], "has_data": False}
+
+
+@app.get("/api/analytics/signals")
+async def get_signals_analytics(period: str = "1D"):
+    """
+    Signal-level analytics for the analysis tab.
+    Returns formula metrics from SignalRecord + per-agent calibration from CalibrationRecord.
+
+    Response:
+      has_data:                 bool
+      avg_market_edge:          float | null  — avg(xgboost_prob - market_implied_prob)
+      avg_mispricing_z:         float | null  — avg(mispricing_z_score)
+      avg_bayes_update:         float | null  — avg(xgboost_prob / market_implied_prob) ratio
+      arb_score:                float | null  — fraction of signals where model beats market
+      by_agent:                 list[{agent, avg_confidence, win_rate, trade_count}]
+      confidence_distribution:  list[{bucket_min, bucket_max, wins, losses}]
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta
+    from db.database import _get_session_factory
+    from db.models import SignalRecord, CalibrationRecord
+    from sqlalchemy import select as _sel
+
+    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180, "ALL": 36500}
+    days = period_days.get(period.upper(), 1)
+    cutoff = _dt.now(_tz.utc) - timedelta(days=days)
+
+    try:
+        async with _get_session_factory()() as session:
+            sig_rows = (await session.execute(
+                _sel(SignalRecord).where(SignalRecord.timestamp >= cutoff)
+            )).scalars().all()
+
+        edges, mispricings, bayes_updates, arb_flags = [], [], [], []
+        for r in sig_rows:
+            if r.market_edge is not None:
+                edges.append(float(r.market_edge))
+            if r.mispricing_z_score is not None:
+                mispricings.append(float(r.mispricing_z_score))
+            xp = float(r.xgboost_prob) if r.xgboost_prob is not None else None
+            mp = float(r.market_implied_prob) if r.market_implied_prob is not None else None
+            if xp is not None and mp is not None and mp > 0:
+                bayes_updates.append(xp / mp)
+                arb_flags.append(1 if xp > mp else 0)
+
+        def _avg(vals):
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        arb_score = round(sum(arb_flags) / len(arb_flags), 4) if arb_flags else None
+
+        async with _get_session_factory()() as session:
+            cal_rows = (await session.execute(
+                _sel(CalibrationRecord).where(CalibrationRecord.timestamp >= cutoff)
+            )).scalars().all()
+
+        # PnL per bot from ClosedTrade (total + avg win / avg loss — used for bucket PnL attribution)
+        from db.models import ClosedTrade
+        from sqlalchemy import func as _func
+        async with _get_session_factory()() as session:
+            pnl_rows = (await session.execute(
+                _sel(
+                    ClosedTrade.bot_id,
+                    ClosedTrade.win,
+                    _func.sum(ClosedTrade.net_pnl).label("total_pnl"),
+                    _func.avg(ClosedTrade.net_pnl).label("avg_pnl"),
+                ).where(ClosedTrade.exit_time >= cutoff).group_by(ClosedTrade.bot_id, ClosedTrade.win)
+            )).all()
+        pnl_by_bot: dict = {}
+        avg_win_pnl: dict = {}   # bot_id → avg PnL per winning trade
+        avg_loss_pnl: dict = {}  # bot_id → avg PnL per losing trade
+        for r in pnl_rows:
+            if not r.bot_id:
+                continue
+            if r.win:
+                pnl_by_bot[r.bot_id] = pnl_by_bot.get(r.bot_id, 0.0) + float(r.total_pnl or 0)
+                avg_win_pnl[r.bot_id] = float(r.avg_pnl or 0)
+            else:
+                pnl_by_bot[r.bot_id] = pnl_by_bot.get(r.bot_id, 0.0) + float(r.total_pnl or 0)
+                avg_loss_pnl[r.bot_id] = float(r.avg_pnl or 0)
+
+        # Per-agent stats
+        agent_map: dict = {}
+        for r in cal_rows:
+            strat = r.strategy or "unknown"
+            if strat not in agent_map:
+                agent_map[strat] = {"wins": 0, "total": 0, "conf_sum": 0.0}
+            agent_map[strat]["total"] += 1
+            agent_map[strat]["wins"] += int(r.outcome or 0)
+            agent_map[strat]["conf_sum"] += float(r.forecast or 0)
+
+        by_agent = sorted(
+            [
+                {
+                    "agent": k,
+                    "avg_confidence": round(v["conf_sum"] / v["total"], 4),
+                    "win_rate": round(v["wins"] / v["total"], 4),
+                    "trade_count": v["total"],
+                    "total_pnl": round(pnl_by_bot.get(k, 0.0), 2),
+                }
+                for k, v in agent_map.items() if v["total"] >= 1
+            ],
+            key=lambda x: x["trade_count"],
+            reverse=True,
+        )
+
+        # Confidence distribution: 10 buckets 0.0–1.0 with estimated PnL per bucket
+        dist = [
+            {"bucket_min": round(i / 10, 1), "bucket_max": round((i + 1) / 10, 1), "wins": 0, "losses": 0, "pnl": 0.0}
+            for i in range(10)
+        ]
+        for r in cal_rows:
+            if r.forecast is None:
+                continue
+            idx = min(int(float(r.forecast) * 10), 9)
+            strat = r.strategy or "unknown"
+            if r.outcome == 1:
+                dist[idx]["wins"] += 1
+                dist[idx]["pnl"] += avg_win_pnl.get(strat, 0.0)
+            else:
+                dist[idx]["losses"] += 1
+                dist[idx]["pnl"] += avg_loss_pnl.get(strat, 0.0)
+        for d in dist:
+            d["pnl"] = round(d["pnl"], 2)
+
+        return {
+            "has_data": len(sig_rows) > 0 or len(cal_rows) > 0,
+            "avg_market_edge": _avg(edges),
+            "avg_mispricing_z": _avg(mispricings),
+            "avg_bayes_update": _avg(bayes_updates),
+            "arb_score": arb_score,
+            "by_agent": by_agent,
+            "confidence_distribution": dist,
+        }
+    except Exception as exc:
+        logger.error("[SIGNALS ANALYTICS] %s", exc)
+        return {"has_data": False, "avg_market_edge": None, "avg_mispricing_z": None,
+                "avg_bayes_update": None, "arb_score": None, "by_agent": [], "confidence_distribution": []}
 
 
 @app.get("/api/analytics/llm-cost")
@@ -857,7 +1062,7 @@ async def get_llm_breakdown(period: str = "1M"):
                     "tokens_in":  int(r.tokens_in or 0),
                     "tokens_out": int(r.tokens_out or 0),
                     "cost_usd":   round(float(r.cost_usd or 0), 6),
-                    "ts":         int(r.timestamp.timestamp() * 1000) if r.timestamp else 0,
+                    "ts":         int((r.timestamp.replace(tzinfo=timezone.utc) if r.timestamp and r.timestamp.tzinfo is None else r.timestamp).timestamp() * 1000) if r.timestamp else 0,
                 }
                 for r in recent_rows
             ],
@@ -1234,6 +1439,24 @@ async def stream_manager():
                     from risk.kill_switch import global_kill_switch
                     global_kill_switch.evaluate_portfolio(equity)
 
+                    # --- XGBoost probability gate (pre-LLM, pre-risk) ---
+                    from predict.feature_extractor import extract_features, compute_market_implied_prob
+                    from predict.xgboost_classifier import xgb_classifier
+                    _xgb_features = extract_features(signal)
+                    _mkt_prob = compute_market_implied_prob(_xgb_features)
+                    _gate = xgb_classifier.gate(_xgb_features, _mkt_prob)
+                    signal["xgboost_prob"]        = _gate["xgboost_prob"]
+                    signal["market_implied_prob"] = _gate["market_implied_prob"]
+                    signal["edge"]                = _gate["edge"]
+                    signal["signal_features"]     = _xgb_features.tolist()
+                    if not _gate["approved"]:
+                        _push_log(
+                            f"[XGBOOST] Rejected {signal['bot'].upper()} {signal['action']} "
+                            f"{symbol} — {_gate['reason']}"
+                        )
+                        continue
+                    # --- End XGBoost gate ---
+
                     approved = risk_agent.process(signal, equity)
                     if approved:
                         _push_log(
@@ -1330,6 +1553,11 @@ async def stream_manager():
             stream.subscribe_quotes(quote_callback, *_crypto_syms)
             logger.info("[STREAM] Subscribed to crypto symbols: %s", _crypto_syms)
 
+            # Expose refs so _scanner_push can dynamically add new symbols at runtime
+            _crypto_stream_state["stream"]         = stream
+            _crypto_stream_state["bar_callback"]   = bar_callback
+            _crypto_stream_state["quote_callback"] = quote_callback
+
             logger.info("[STREAM] Starting Alpaca CryptoDataStream...")
             _push_log("[STREAM] Connecting to Alpaca live data stream...")
 
@@ -1388,6 +1616,10 @@ EQUITY_STREAM_SYMBOLS: list[str] = list(_EQUITY_SEED)  # mutable; grows via scan
 # Shared mutable container so _scanner_push can reach the running equity stream
 _equity_stream_state: dict = {}  # keys: "stream", "callback" — set by equity_stream_manager
 
+# Crypto equivalents — mirrors the equity pattern for dynamic symbol subscription
+CRYPTO_STREAM_SYMBOLS: list[str] = list(master_engine.active_crypto_symbols)  # mutable
+_crypto_stream_state: dict = {}  # keys: "stream", "bar_callback", "quote_callback"
+
 async def equity_stream_manager():
     """
     Manages the Alpaca StockDataStream for US equity symbols.
@@ -1430,6 +1662,25 @@ async def equity_stream_manager():
                         pass
                     from risk.kill_switch import global_kill_switch
                     global_kill_switch.evaluate_portfolio(equity_bal)
+
+                    # --- XGBoost probability gate ---
+                    from predict.feature_extractor import extract_features, compute_market_implied_prob
+                    from predict.xgboost_classifier import xgb_classifier
+                    _xgb_feats = extract_features(signal)
+                    _mkt_p = compute_market_implied_prob(_xgb_feats)
+                    _g = xgb_classifier.gate(_xgb_feats, _mkt_p)
+                    signal["xgboost_prob"]        = _g["xgboost_prob"]
+                    signal["market_implied_prob"] = _g["market_implied_prob"]
+                    signal["edge"]                = _g["edge"]
+                    signal["signal_features"]     = _xgb_feats.tolist()
+                    if not _g["approved"]:
+                        _push_log(
+                            f"[XGBOOST] Rejected {signal['bot'].upper()} {signal['action']} "
+                            f"{symbol} — {_g['reason']}"
+                        )
+                        continue
+                    # --- End XGBoost gate ---
+
                     approved = risk_agent.process(signal, equity_bal)
                     if approved:
                         _push_log(
@@ -2033,6 +2284,32 @@ async def _write_closed_trade(
         return None
 
     realized_pnl = (exit_price - entry_price) * qty if direction == "LONG" else (entry_price - exit_price) * qty
+    win = realized_pnl > 0
+
+    # Pull formula metrics from the entry signal if available
+    entry_ev = entry_kelly = entry_edge = brier_contrib = None
+    if entry_exec_id is not None:
+        try:
+            from db.models import ExecutionRecord as _ER, SignalRecord as _SR
+            from sqlalchemy import select as _sel_s
+            async with _get_session_factory()() as _ls:
+                exec_row = (await _ls.execute(
+                    _sel_s(_ER).where(_ER.id == entry_exec_id)
+                )).scalar_one_or_none()
+                if exec_row and exec_row.signal_id:
+                    sig_row = (await _ls.execute(
+                        _sel_s(_SR).where(_SR.id == exec_row.signal_id)
+                    )).scalar_one_or_none()
+                    if sig_row:
+                        entry_ev    = float(sig_row.expected_value) if sig_row.expected_value is not None else None
+                        entry_kelly = float(sig_row.kelly_fraction) if sig_row.kelly_fraction is not None else None
+                        entry_edge  = float(sig_row.market_edge) if sig_row.market_edge is not None else None
+                        conf = float(sig_row.confidence or 0)
+                        outcome = 1 if win else 0
+                        brier_contrib = round((conf - outcome) ** 2, 6)
+        except Exception as _fme:
+            logger.debug("[CLOSED TRADE] formula metrics lookup failed: %s", _fme)
+
     try:
         async with _get_session_factory()() as _s:
             _s.add(ClosedTrade(
@@ -2043,9 +2320,13 @@ async def _write_closed_trade(
                 avg_exit_price=exit_price,
                 realized_pnl=realized_pnl,
                 net_pnl=realized_pnl,
-                win=(realized_pnl > 0),
+                win=win,
                 entry_time=_parse_ts(entry_time),
                 exit_time=_parse_ts(exit_time),
+                entry_ev=entry_ev,
+                entry_kelly=entry_kelly,
+                entry_edge=entry_edge,
+                brier_contribution=brier_contrib,
             ))
             await _s.commit()
     except Exception as e:
@@ -2083,6 +2364,16 @@ async def startup_event():
                         master_engine.update_strategy_params(_amend.target_bot, _params)
                     except Exception as _pe:
                         logger.debug("[STARTUP] BotAmend re-apply failed for %s: %s", _amend.target_bot, _pe)
+
+            # Restore per-symbol strategy assignments
+            from db.models import SymbolStrategyAssignment as _SSA
+            from sqlalchemy import select as _ssa_select
+            _assignments = (await _session.execute(
+                _ssa_select(_SSA).where(_SSA.active == True)
+            )).scalars().all()
+            if _assignments:
+                master_engine.restore_symbol_assignments(_assignments)
+                logger.info("[STARTUP] Restored %d symbol-strategy assignments", len(_assignments))
     except Exception as _exc:
         logger.warning("[STARTUP] BotState restore failed: %s", _exc)
 
@@ -2121,10 +2412,35 @@ async def startup_event():
                 equity_syms = {s for s in symbols if "/" not in s}
 
                 if crypto_syms:
+                    # Quarantine brand-new crypto symbols before streaming begins
+                    known_crypto = set(master_engine.active_crypto_symbols)
+                    for _sym in crypto_syms - known_crypto:
+                        master_engine.add_to_pending(_sym)
+
                     master_engine.set_active_crypto_symbols(crypto_syms)
+                    # Dynamically subscribe new crypto symbols to the running stream
+                    _cs = _crypto_stream_state.get("stream")
+                    _cb = _crypto_stream_state.get("bar_callback")
+                    _qb = _crypto_stream_state.get("quote_callback")
+                    if _cs and _cb:
+                        new_crypto = crypto_syms - set(CRYPTO_STREAM_SYMBOLS)
+                        if new_crypto:
+                            try:
+                                _cs.subscribe_bars(_cb, *new_crypto)
+                                if _qb:
+                                    _cs.subscribe_quotes(_qb, *new_crypto)
+                                CRYPTO_STREAM_SYMBOLS.extend(new_crypto)
+                                logger.info("[SCANNER→CRYPTO STREAM] Subscribed new symbols: %s", new_crypto)
+                            except Exception as _e:
+                                logger.warning("[SCANNER→CRYPTO STREAM] Subscribe failed: %s", _e)
                     logger.info("[SCANNER→ENGINE] Crypto symbols updated: %s", crypto_syms)
 
                 if equity_syms:
+                    # Quarantine brand-new equity symbols before streaming begins
+                    known_equity = set(master_engine.active_equity_symbols)
+                    for _sym in equity_syms - known_equity:
+                        master_engine.add_to_pending(_sym)
+
                     master_engine.set_active_equity_symbols(equity_syms)
                     # Dynamically subscribe new equity symbols to the running stream
                     stream = _equity_stream_state.get("stream")
@@ -2189,8 +2505,28 @@ async def startup_event():
         get_scanner_fn = lambda: _scanner_agent.get_last_results() if _scanner_agent else [],
         db_factory     = _gsf_director,
     )
+    _director.set_research_fn(lambda: _research_agent)
     asyncio.create_task(_director.run())
     logger.info("[DIRECTOR] Autonomous Portfolio Director scheduled (15 min interval)")
+
+    # Start Nightly Consolidation agent — runs at 23:55 UTC, writes metrics_log.jsonl
+    from agents.nightly_consolidation import NightlyConsolidation
+    _nightly = NightlyConsolidation(push_fn=_push_reflection)
+    asyncio.create_task(_nightly.run())
+    logger.info("[CONSOLIDATION] Nightly consolidation agent scheduled (23:55 UTC)")
+
+    # XGBoost startup training — loads persisted model or trains on existing trade history
+    async def _xgb_startup_train():
+        try:
+            from predict.xgboost_classifier import xgb_classifier
+            trained = await asyncio.get_event_loop().run_in_executor(None, xgb_classifier.train)
+            if trained:
+                logger.info("[PREDICT] XGBoost model trained on startup from existing trade history")
+            else:
+                logger.info("[PREDICT] XGBoost in cold-start mode (insufficient data — signals pass through)")
+        except Exception as _xgb_err:
+            logger.info("[PREDICT] XGBoost startup training skipped: %s", _xgb_err)
+    asyncio.create_task(_xgb_startup_train())
 
 
 @app.on_event("shutdown")

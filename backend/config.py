@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     slippage_abort_pct: float = 0.02        # abort if pre-execution mid-quote drift > 2%
     min_signal_confidence: float = 0.30     # reject signals below this confidence
     min_edge: float = 0.04                  # model_prob - market_implied_prob must exceed 4%
+    xgboost_min_confidence: float = 0.55    # XGBoost P(win) gate — reject signals below this
 
     # Risk parameters for exposure manager
     var_daily_pct: float = 0.01             # 1% daily VaR limit (95th percentile)

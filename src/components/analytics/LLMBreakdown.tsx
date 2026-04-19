@@ -147,15 +147,36 @@ function PurposeChart({ data, height }: { data: LLMBreakdownData['by_purpose']; 
 // Model mix
 // ---------------------------------------------------------------------------
 
+function mergeModels(data: LLMBreakdownData['by_model']) {
+  const map = new Map<string, LLMBreakdownData['by_model'][number]>();
+  for (const r of data) {
+    const key = fmtModel(r.model);
+    const existing = map.get(key);
+    if (existing) {
+      map.set(key, {
+        model: existing.model,
+        calls: existing.calls + r.calls,
+        tokens_in: existing.tokens_in + r.tokens_in,
+        tokens_out: existing.tokens_out + r.tokens_out,
+        cost_usd: existing.cost_usd + r.cost_usd,
+      });
+    } else {
+      map.set(key, { ...r });
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => b.cost_usd - a.cost_usd);
+}
+
 function ModelGrid({ data, height }: { data: LLMBreakdownData['by_model']; height: number }) {
   if (!data.length) return <Empty height={height} />;
 
-  const total = data.reduce((s, r) => s + r.cost_usd, 0);
+  const merged = mergeModels(data);
+  const total = merged.reduce((s, r) => s + r.cost_usd, 0);
 
   return (
     <div className="overflow-y-auto px-1" style={{ height }}>
       <div className="space-y-2 py-1">
-        {data.map(r => {
+        {merged.map(r => {
           const pct = total > 0 ? (r.cost_usd / total) * 100 : 0;
           const color = modelColor(r.model);
           return (
@@ -238,7 +259,12 @@ function RecentCalls({ data, height }: { data: LLMBreakdownData['recent']; heigh
                 ${r.cost_usd.toFixed(5)}
               </td>
               <td className="py-1 px-2 text-right text-[var(--muted-foreground)] opacity-60">
-                {new Date(r.ts).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}
+                {(() => {
+                  const d = new Date(r.ts);
+                  const isToday = d.toLocaleDateString(undefined) === new Date().toLocaleDateString(undefined);
+                  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+                  return isToday ? time : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`;
+                })()}
               </td>
             </tr>
           ))}

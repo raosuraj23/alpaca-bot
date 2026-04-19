@@ -21,7 +21,8 @@ _MAX_CONCURRENT_POS   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "15"))  # hard
 
 class ExecutionResult:
     __slots__ = ("order_id", "symbol", "action", "qty", "fill_price",
-                 "signal_price", "slippage", "slippage_pct", "bot_id", "timestamp")
+                 "signal_price", "slippage", "slippage_pct", "bot_id", "timestamp",
+                 "hold_duration_min", "market_conditions")
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -220,7 +221,16 @@ class ExecutionAgent:
                 slippage=slippage,
                 status="FILLED",
                 failure_reason=None,
+                expected_value=approved_signal.get("expected_value"),
+                kelly_fraction=approved_signal.get("kelly_fraction"),
+                market_edge=approved_signal.get("market_edge"),
+                market_implied_prob=approved_signal.get("market_implied_prob"),
+                mispricing_z_score=approved_signal.get("mispricing_z_score"),
+                xgboost_prob=approved_signal.get("xgboost_prob"),
+                signal_features=approved_signal.get("signal_features"),
             )
+
+            market_conditions = self._extract_market_conditions(approved_signal) if action == "SELL" else None
 
             return ExecutionResult(
                 order_id=order_id,
@@ -233,6 +243,8 @@ class ExecutionAgent:
                 slippage_pct=round(slip_pct, 6),
                 bot_id=bot_id,
                 timestamp=datetime.utcnow().isoformat(),
+                market_conditions=market_conditions,
+                hold_duration_min=None,  # computed async in reflection_engine
             )
 
         except Exception as e:
@@ -263,6 +275,13 @@ class ExecutionAgent:
         slippage: float = 0.0,
         status: str = "FILLED",
         failure_reason: str | None = None,
+        expected_value: float | None = None,
+        kelly_fraction: float | None = None,
+        market_edge: float | None = None,
+        market_implied_prob: float | None = None,
+        mispricing_z_score: float | None = None,
+        xgboost_prob: float | None = None,
+        signal_features: list | None = None,
     ):
         """
         Spawns a background coroutine to write SignalRecord + ExecutionRecord.
@@ -283,6 +302,13 @@ class ExecutionAgent:
                     slippage=slippage,
                     status=status,
                     failure_reason=failure_reason,
+                    expected_value=expected_value,
+                    kelly_fraction=kelly_fraction,
+                    market_edge=market_edge,
+                    market_implied_prob=market_implied_prob,
+                    mispricing_z_score=mispricing_z_score,
+                    xgboost_prob=xgboost_prob,
+                    signal_features=signal_features,
                 ))
         except RuntimeError:
             # No running event loop (e.g. in tests) — skip persistence
@@ -300,6 +326,13 @@ class ExecutionAgent:
         slippage: float = 0.0,
         status: str = "FILLED",
         failure_reason: str | None = None,
+        expected_value: float | None = None,
+        kelly_fraction: float | None = None,
+        market_edge: float | None = None,
+        market_implied_prob: float | None = None,
+        mispricing_z_score: float | None = None,
+        xgboost_prob: float | None = None,
+        signal_features: list | None = None,
     ):
         """Writes a SignalRecord and linked ExecutionRecord to SQLite."""
         try:
@@ -313,6 +346,13 @@ class ExecutionAgent:
                     action=action,
                     confidence=confidence,
                     processed=True,
+                    expected_value=expected_value,
+                    kelly_fraction=kelly_fraction,
+                    market_edge=market_edge,
+                    market_implied_prob=market_implied_prob,
+                    mispricing_z_score=mispricing_z_score,
+                    xgboost_prob=xgboost_prob,
+                    signal_features=signal_features,
                 )
                 session.add(sig)
                 await session.flush()  # populate sig.id
@@ -335,6 +375,18 @@ class ExecutionAgent:
 
         except Exception as e:
             logger.error("[EXECUTION AGENT] DB persist failed: %s", e)
+
+
+    def _extract_market_conditions(self, signal: dict) -> str | None:
+        """Packs strategy state fields from the signal into a compact JSON string."""
+        import json
+        meta = signal.get("meta") or {}
+        conditions = {
+            k: meta.get(k)
+            for k in ("rsi", "ema_spread", "volume_ratio", "zone", "bias")
+            if meta.get(k) is not None
+        }
+        return json.dumps(conditions) if conditions else None
 
 
 execution_agent = ExecutionAgent()

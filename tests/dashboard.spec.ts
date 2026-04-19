@@ -32,7 +32,7 @@ test.describe('Automated Bot Terminal Verification', () => {
     
     // Validate the Analytics dashboard loaded correctly
     await expect(page.locator('text=Equity Curve')).toBeVisible();
-    await expect(page.locator('text=Bot Performance Matrix')).toBeVisible();
+    await expect(page.locator('text=Core Formulas')).toBeVisible();
   });
 
   test('Analysis charts render with valid bounds and no zero-size warnings', async ({ page }) => {
@@ -47,7 +47,7 @@ test.describe('Automated Bot Terminal Verification', () => {
     await page.getByRole('button', { name: 'Analysis' }).click();
 
     await expect(page.locator('text=Return Distribution')).toBeVisible();
-    await expect(page.locator('text=Cumulative PnL').first()).toBeVisible();
+    await expect(page.locator('text=LLM Telemetry').first()).toBeVisible();
     await expect(page.locator('text=Equity Curve')).toBeVisible();
 
     await page.waitForTimeout(500);

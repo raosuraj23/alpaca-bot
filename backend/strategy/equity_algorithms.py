@@ -222,13 +222,27 @@ class EquityPairsStrategy(BaseStrategy):
         self.leg_b = getattr(self, 'leg_b', "QQQ")
         self.WINDOW = getattr(self, 'window', 30)
         self.Z_THRESHOLD = getattr(self, 'z_threshold', 2.0)
-        
+        self._reset_pair_state()
+
+    def _reset_pair_state(self) -> None:
         self._price_a: float | None = None
         self._price_b: float | None = None
-        
         self._spreads = deque(maxlen=self.WINDOW)
         self._welford = {"count": 0, "mean": 0.0, "M2": 0.0}
         self._last_signal: str = "NONE"
+
+    def update_params(self, params: dict) -> None:
+        """Reset spread history when legs change so stale data doesn't corrupt the new pair."""
+        legs_changed = "leg_a" in params or "leg_b" in params
+        super().update_params(params)
+        if "window" in params:
+            self.WINDOW = int(self.WINDOW)
+        if "z_threshold" in params:
+            self.Z_THRESHOLD = float(self.Z_THRESHOLD)
+        if legs_changed:
+            self._reset_pair_state()
+            logger.info("[%s] Pair legs changed → state reset (leg_a=%s, leg_b=%s)",
+                        self.name, self.leg_a, self.leg_b)
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
@@ -308,5 +322,244 @@ class EquityPairsStrategy(BaseStrategy):
             "z_score": z_score,
             "position_state": self._position_state.get(self.leg_a, FLAT),
             "ticks_collected": w["count"],
+            "market_hours": _is_market_hours(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: Equity Breakout (ATR-based breakout with volume confirmation)
+# ---------------------------------------------------------------------------
+
+class EquityBreakoutStrategy(BaseStrategy):
+    """
+    ATR-based breakout strategy for equities.
+
+    BUY when:
+      - price > N-bar high + breakout_multiplier × ATR
+      - volume_ratio (current / avg) > volume_threshold
+      - position is FLAT
+    SELL on trailing stop: if price falls below entry − atr_period-bar ATR.
+
+    ATR uses Wilder's smoothing (O(1)). Volume tracked via EWM average.
+
+    Params (all patchable):
+      atr_period          int    ATR smoothing window (default 14)
+      breakout_multiplier float  ATR multiple above N-bar high to confirm breakout (default 1.5)
+      volume_threshold    float  Volume ratio threshold (default 1.8)
+      cooldown_ticks      int    Ticks between signals (default 20)
+    """
+    asset_class = "EQUITY"
+
+    def __init__(self, bot_id="equity-breakout", name="Equity Breakout", allocation=15, **kwargs):
+        super().__init__(bot_id, name, allocation, "ATR Breakout", **kwargs)
+        self.atr_period          = getattr(self, 'atr_period',          14)
+        self.breakout_multiplier = getattr(self, 'breakout_multiplier', 1.5)
+        self.volume_threshold    = getattr(self, 'volume_threshold',    1.8)
+        self.cooldown_ticks      = getattr(self, 'cooldown_ticks',      20)
+
+        self._prev_price:  dict[str, float] = {}
+        self._atr:         dict[str, float] = {}   # Wilder smoothed ATR
+        self._highs:       dict[str, deque] = {}   # rolling N-bar highs
+        self._avg_vol:     dict[str, float] = {}   # EWM volume average
+        self._ticks:       dict[str, int]   = {}
+        self._cooldown:    dict[str, int]   = {}
+        self._entry_price: dict[str, float] = {}
+
+    def _update_atr(self, symbol: str, price: float, volume: float = 0.0) -> None:
+        if symbol not in self._prev_price:
+            self._prev_price[symbol] = price
+            self._atr[symbol]        = 0.0
+            self._highs[symbol]      = deque(maxlen=self.atr_period)
+            self._avg_vol[symbol]    = volume if volume > 0 else 1.0
+            self._ticks[symbol]      = 1
+            return
+        self._ticks[symbol] += 1
+        tr = abs(price - self._prev_price[symbol])
+        alpha = 1.0 / self.atr_period
+        self._atr[symbol]     = self._atr[symbol] * (1 - alpha) + tr * alpha
+        self._prev_price[symbol] = price
+        self._highs[symbol].append(price)
+        if volume > 0:
+            self._avg_vol[symbol] = self._avg_vol[symbol] * 0.95 + volume * 0.05
+
+    async def aanalyze(self, symbol: str, price: float, volume: float = 0.0) -> dict | None:
+        if not _is_market_hours():
+            return None
+
+        self._update_atr(symbol, price, volume)
+        self._cooldown[symbol] = max(0, self._cooldown.get(symbol, 0) - 1)
+
+        if self._ticks.get(symbol, 0) < self.atr_period:
+            return None
+
+        atr     = self._atr[symbol]
+        n_high  = max(self._highs[symbol]) if self._highs[symbol] else price
+        vol_ok  = (volume / max(self._avg_vol.get(symbol, 1.0), 1e-6)) >= self.volume_threshold
+
+        # Trailing stop exit
+        if self._is_long(symbol) and symbol in self._entry_price:
+            stop = self._entry_price[symbol] - atr
+            if price <= stop:
+                self._cooldown[symbol] = self.cooldown_ticks
+                del self._entry_price[symbol]
+                self.signal_count += 1
+                return {
+                    "bot": self.id, "symbol": symbol, "action": "SELL",
+                    "confidence": 0.90, "price": price,
+                    "meta": {"trigger": "trailing_stop", "atr": round(atr, 4)},
+                }
+
+        if self._cooldown[symbol] > 0:
+            return None
+
+        breakout_level = n_high + self.breakout_multiplier * atr
+        signal = None
+        if price > breakout_level and vol_ok and self._is_flat(symbol):
+            conf = min(0.93, 0.70 + (price - breakout_level) / max(atr, 1e-6) * 0.05)
+            self._cooldown[symbol]    = self.cooldown_ticks
+            self._entry_price[symbol] = price
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "BUY",
+                "confidence": round(conf, 3), "price": price,
+                "meta": {"breakout_level": round(breakout_level, 4), "atr": round(atr, 4),
+                         "n_high": round(n_high, 4)},
+            }
+
+        if signal:
+            logger.info("[EQUITY-BREAKOUT] %s → %s (conf=%.2f, atr=%.4f)",
+                        symbol, signal["action"], signal["confidence"], atr)
+        return signal
+
+    def get_state(self, symbol: str) -> dict | None:
+        return {
+            "strategy": self.id,
+            "name": self.name,
+            "asset_class": self.asset_class,
+            "atr": round(self._atr.get(symbol, 0.0), 4),
+            "cooldown_remaining": self._cooldown.get(symbol, 0),
+            "position_state": self._position_state.get(symbol, FLAT),
+            "entry_price": round(self._entry_price[symbol], 4) if symbol in self._entry_price else None,
+            "market_hours": _is_market_hours(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: VWAP Reversion (equity intraday mean-reversion to VWAP)
+# ---------------------------------------------------------------------------
+
+class VWAPReversionStrategy(BaseStrategy):
+    """
+    Intraday mean-reversion to VWAP for equity symbols.
+
+    BUY  when price deviates below VWAP by > sigma_threshold standard deviations.
+    SELL when price deviates above VWAP by > sigma_threshold, or position is LONG.
+
+    VWAP and rolling variance are computed via O(1) cumulative accumulation.
+    State is reset at each market open (9:30 AM ET).
+
+    Params (all patchable):
+      sigma_threshold  float  Deviation in σ to trigger entry (default 1.5)
+      warmup_ticks     int    Minimum ticks before emitting signals (default 30)
+    """
+    asset_class = "EQUITY"
+
+    def __init__(self, bot_id="vwap-reversion", name="VWAP Reversion", allocation=15, **kwargs):
+        super().__init__(bot_id, name, allocation, "VWAP Reversion", **kwargs)
+        self.sigma_threshold = getattr(self, 'sigma_threshold', 1.5)
+        self.warmup_ticks    = getattr(self, 'warmup_ticks',    30)
+
+        # Per-symbol VWAP state: cumulative price*volume and volume, plus Welford variance
+        self._cum_pv:     dict[str, float] = {}   # sum(price * volume)
+        self._cum_vol:    dict[str, float] = {}   # sum(volume)
+        self._welford:    dict[str, dict]  = {}   # rolling price variance
+        self._ticks:      dict[str, int]   = {}
+        self._last_date:  dict[str, int]   = {}   # day-of-year to detect session reset
+        self._last_signal: dict[str, str]  = {}
+
+    def _reset_session(self, symbol: str, price: float) -> None:
+        self._cum_pv[symbol]     = price
+        self._cum_vol[symbol]    = 1.0
+        self._welford[symbol]    = {"count": 0, "mean": 0.0, "M2": 0.0}
+        self._ticks[symbol]      = 0
+        self._last_signal[symbol] = "NONE"
+
+    def _update(self, symbol: str, price: float, volume: float = 1.0) -> None:
+        now = datetime.now(ET)
+        day = now.timetuple().tm_yday
+        if symbol not in self._last_date or self._last_date[symbol] != day:
+            self._reset_session(symbol, price)
+            self._last_date[symbol] = day
+            return
+
+        self._ticks[symbol] += 1
+        v = volume if volume > 0 else 1.0
+        self._cum_pv[symbol]  += price * v
+        self._cum_vol[symbol] += v
+
+        w = self._welford[symbol]
+        w["count"] += 1
+        d = price - w["mean"]
+        w["mean"] += d / w["count"]
+        w["M2"]   += d * (price - w["mean"])
+
+    async def aanalyze(self, symbol: str, price: float, volume: float = 1.0) -> dict | None:
+        if not _is_market_hours():
+            return None
+
+        self._update(symbol, price, volume)
+
+        if self._ticks.get(symbol, 0) < self.warmup_ticks:
+            return None
+
+        w    = self._welford[symbol]
+        vwap = self._cum_pv[symbol] / max(self._cum_vol[symbol], 1e-9)
+        std  = math.sqrt(max(0.0, w["M2"] / w["count"])) if w["count"] > 0 else 0.0
+
+        if std < 1e-9:
+            return None
+
+        z = (price - vwap) / std
+
+        signal = None
+        if z < -self.sigma_threshold and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
+            self._last_signal[symbol] = "BUY"
+            conf = min(0.93, 0.65 + abs(z) * 0.06)
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "BUY",
+                "confidence": round(conf, 3), "price": price,
+                "meta": {"vwap": round(vwap, 4), "z_score": round(z, 3), "std": round(std, 4)},
+            }
+        elif z > self.sigma_threshold and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
+            self._last_signal[symbol] = "SELL"
+            conf = min(0.93, 0.65 + abs(z) * 0.06)
+            self.signal_count += 1
+            signal = {
+                "bot": self.id, "symbol": symbol, "action": "SELL",
+                "confidence": round(conf, 3), "price": price,
+                "meta": {"vwap": round(vwap, 4), "z_score": round(z, 3), "std": round(std, 4)},
+            }
+
+        if signal:
+            logger.info("[VWAP-REV] %s → %s (z=%.2f, vwap=%.4f, conf=%.2f)",
+                        symbol, signal["action"], z, vwap, signal["confidence"])
+        return signal
+
+    def get_state(self, symbol: str) -> dict | None:
+        if symbol not in self._ticks:
+            return None
+        vwap = (self._cum_pv.get(symbol, 0) /
+                max(self._cum_vol.get(symbol, 1e-9), 1e-9))
+        w = self._welford.get(symbol, {})
+        std = math.sqrt(max(0.0, w.get("M2", 0) / w["count"])) if w.get("count", 0) > 0 else 0.0
+        return {
+            "strategy": self.id,
+            "name": self.name,
+            "asset_class": self.asset_class,
+            "vwap": round(vwap, 4),
+            "std": round(std, 4),
+            "ticks": self._ticks.get(symbol, 0),
+            "position_state": self._position_state.get(symbol, FLAT),
             "market_hours": _is_market_hours(),
         }

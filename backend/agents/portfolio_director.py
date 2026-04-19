@@ -11,12 +11,15 @@ for portfolio-level decision making. Uses Haiku (fast/cheap tier) to:
   5. Push SSE events so the UI Brain tab reflects changes in real time
 
 Supported command actions:
-  HALT_BOT               — halt a bot + persist BotState
-  RESUME_BOT             — resume a halted bot + persist BotState
-  ADJUST_ALLOCATION      — change allocation % on a bot (hard-clamped 5–40%)
-  UPDATE_STRATEGY_PARAMS — mutate strategy parameters at runtime (key-intersected)
-  SPAWN_BOT_VARIANT      — deep-copy a bot with new params, add to engine
-  NO_ACTION              — Haiku recommends status quo (logged, not executed)
+  HALT_BOT                   — halt a bot + persist BotState
+  RESUME_BOT                 — resume a halted bot + persist BotState
+  ADJUST_ALLOCATION          — change allocation % on a bot (hard-clamped 5–40%)
+  UPDATE_STRATEGY_PARAMS     — mutate strategy parameters at runtime (key-intersected)
+  SPAWN_BOT_VARIANT          — deep-copy a bot with new params, add to engine
+  ASSIGN_EXISTING_STRATEGY   — bind an existing bot to a specific symbol (removes quarantine)
+  CREATE_NEW_STRATEGY_INSTANCE — instantiate a new bot from any template for a specific symbol
+  UNASSIGN_STRATEGY          — remove a bot-symbol binding
+  NO_ACTION                  — Haiku recommends status quo (logged, not executed)
 
 Architecture:
   - Pydantic structured outputs replace brittle regex JSON parsing
@@ -48,48 +51,59 @@ Analyze the portfolio context and determine what actions, if any, should be take
 Primary objective: maximize portfolio win rate and risk-adjusted return.
 Use bot_win_rates and trade_history to identify underperforming and outperforming bots.
 
-Rules:
+═══════════════════════════════════════════════════════════════
+PRIORITY TASK — PENDING SYMBOL ASSIGNMENT (handle FIRST):
+═══════════════════════════════════════════════════════════════
+If pending_symbols is non-empty, you MUST emit one assignment command per symbol
+BEFORE any other commands. Each pending symbol has been quarantined (no trading)
+until you assign it a strategy.
+
+Use ta_snapshots and research_edges to select the best algorithm:
+
+  Strong trend (EMA spread > 0.3%) + positive edge  → equity-breakout OR momentum-alpha
+  Consolidation / low vol (EMA spread < 0.1%)        → statarb-gamma, equity-rsi, OR crypto-range-scalp
+  High news edge (abs(edge) > 0.07)                  → news-momentum
+  Equity near VWAP mean-reversion profile            → vwap-reversion
+  Two correlated equity symbols (e.g. NVDA/AMD)      → equity-pairs with leg_a/leg_b params
+  Two correlated crypto symbols (e.g. BTC/ETH)       → crypto-pairs with leg_a/leg_b params
+  An existing seed bot already handles similar symbols → ASSIGN_EXISTING_STRATEGY with that bot_id
+
+For each pending symbol, emit one of:
+  a) ASSIGN_EXISTING_STRATEGY — use an existing bot, set target_bot and params.symbol
+  b) CREATE_NEW_STRATEGY_INSTANCE — instantiate a new bot from available_algorithms:
+       set params.algorithm_type, params.new_bot_id ("<algo>-<ticker>-v1"),
+       params.symbol, params.strategy_params (tuned for this symbol), and params.reason
+
+═══════════════════════════════════════════════════════════════
+PORTFOLIO OPTIMIZATION RULES (run after pending assignments):
+═══════════════════════════════════════════════════════════════
 - Only HALT bots with clear negative evidence (fill_rate < 0.1 AND yield24h < -0.5)
 - Bots with win_rate < 0.35 AND total >= 10 trades are strong candidates for HALT or ADJUST_ALLOCATION down
 - Bots with win_rate > 0.60 AND total >= 5 trades may warrant ADJUST_ALLOCATION increase
 - ADJUST_ALLOCATION requires new_allocation_pct (a float 5.0–40.0). NEVER emit ADJUST_ALLOCATION without it.
 - Allocation adjustments must be between 5% and 40%
-- UPDATE_STRATEGY_PARAMS and SPAWN_BOT_VARIANT MUST use ONLY the parameter names listed in the
-  STRATEGY PARAMETER REGISTRY below. Any other name will be silently rejected by the engine.
+- UPDATE_STRATEGY_PARAMS and SPAWN_BOT_VARIANT MUST use ONLY the parameter names in the registry below.
 - SPAWN_BOT_VARIANT tries a parameter variant without halting the original
 - Recommend NO_ACTION or an empty commands list if no intervention is warranted
 - Always provide a reason and expected impact for each action
-- Maximum 3 commands per cycle
+- Maximum 3 commands per cycle (pending assignments count toward this cap)
 
-STRATEGY PARAMETER REGISTRY — exact attribute names the engine accepts:
-
-  momentum-alpha (crypto EMA crossover):
-    alpha_short  float  0.05–0.40   EMA short-window smoothing factor (higher = faster response)
-    alpha_long   float  0.01–0.15   EMA long-window smoothing factor  (lower = smoother trend)
-
-  statarb-gamma (Bollinger Band mean reversion):
-    lookback_period  int    10–50   Bollinger Band window in bars (higher = smoother bands)
-    sigma_multiplier float  1.5–3.0 Band width in standard deviations (higher = fewer but stronger signals)
-
-  hft-sniper (tick momentum):
-    MOMENTUM_THRESHOLD  float  0.0001–0.001  Minimum tick momentum % to trigger a signal
-    MOMENTUM_WINDOW     int    2–10          Ticks used to compute momentum slope
-    COOLDOWN_TICKS      int    3–20          Ticks to wait after a signal before re-arming
-
-  equity-momentum (equity EMA crossover):
-    alpha_short  float  0.05–0.40
-    alpha_long   float  0.01–0.15
-
-  equity-rsi (RSI mean reversion):
-    rsi_period    int    7–21    RSI lookback window
-    rsi_oversold  float  20–40   RSI level that triggers BUY (default 30)
-    rsi_overbought float 60–80   RSI level that triggers SELL (default 70)
-
-  equity-pairs (SPY/QQQ pairs):
-    z_threshold  float  1.0–3.0  Z-score threshold to enter a trade (default 2.0)
-    window       int    10–60    Spread rolling window in bars (default 30)
-
-For variant bots (bot_id ending in -v1, -v2, etc.), use the same parameters as the source bot.
+═══════════════════════════════════════════════════════════════
+STRATEGY PARAMETER REGISTRY — exact attribute names:
+═══════════════════════════════════════════════════════════════
+  momentum-alpha:        alpha_short (0.05–0.40), alpha_long (0.01–0.15)
+  statarb-gamma:         lookback_period (10–50), sigma_multiplier (1.5–3.0)
+  hft-sniper:            MOMENTUM_THRESHOLD (0.0001–0.001), MOMENTUM_WINDOW (2–10), COOLDOWN_TICKS (3–20)
+  equity-momentum:       alpha_short (0.05–0.40), alpha_long (0.01–0.15)
+  equity-rsi:            rsi_period (7–21), rsi_oversold (20–40), rsi_overbought (60–80)
+  equity-pairs:          leg_a str (e.g. "NVDA"), leg_b str (e.g. "AMD"), z_threshold (1.0–3.0), window (10–60)
+  crypto-pairs:          leg_a str (e.g. "BTC/USD"), leg_b str (e.g. "ETH/USD"), z_threshold (1.0–3.0), window (10–60)
+  equity-breakout:       atr_period (7–28), breakout_multiplier (1.0–3.0), volume_threshold (1.2–3.0), cooldown_ticks (5–40)
+  vwap-reversion:        sigma_threshold (1.0–2.5), warmup_ticks (15–60)
+  news-momentum:         edge_threshold (0.04–0.12), momentum_ticks (3–10), hold_limit_ticks (10–60)
+  crypto-range-scalp:    bb_period (10–40), bb_sigma (1.0–2.5), min_range_ticks (5–20), cooldown_ticks (3–15)
+  covered-call:          (no patchable params)
+  protective-put:        (no patchable params)
 """
 
 # ---------------------------------------------------------------------------
@@ -97,12 +111,15 @@ For variant bots (bot_id ending in -v1, -v2, etc.), use the same parameters as t
 # ---------------------------------------------------------------------------
 
 class CommandAction(str, Enum):
-    HALT_BOT               = "HALT_BOT"
-    RESUME_BOT             = "RESUME_BOT"
-    ADJUST_ALLOCATION      = "ADJUST_ALLOCATION"
-    UPDATE_STRATEGY_PARAMS = "UPDATE_STRATEGY_PARAMS"
-    SPAWN_BOT_VARIANT      = "SPAWN_BOT_VARIANT"
-    NO_ACTION              = "NO_ACTION"
+    HALT_BOT                    = "HALT_BOT"
+    RESUME_BOT                  = "RESUME_BOT"
+    ADJUST_ALLOCATION           = "ADJUST_ALLOCATION"
+    UPDATE_STRATEGY_PARAMS      = "UPDATE_STRATEGY_PARAMS"
+    SPAWN_BOT_VARIANT           = "SPAWN_BOT_VARIANT"
+    ASSIGN_EXISTING_STRATEGY    = "ASSIGN_EXISTING_STRATEGY"
+    CREATE_NEW_STRATEGY_INSTANCE = "CREATE_NEW_STRATEGY_INSTANCE"
+    UNASSIGN_STRATEGY           = "UNASSIGN_STRATEGY"
+    NO_ACTION                   = "NO_ACTION"
 
 
 class CommandParams(BaseModel):
@@ -112,6 +129,9 @@ class CommandParams(BaseModel):
     strategy_params: Optional[dict]  = Field(None, description="Key-value pairs to mutate on strategy")
     source_bot:      Optional[str]   = Field(None, description="Bot ID to clone from")
     new_bot_id:      Optional[str]   = Field(None, description="Unique ID for the variant bot")
+    # Symbol assignment fields
+    symbol:          Optional[str]   = Field(None, description="Symbol to assign/unassign strategy to")
+    algorithm_type:  Optional[str]   = Field(None, description="Algorithm template type for CREATE_NEW_STRATEGY_INSTANCE")
 
 
 class DirectorCommand(BaseModel):
@@ -134,13 +154,17 @@ class CommandDispatcher:
     Each handler owns its own zero-trust guardrails.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, db_factory: Optional[Callable] = None) -> None:
+        self._db_factory = db_factory
         self._registry: dict[CommandAction, Callable] = {
-            CommandAction.HALT_BOT:               self._handle_halt_bot,
-            CommandAction.RESUME_BOT:             self._handle_resume_bot,
-            CommandAction.ADJUST_ALLOCATION:      self._handle_adjust_allocation,
-            CommandAction.UPDATE_STRATEGY_PARAMS: self._handle_update_strategy_params,
-            CommandAction.SPAWN_BOT_VARIANT:      self._handle_spawn_bot_variant,
+            CommandAction.HALT_BOT:                     self._handle_halt_bot,
+            CommandAction.RESUME_BOT:                   self._handle_resume_bot,
+            CommandAction.ADJUST_ALLOCATION:            self._handle_adjust_allocation,
+            CommandAction.UPDATE_STRATEGY_PARAMS:       self._handle_update_strategy_params,
+            CommandAction.SPAWN_BOT_VARIANT:            self._handle_spawn_bot_variant,
+            CommandAction.ASSIGN_EXISTING_STRATEGY:     self._handle_assign_existing_strategy,
+            CommandAction.CREATE_NEW_STRATEGY_INSTANCE: self._handle_create_new_strategy_instance,
+            CommandAction.UNASSIGN_STRATEGY:            self._handle_unassign_strategy,
         }
 
     async def dispatch(
@@ -243,7 +267,6 @@ class CommandDispatcher:
     ) -> bool:
         source_bot = cmd.params.source_bot or cmd.target_bot
         new_bot_id = cmd.params.new_bot_id
-        # Zero-trust guardrail: both IDs required
         if not source_bot or not new_bot_id:
             logger.warning(
                 "[DIRECTOR] SPAWN_BOT_VARIANT requires source_bot and new_bot_id — "
@@ -252,6 +275,113 @@ class CommandDispatcher:
             return False
         strategy_params = cmd.params.strategy_params or {}
         return engine.spawn_variant(source_bot, new_bot_id, strategy_params)
+
+    async def _handle_assign_existing_strategy(
+        self, cmd: DirectorCommand, engine, persist_fn: Callable
+    ) -> bool:
+        symbol  = cmd.params.symbol
+        bot_id  = cmd.target_bot or cmd.params.source_bot
+        if not symbol or not bot_id:
+            logger.warning("[DIRECTOR] ASSIGN_EXISTING_STRATEGY requires symbol and target_bot")
+            return False
+        success = engine.assign_strategy_to_symbol(symbol, bot_id)
+        if success:
+            asyncio.create_task(
+                persist_fn(bot_id, engine.bots[bot_id].status if bot_id in engine.bots else "ACTIVE", engine)
+            )
+            asyncio.create_task(self._persist_symbol_assignment(symbol, bot_id, bot_id, engine, cmd))
+        return success
+
+    async def _handle_create_new_strategy_instance(
+        self, cmd: DirectorCommand, engine, persist_fn: Callable
+    ) -> bool:
+        symbol     = cmd.params.symbol
+        algo_type  = cmd.params.algorithm_type
+        new_bot_id = cmd.params.new_bot_id
+        if not symbol or not algo_type or not new_bot_id:
+            logger.warning(
+                "[DIRECTOR] CREATE_NEW_STRATEGY_INSTANCE requires symbol, algorithm_type, new_bot_id "
+                "— got symbol=%s algo=%s bot_id=%s", symbol, algo_type, new_bot_id,
+            )
+            return False
+        # Validate algorithm type exists
+        if algo_type not in engine._strategy_templates:
+            logger.warning("[DIRECTOR] CREATE_NEW_STRATEGY_INSTANCE: unknown algo_type=%s", algo_type)
+            return False
+        strategy_params = cmd.params.strategy_params or {}
+        success = engine.create_strategy_for_symbol(symbol, algo_type, strategy_params, new_bot_id)
+        if success:
+            asyncio.create_task(persist_fn(new_bot_id, "ACTIVE", engine))
+            asyncio.create_task(
+                self._persist_symbol_assignment(symbol, new_bot_id, algo_type, engine, cmd)
+            )
+        return success
+
+    async def _handle_unassign_strategy(
+        self, cmd: DirectorCommand, engine, persist_fn: Callable
+    ) -> bool:
+        symbol = cmd.params.symbol
+        bot_id = cmd.target_bot
+        if not symbol or not bot_id:
+            logger.warning("[DIRECTOR] UNASSIGN_STRATEGY requires symbol and target_bot")
+            return False
+        success = engine.unassign_strategy_from_symbol(symbol, bot_id)
+        if success:
+            asyncio.create_task(self._deactivate_symbol_assignment(symbol, bot_id))
+        return success
+
+    async def _persist_symbol_assignment(
+        self, symbol: str, bot_id: str, algo_type: str, engine, cmd: "DirectorCommand"
+    ) -> None:
+        """Persist a new symbol-strategy assignment to the DB."""
+        try:
+            from db.models import SymbolStrategyAssignment
+            from sqlalchemy import select
+            bot     = engine.bots.get(bot_id)
+            params  = cmd.params.strategy_params
+            async with self._db_factory()() as session:
+                # Deactivate any prior active assignment for this symbol+bot_id
+                existing = (await session.execute(
+                    select(SymbolStrategyAssignment)
+                    .where(SymbolStrategyAssignment.symbol == symbol)
+                    .where(SymbolStrategyAssignment.bot_id == bot_id)
+                    .where(SymbolStrategyAssignment.active == True)
+                )).scalars().all()
+                for row in existing:
+                    row.active = False
+
+                row = SymbolStrategyAssignment(
+                    symbol         = symbol,
+                    bot_id         = bot_id,
+                    algorithm_type = algo_type,
+                    assigned_by    = "director",
+                    rationale      = cmd.params.reason[:500] if cmd.params.reason else None,
+                    params_json    = json.dumps(params) if params else None,
+                    active         = True,
+                )
+                session.add(row)
+                await session.commit()
+                logger.info("[DIRECTOR] SymbolStrategyAssignment persisted: %s → %s", symbol, bot_id)
+        except Exception as exc:
+            logger.warning("[DIRECTOR] SymbolStrategyAssignment persist failed: %s", exc)
+
+    async def _deactivate_symbol_assignment(self, symbol: str, bot_id: str) -> None:
+        """Mark a symbol-strategy assignment inactive in the DB."""
+        try:
+            from db.models import SymbolStrategyAssignment
+            from sqlalchemy import select
+            async with self._db_factory()() as session:
+                rows = (await session.execute(
+                    select(SymbolStrategyAssignment)
+                    .where(SymbolStrategyAssignment.symbol == symbol)
+                    .where(SymbolStrategyAssignment.bot_id == bot_id)
+                    .where(SymbolStrategyAssignment.active == True)
+                )).scalars().all()
+                for row in rows:
+                    row.active = False
+                await session.commit()
+        except Exception as exc:
+            logger.warning("[DIRECTOR] Deactivate assignment failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -281,11 +411,16 @@ class AutonomousPortfolioDirector:
         self._push           = push_fn
         self._get_engine     = get_engine_fn
         self._get_scanner    = get_scanner_fn
+        self._get_research   = None   # injected post-construction via set_research_fn()
         self._db_factory     = db_factory
         self._model          = None   # lazy raw ChatModel (kept for reference)
         self._structured_llm = None   # lazy with_structured_output runnable
-        self._dispatcher     = CommandDispatcher()
+        self._dispatcher     = CommandDispatcher(db_factory=db_factory)
         self._running        = False
+
+    def set_research_fn(self, fn: Callable) -> None:
+        """Inject the research agent getter so director can read the latest brief."""
+        self._get_research = fn
 
     def _ensure_structured_llm(self):
         """Lazy-build the structured-output runnable on first use."""
@@ -345,13 +480,40 @@ class AutonomousPortfolioDirector:
         for v in bot_win_rates.values():
             v["win_rate"] = round(v["wins"] / v["total"], 3) if v["total"] else 0.0
 
+        # Gather per-symbol TA snapshots for pending symbols
+        pending = engine.get_pending_assignment()
+        ta_snapshots: dict = {}
+        for sym in pending:
+            ta_snapshots[sym] = engine.get_ta_snapshot(sym)
+
+        # Gather research edges for pending symbols
+        research_edges: dict = {}
+        if self._get_research:
+            try:
+                research_agent = self._get_research()
+                if research_agent and hasattr(research_agent, "_last_brief") and research_agent._last_brief:
+                    brief = research_agent._last_brief
+                    for s in getattr(brief, "sentiment_by_symbol", []):
+                        research_edges[s.symbol] = {
+                            "sentiment":  s.sentiment,
+                            "edge":       round(getattr(s, "edge", 0.0), 4),
+                            "confidence": round(getattr(s, "confidence", 0.5), 3),
+                        }
+            except Exception as _re:
+                logger.debug("[DIRECTOR] Research brief unavailable: %s", _re)
+
         context = {
-            "bots":          engine.get_bot_states(),
-            "stats":         engine.get_stats(),
-            "scanner":       scanner[:10],
-            "trade_history": raw_trades[:20],   # recent 20 trades for LLM context
-            "bot_win_rates": bot_win_rates,     # pre-aggregated for token efficiency
-            "ts":            datetime.now(timezone.utc).isoformat(),
+            "bots":               engine.get_bot_states(),
+            "stats":              engine.get_stats(),
+            "scanner":            scanner[:10],
+            "trade_history":      raw_trades[:20],
+            "bot_win_rates":      bot_win_rates,
+            "pending_symbols":    pending,
+            "symbol_assignments": engine.get_symbol_strategy_map(),
+            "available_algorithms": engine.get_available_algorithms(),
+            "ta_snapshots":       ta_snapshots,
+            "research_edges":     research_edges,
+            "ts":                 datetime.now(timezone.utc).isoformat(),
         }
 
         commands: list[DirectorCommand] = await self._generate_commands(context)
