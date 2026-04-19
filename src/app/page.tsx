@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { useTradingEngine, useTradingStore } from '@/hooks/useTradingStream';
-import { Activity, LayoutDashboard, BarChart3, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
+import { Activity, LayoutDashboard, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // Views
@@ -13,6 +13,8 @@ import { BacktestRunner } from '@/components/dashboard/backtest-runner';
 import { BotReflections } from '@/components/dashboard/bot-reflections';
 import { OrchestratorChat } from '@/components/dashboard/orchestrator-chat';
 import { TradeLedger } from '@/components/dashboard/trade-ledger';
+import { CommandPalette } from '@/components/ui/command-palette';
+import { MiniKPIStrip } from '@/components/ui/mini-kpi-strip';
 
 function SystemClock() {
   const [mounted, setMounted] = React.useState(false);
@@ -26,7 +28,6 @@ function SystemClock() {
   }, []);
 
   if (!mounted || !time) {
-    // Render a fixed-width placeholder so layout doesn't shift on mount
     return (
       <div className="flex flex-col items-end px-4 border-l border-[var(--border)] ml-2">
         <span className="text-xs text-[var(--kraken-light)] font-mono font-bold leading-none opacity-0">00:00:00</span>
@@ -46,12 +47,39 @@ function SystemClock() {
     </div>
   );
 }
+
+function WsStatusDot() {
+  const wsStatus = useTradingStore(s => s.wsStatus);
+  if (wsStatus === 'connected') {
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="w-1.5 h-1.5 rounded-sm bg-[var(--neon-green)] animate-live" />
+        <span className="text-[var(--neon-green)] font-bold text-xs tracking-widest">LIVE</span>
+      </div>
+    );
+  }
+  if (wsStatus === 'reconnecting') {
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="w-1.5 h-1.5 rounded-sm bg-[var(--agent-learning)] animate-pulse" />
+        <span className="text-[var(--agent-learning)] font-bold text-xs tracking-widest">SYNC</span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="w-1.5 h-1.5 rounded-sm bg-[var(--neon-red)]" />
+      <span className="text-[var(--neon-red)] font-bold text-xs tracking-widest">OFFLINE</span>
+    </div>
+  );
+}
+
 type TabView = 'DESK' | 'PERFORMANCE' | 'STRATEGIES' | 'BACKTEST' | 'LEDGER' | 'REFLECTIONS';
 
 export default function AppShell() {
   const [activeTab, setActiveTab] = React.useState<TabView>('DESK');
-  const { assetClass, setAssetClass, activeSymbol, accountEquity } = useTradingStore();
-  
+  const { activeSymbol } = useTradingStore();
+
   // Mount the simulation WebSocket engine globally
   useTradingEngine();
 
@@ -69,7 +97,7 @@ export default function AppShell() {
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-[var(--background)] text-[var(--foreground)] selection:bg-[var(--kraken-purple)] selection:text-white font-sans">
-      
+
       {/* Top Header */}
       <header className="h-14 border-b border-[var(--border)] bg-[var(--panel)] flex items-center px-4 justify-between shrink-0 shadow-md relative z-20">
         <div className="flex items-center space-x-3">
@@ -78,22 +106,6 @@ export default function AppShell() {
           </div>
           <span className="font-bold tracking-tight text-md text-[var(--kraken-light)] mr-2">ALPACA X</span>
 
-          {/* Asset Class Selector Toggle */}
-          <div className="flex bg-[var(--background)] border border-[var(--border)] rounded-sm p-1 mx-2">
-            {(['EQUITY', 'OPTIONS', 'CRYPTO'] as const).map(ac => (
-               <button
-                 key={ac}
-                 onClick={() => setAssetClass(ac)}
-                 className={`px-3 py-1 text-xs font-bold rounded-sm tracking-wider transition-colors ${assetClass === ac ? 'bg-[var(--panel-muted)] text-[var(--kraken-light)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-white'}`}
-               >
-                 {ac}
-               </button>
-            ))}
-          </div>
-          
-          <div className="h-4 w-px bg-[var(--border)] mx-1" />
-          
-          {/* Tab Navigation with Scroll Wrap to Prevent Squishing */}
           <nav className="flex space-x-1 lg:space-x-2 overflow-x-auto scrollbar-hide py-1">
              <TabButton active={activeTab === 'DESK'} onClick={() => setActiveTab('DESK')} icon={<LayoutDashboard />}>Desk</TabButton>
              <TabButton active={activeTab === 'PERFORMANCE'} onClick={() => setActiveTab('PERFORMANCE')} icon={<LineChart />}>Analysis</TabButton>
@@ -105,27 +117,14 @@ export default function AppShell() {
         </div>
 
         {/* Global Stats KPIs */}
-        <div className="flex space-x-6 text-xs font-mono font-medium items-center">
+        <div className="flex items-center gap-3 text-xs font-mono font-medium">
           <div className="hidden lg:flex items-center space-x-1 border border-[var(--border)] bg-[var(--panel-muted)] px-3 py-1.5 rounded-sm">
             <span className="text-[var(--muted-foreground)] uppercase mr-1">Active:</span>
             <span className="text-[var(--foreground)]">{activeSymbol}</span>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-sm bg-[var(--neon-green)] animate-live" />
-            <span className="text-[var(--neon-green)] font-bold text-xs tracking-widest">LIVE</span>
-          </div>
-
-          <div className="flex flex-col items-end border-l border-[var(--border)] pl-4 ml-1">
-            <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-widest leading-none mb-0.5">Total Equity</span>
-            <span className="text-sm font-mono tabular-nums font-bold text-[var(--foreground)] leading-none">
-              {accountEquity !== null
-                ? `$${accountEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                : <span className="text-[var(--muted-foreground)] opacity-50 text-xs">SYNCING...</span>
-              }
-            </span>
-          </div>
-
+          <WsStatusDot />
+          <MiniKPIStrip />
           <SystemClock />
         </div>
       </header>
@@ -145,7 +144,10 @@ export default function AppShell() {
           </motion.div>
         </AnimatePresence>
       </main>
+
       <OrchestratorChat />
+
+      <CommandPalette />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { useEffect, useRef } from 'react';
+import { toast } from 'sonner';
 import { API_BASE, WS_BASE } from '@/lib/api';
 
 import type {
@@ -62,6 +63,7 @@ interface TradingStore {
   performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean; sharpe: number; sortino: number; realized_trades?: { pnl: number }[] };
   lastSignal: { bot_id: string; action: string; symbol: string; confidence: number; timestamp: string } | null;
   ohlcvData: { candles: { time: number; open: number; high: number; low: number; close: number; volume: number }[]; symbol: string } | null;
+  wsStatus: 'connected' | 'reconnecting' | 'offline';
 
   setAssetClass: (ac: AssetClass) => void;
   setActiveSymbol: (s: string) => void;
@@ -70,7 +72,7 @@ interface TradingStore {
   fetchRiskStatus: () => Promise<void>;
   fetchPositions: () => Promise<void>;
   fetchLedger: () => Promise<void>;
-  injectSocketData: (symbol: string, price: number, volume?: number) => void;
+  injectSocketData: (ticks: Array<{ symbol: string, price: number, volume?: number }>) => void;
   fetchAPIIntegrations: () => Promise<void>;
   fetchStrategyStates: () => Promise<void>;
 }
@@ -94,6 +96,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   performance:   { history: [], net_pnl: 0, drawdown: 0, has_data: false, sharpe: 0, sortino: 0 },
   lastSignal:    null,
   ohlcvData:     null,
+  wsStatus:      'offline',
   marketHistory: [],
   learningHistory: [],
   aiInsights:    null,
@@ -150,7 +153,12 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
-        set({ riskStatus: await res.json() });
+        const next = await res.json();
+        const prev = get().riskStatus;
+        if (next.triggered && !prev?.triggered) {
+          toast.error(`Kill Switch Active — ${next.reason ?? 'Trading Halted'}`, { duration: Infinity });
+        }
+        set({ riskStatus: next });
       }
     } catch {
       // Silent fail — risk status is non-critical for UI
@@ -235,34 +243,44 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   },
 
   // Real-time integration pipe for the Python FastAPI / Alpaca WebSocket bridge.
-  // Receives symbol + price from the backend stream and updates the Zustand store.
+  // Receives an array of batched ticks from the backend stream and updates the Zustand store once.
   // In production, Alpaca provides precise daily bars; the change24h here is a
   // rough visual approximation until the daily bar feed is wired up (Phase 1).
-  injectSocketData: (symbol, price, volume) => {
-    const currentList = get().watchlist;
-    const existing = currentList.find(w => w.symbol === symbol);
+  injectSocketData: (ticks) => {
+    let currentList = get().watchlist;
+    let newTicker = get().ticker;
+    let isActiveChanged = false;
 
-    let newWatchlist = currentList;
-    if (existing) {
-      const diff       = price - existing.price;
-      const changePct  = existing.change24h + (diff / price) * 100;
-      const updated    = { ...existing, price, volume: volume ?? existing.volume, change24h: changePct };
-      newWatchlist     = currentList.map(item => item.symbol === symbol ? updated : item);
+    // Use a map for O(1) deduplication of multiple ticks for the same symbol in a single batch
+    const latestTicks = new Map<string, { symbol: string, price: number, volume?: number }>();
+    for (const tick of ticks) {
+      latestTicks.set(tick.symbol, tick);
     }
 
-    const isActive = get().activeSymbol === symbol;
-    const newTicker = isActive && existing
-      ? { ...existing, price, volume: volume ?? existing.volume }
-      : get().ticker;
+    let watchlistUpdated = false;
+    for (const { symbol, price, volume } of latestTicks.values()) {
+      const existing = currentList.find(w => w.symbol === symbol);
+      if (existing) {
+        watchlistUpdated = true;
+        const diff       = price - existing.price;
+        const changePct  = existing.change24h + (diff / price) * 100;
+        const updated    = { ...existing, price, volume: volume ?? existing.volume, change24h: changePct };
+        currentList      = currentList.map(item => item.symbol === symbol ? updated : item);
 
-    // (Removed offline execution trace injection)
-    const newTrades = get().recentTrades;
+        const isActive = get().activeSymbol === symbol;
+        if (isActive) {
+          newTicker = { ...existing, price, volume: volume ?? existing.volume };
+          isActiveChanged = true;
+        }
+      }
+    }
 
-    set({
-      watchlist: newWatchlist,
-      recentTrades: newTrades,
-      ...(isActive && { ticker: newTicker }),
-    });
+    if (watchlistUpdated || isActiveChanged) {
+      set({
+        watchlist: currentList,
+        ...(isActiveChanged && { ticker: newTicker }),
+      });
+    }
   },
 
   // Polls the FastAPI REST endpoints for account/position/order snapshots.
@@ -366,15 +384,29 @@ export function useTradingEngine() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        attemptsRef.current = 0;  // reset backoff on successful connection
+        attemptsRef.current = 0;
+        useTradingStore.setState({ wsStatus: 'connected' });
       };
+
+      let batchedTicks: Array<{ symbol: string, price: number, volume?: number }> = [];
+      let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data) as SocketTickPayload;
           if (payload.type === 'QUOTE' || payload.type === 'TICK') {
             const { symbol, price, volume } = payload.data;
-            useTradingStore.getState().injectSocketData(symbol, price, volume);
+            batchedTicks.push({ symbol, price, volume });
+
+            if (!batchTimer) {
+              batchTimer = setTimeout(() => {
+                if (batchedTicks.length > 0) {
+                  useTradingStore.getState().injectSocketData(batchedTicks);
+                  batchedTicks = [];
+                }
+                batchTimer = null;
+              }, 100); // Batch updates every 100ms
+            }
           } else if (payload.type === 'SIGNAL') {
             const d = payload.data as any;
             const log = `[SIGNAL] ${d.bot_id?.toUpperCase()} ${d.action} ${d.symbol} qty=${Number(d.qty).toFixed(6)} conf=${d.confidence}`;
@@ -382,6 +414,7 @@ export function useTradingEngine() {
               botLogs: [...s.botLogs, log].slice(-100),
               lastSignal: d,
             }));
+            toast.info(`Signal: ${d.action} ${d.symbol} @ ${Math.round(d.confidence * 100)}%`, { duration: 4000 });
           }
         } catch (err) {
           console.error('[ORCHESTRATOR] WebSocket message parse error', err);
@@ -397,8 +430,10 @@ export function useTradingEngine() {
         attemptsRef.current += 1;
         if (attemptsRef.current > WS_MAX_ATTEMPTS) {
           console.warn('[ORCHESTRATOR] WebSocket max reconnect attempts reached.');
+          useTradingStore.setState({ wsStatus: 'offline' });
           return;
         }
+        useTradingStore.setState({ wsStatus: 'reconnecting' });
         const delay = WS_BASE_DELAY_MS * Math.pow(2, attemptsRef.current - 1);
         console.warn(`[ORCHESTRATOR] WebSocket closed — reconnecting in ${delay}ms (attempt ${attemptsRef.current}/${WS_MAX_ATTEMPTS})`);
         retryTimer.current = setTimeout(connect, delay);
@@ -425,6 +460,7 @@ export function useTradingEngine() {
         // Scanner results update the scannerResults store slice
         if (data.type === 'scanner' && Array.isArray(data.results)) {
           useTradingStore.setState({ scannerResults: data.results });
+          toast.success(`Scanner: ${data.results.length} picks updated`, { duration: 3000 });
         }
 
         // All reflection types go to learningHistory (observe, calculate, decision, learning)

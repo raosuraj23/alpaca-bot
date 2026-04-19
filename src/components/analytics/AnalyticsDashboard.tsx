@@ -195,34 +195,33 @@ export function AnalyticsDashboard() {
         </div>
       )}
 
-      {/* Filter Bar */}
-      <div className="flex items-center gap-2 shrink-0">
-        <div className="flex bg-[var(--panel)] border border-[var(--border)] rounded-sm p-0.5">
-          {PERIODS.map(p => (
-            <button
-              key={p}
-              onClick={() => setPeriod(p)}
-              className={`px-3 py-1 text-xs font-mono rounded-sm transition-colors ${
-                period === p
-                  ? 'bg-[var(--kraken-purple)]/20 text-[var(--kraken-light)] border border-[var(--kraken-purple)]/40'
-                  : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
-              }`}
-            >
-              {p}
-            </button>
-          ))}
-        </div>
-        {loading && (
-          <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-50 animate-pulse">loading...</span>
-        )}
-        <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 ml-auto">30s refresh</span>
-      </div>
-
       {/* ── Bento Grid ── */}
       <div className="grid grid-cols-12 gap-3">
 
-        {/* Row 1 — Core Formulas + KPI Strip (merged) */}
-        <div className="col-span-12">
+        {/* Row 1 — KPI Strip + inline period filter */}
+        <div className="col-span-12 flex flex-col gap-2">
+          {/* Period filter sits above GlobalKPIs, no extra row */}
+          <div className="flex items-center gap-2">
+            <div className="flex bg-[var(--panel)] border border-[var(--border)] rounded-sm p-0.5">
+              {PERIODS.map(p => (
+                <button
+                  key={p}
+                  onClick={() => setPeriod(p)}
+                  className={`px-3 py-1 text-xs font-mono rounded-sm transition-colors ${
+                    period === p
+                      ? 'bg-[var(--kraken-purple)]/20 text-[var(--kraken-light)] border border-[var(--kraken-purple)]/40'
+                      : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                  }`}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+            {loading && (
+              <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-50 animate-pulse">loading...</span>
+            )}
+            <span className="text-xs font-mono text-[var(--muted-foreground)] opacity-40 ml-auto">30s refresh</span>
+          </div>
           <GlobalKPIs
             perfData={perfData}
             riskStatus={riskStatus}
@@ -242,7 +241,7 @@ export function AnalyticsDashboard() {
 
         {/* Row 2 — Equity Curve (6) | Confidence Distribution (6, replaces Drawdown) */}
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={netPnl >= 0 ? <TrendingUp /> : <TrendingDown />}
@@ -256,7 +255,7 @@ export function AnalyticsDashboard() {
         </BentoCell>
 
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={<BarChart3 />}
@@ -269,9 +268,9 @@ export function AnalyticsDashboard() {
           <ConfidenceHistogram data={signalsData.confidence_distribution ?? []} height={256} />
         </BentoCell>
 
-        {/* Row 3 — Return Distribution (6) | LLM Telemetry (6) */}
+        {/* Rows 3+4 — 3-col layout at lg+: Return Distribution | LLM Telemetry | LLM Intelligence | Signal Confidence (wraps) */}
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={<BarChart3 />}
@@ -281,11 +280,11 @@ export function AnalyticsDashboard() {
           }
           bodyClass="p-3"
         >
-          <ReturnDistribution trades={perfData.realized_trades} height={256} />
+          <ReturnDistribution trades={perfData.realized_trades} height={208} />
         </BentoCell>
 
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={<Zap />}
@@ -297,12 +296,11 @@ export function AnalyticsDashboard() {
           }
           bodyClass="p-3"
         >
-          <LLMTelemetry llmRecords={[]} llmCostData={llmCostData} mode="cumulative" height={256} />
+          <LLMTelemetry llmRecords={[]} llmCostData={llmCostData} mode="cumulative" height={208} />
         </BentoCell>
 
-        {/* Row 4 — LLM Intelligence (6) | Signal Confidence vs Win Rate (6) */}
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={<BrainCircuit />}
@@ -312,11 +310,11 @@ export function AnalyticsDashboard() {
           }
           bodyClass="p-3"
         >
-          <LLMBreakdown data={llmBreakdown} height={256} />
+          <LLMBreakdown data={llmBreakdown} height={208} />
         </BentoCell>
 
         <BentoCell
-          className="col-span-12 lg:col-span-6 h-[320px]"
+          className="col-span-12 lg:col-span-6 h-[260px]"
           header={
             <CellTitle
               icon={<Activity />}
@@ -326,7 +324,7 @@ export function AnalyticsDashboard() {
           }
           bodyClass="p-3"
         >
-          <SignalConfidenceChart data={signalsData.by_agent ?? []} height={256} />
+          <SignalConfidenceChart data={signalsData.by_agent ?? []} height={208} />
         </BentoCell>
 
       </div>

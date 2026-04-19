@@ -53,10 +53,12 @@ class EquityMomentumStrategy(BaseStrategy):
         self.ema_long:  dict[str, float] = {}
         self._ticks: dict[str, int] = {}
         self._last_cross: dict[str, str] = {}
-        
+        self._entry_price: dict[str, float] = {}
+
         self.alpha_short = getattr(self, 'alpha_short', 0.12)
         self.alpha_long = getattr(self, 'alpha_long', 0.03)
         self.warmup_ticks = getattr(self, 'warmup_ticks', 66) # Must wait for long EMA to stabilize
+        self.min_profit_to_exit_pct = getattr(self, 'min_profit_to_exit_pct', 0.003)
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
@@ -85,6 +87,10 @@ class EquityMomentumStrategy(BaseStrategy):
             self._last_cross[symbol] = "BUY"
             signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
         elif spread < -0.0015 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
+            if symbol in self._entry_price:
+                profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
+                if profit_pct < self.min_profit_to_exit_pct:
+                    return None
             self._last_cross[symbol] = "SELL"
             signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
 
@@ -93,6 +99,14 @@ class EquityMomentumStrategy(BaseStrategy):
             logger.info("[EQUITY-MOMENTUM] %s -> %s (conf=%.2f, spread=%.4f%%)",
                         symbol, signal["action"], signal["confidence"], spread * 100)
         return signal
+
+    def notify_fill(self, symbol: str, action: str) -> None:
+        super().notify_fill(symbol, action)
+        if action == "SELL":
+            self._entry_price.pop(symbol, None)
+
+    def set_entry_price(self, symbol: str, price: float) -> None:
+        self._entry_price[symbol] = price
 
     def get_state(self, symbol: str) -> dict | None:
         if symbol not in self.ema_short:
@@ -125,13 +139,15 @@ class EquityRSIStrategy(BaseStrategy):
         self.RSI_PERIOD = getattr(self, 'rsi_period', 14)
         self.RSI_OVERSOLD = getattr(self, 'rsi_oversold', 30)
         self.RSI_OVERBOUGHT = getattr(self, 'rsi_overbought', 70)
-        
+        self.min_profit_to_exit_pct = getattr(self, 'min_profit_to_exit_pct', 0.003)
+
         self._prev_price: dict[str, float] = {}
         self._avg_gain: dict[str, float] = {}
         self._avg_loss: dict[str, float] = {}
         self._rsi: dict[str, float] = {}
         self._ticks: dict[str, int] = {}
         self._last_signal: dict[str, str] = {}
+        self._entry_price: dict[str, float] = {}
 
     def _update_rsi_o1(self, symbol: str, price: float):
         """O(1) Wilder's smoothing without needing a deque."""
@@ -185,6 +201,10 @@ class EquityRSIStrategy(BaseStrategy):
             self._last_signal[symbol] = "BUY"
             signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.60 + (self.RSI_OVERSOLD - rsi) / 30 * 0.35), "price": price}
         elif rsi > self.RSI_OVERBOUGHT and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
+            if symbol in self._entry_price:
+                profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
+                if profit_pct < self.min_profit_to_exit_pct:
+                    return None
             self._last_signal[symbol] = "SELL"
             signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.60 + (rsi - self.RSI_OVERBOUGHT) / 30 * 0.35), "price": price}
 
@@ -193,6 +213,14 @@ class EquityRSIStrategy(BaseStrategy):
             logger.info("[EQUITY-RSI] %s -> %s (conf=%.2f, RSI=%.1f)",
                         symbol, signal["action"], signal["confidence"], rsi)
         return signal
+
+    def notify_fill(self, symbol: str, action: str) -> None:
+        super().notify_fill(symbol, action)
+        if action == "SELL":
+            self._entry_price.pop(symbol, None)
+
+    def set_entry_price(self, symbol: str, price: float) -> None:
+        self._entry_price[symbol] = price
 
     def get_state(self, symbol: str) -> dict | None:
         rsi = self._rsi.get(symbol)

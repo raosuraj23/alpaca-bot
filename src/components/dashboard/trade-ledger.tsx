@@ -79,6 +79,28 @@ function KpiSummary({ data, ledgerCount }: { data: RealizedPnlData | null; ledge
 }
 
 // ---------------------------------------------------------------------------
+// TicketIdCell — truncated display with title tooltip + click-to-copy
+// ---------------------------------------------------------------------------
+
+function TicketIdCell({ fullId, short }: { fullId: string; short: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const handleClick = () => {
+    navigator.clipboard.writeText(fullId).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 600);
+  };
+  return (
+    <span
+      title={fullId}
+      onClick={handleClick}
+      className={`cursor-pointer transition-colors ${copied ? 'text-[var(--neon-green)]' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}`}
+    >
+      {short}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // TradeLedger Component
 // ---------------------------------------------------------------------------
 
@@ -157,86 +179,111 @@ export function TradeLedger() {
     return [...closed, ...open];
   }, [realizedData, positions]);
 
+  const hasNonZeroSlippage = React.useMemo(
+    () => ledgerTrades.some((r: any) => r.slippage_bps != null && r.slippage_bps !== 0),
+    [ledgerTrades],
+  );
+
   // ------------------------------------------------------------------
   // Ledger table columns
   // ------------------------------------------------------------------
-  const ledgerColumns = React.useMemo<ColumnDef<any>[]>(() => [
-    {
-      accessorKey: 'order_id',
-      header: 'Ticket ID',
-      cell: ({ row }) => <span className="text-[var(--muted-foreground)]">{row.original.order_id ? row.original.order_id.slice(0, 8) + '…' : String(row.original.id)}</span>,
-    },
-    {
-      accessorKey: 'timestamp',
-      header: 'Timestamp',
-      cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
-    },
-    {
-      accessorKey: 'symbol',
-      header: 'Symbol',
-      cell: ({ getValue }) => <span className="font-bold text-[var(--foreground)]">{(getValue() as string) ?? '—'}</span>,
-    },
-    {
-      accessorKey: 'side',
-      header: 'Direction',
-      cell: ({ getValue }) => (
-        <div className="flex justify-center">
-          <Badge variant={(getValue() as string) === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5 uppercase font-sans tracking-widest">
-            {(getValue() as string) ?? '—'}
-          </Badge>
-        </div>
-      ),
-    },
-    {
-      accessorKey: 'bot',
-      header: 'Origin Agent',
-      cell: ({ getValue }) => (
-        <div className="hidden md:flex justify-center">
-          <Badge variant="outline" className="font-sans font-normal opacity-80">{(getValue() as string) ?? '—'}</Badge>
-        </div>
-      ),
-    },
-    {
-      accessorKey: 'confidence',
-      header: 'Signal Conf.',
-      cell: ({ getValue }) => {
-        const v = getValue() as number | null;
-        return <span className="text-right block text-[var(--kraken-light)] hidden xl:block">{v != null ? `${(v * 100).toFixed(0)}%` : '—'}</span>;
+  const ledgerColumns = React.useMemo<ColumnDef<any>[]>(() => {
+    const cols: ColumnDef<any>[] = [
+      {
+        accessorKey: 'order_id',
+        header: 'Ticket ID',
+        cell: ({ row }) => {
+          const fullId = row.original.order_id ?? String(row.original.id);
+          const short  = fullId.length > 8 ? fullId.slice(0, 8) + '…' : fullId;
+          return <TicketIdCell fullId={fullId} short={short} />;
+        },
       },
-    },
-    {
-      accessorKey: 'slippage_bps',
-      header: 'Slippage',
-      cell: ({ getValue }) => {
-        const v = getValue() as number | null;
-        return <span className="text-right block hidden lg:block">{v != null ? <span className="text-[var(--neon-red)]">{v.toFixed(1)} bps</span> : <span className="text-[var(--muted-foreground)]">—</span>}</span>;
+      {
+        accessorKey: 'timestamp',
+        header: 'Timestamp',
+        cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
       },
-    },
-    {
-      accessorKey: 'fill_price',
-      header: 'Fill Price',
-      cell: ({ getValue }) => {
-        const v = getValue() as number | null;
-        return <span className="text-right block font-bold text-[var(--foreground)]">{v != null ? `$${Number(v).toFixed(2)}` : '—'}</span>;
+      {
+        accessorKey: 'symbol',
+        header: 'Symbol',
+        cell: ({ getValue }) => <span className="font-bold text-[var(--foreground)]">{(getValue() as string) ?? '—'}</span>,
       },
-    },
-    {
-      id: 'realized_pnl',
-      header: 'Realized PnL',
-      enableSorting: false,
-      cell: ({ row }) => {
-        const realPnl = row.original.side === 'SELL' ? (realizedPnlByLedgerId.get(row.original.id) ?? null) : null;
-        return realPnl != null ? (
-          <span className={`flex items-center justify-end gap-0.5 font-bold ${realPnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-            {realPnl >= 0 ? <TrendingUp className="w-3 h-3 shrink-0" /> : <TrendingDown className="w-3 h-3 shrink-0" />}
-            {realPnl >= 0 ? '+' : ''}${realPnl.toFixed(4)}
-          </span>
-        ) : (
-          <span className="text-right block text-[var(--muted-foreground)] opacity-40">{row.original.side === 'BUY' ? 'open' : '—'}</span>
-        );
+      {
+        accessorKey: 'side',
+        header: 'Direction',
+        cell: ({ getValue }) => (
+          <div className="flex justify-center">
+            <Badge variant={(getValue() as string) === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5 uppercase font-sans tracking-widest">
+              {(getValue() as string) ?? '—'}
+            </Badge>
+          </div>
+        ),
       },
-    },
-  ], [realizedPnlByLedgerId]);
+      {
+        accessorKey: 'bot',
+        header: 'Origin Agent',
+        cell: ({ getValue }) => (
+          <div className="hidden md:flex justify-center">
+            <Badge variant="outline" className="font-sans font-normal opacity-80">{(getValue() as string) ?? '—'}</Badge>
+          </div>
+        ),
+      },
+      {
+        accessorKey: 'confidence',
+        header: 'Signal Conf.',
+        cell: ({ getValue }) => {
+          const v = getValue() as number | null;
+          const pct = v != null ? v * 100 : null;
+          const color = pct == null ? 'text-[var(--muted-foreground)]'
+            : pct >= 85 ? 'text-[var(--neon-green)]'
+            : pct >= 70 ? 'text-[var(--foreground)]'
+            : 'text-[var(--warning)]';
+          return <span className={`text-right block hidden xl:block ${color}`}>{pct != null ? `${pct.toFixed(0)}%` : '—'}</span>;
+        },
+      },
+      {
+        accessorKey: 'fill_price',
+        header: 'Fill Price',
+        cell: ({ getValue }) => {
+          const v = getValue() as number | null;
+          return <span className="text-right block font-bold text-[var(--foreground)]">{v != null ? `$${Number(v).toFixed(2)}` : '—'}</span>;
+        },
+      },
+      {
+        id: 'realized_pnl',
+        header: 'Realized PnL',
+        enableSorting: false,
+        cell: ({ row }) => {
+          const realPnl = row.original.side === 'SELL' ? (realizedPnlByLedgerId.get(row.original.id) ?? null) : null;
+          return realPnl != null ? (
+            <span className={`flex items-center justify-end gap-0.5 font-bold ${realPnl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+              {realPnl >= 0 ? <TrendingUp className="w-3 h-3 shrink-0" /> : <TrendingDown className="w-3 h-3 shrink-0" />}
+              {realPnl >= 0 ? '+' : ''}${realPnl.toFixed(4)}
+            </span>
+          ) : (
+            <span className="text-right block text-[var(--muted-foreground)] opacity-40">—</span>
+          );
+        },
+      },
+    ];
+
+    if (hasNonZeroSlippage) {
+      cols.splice(6, 0, {
+        accessorKey: 'slippage_bps',
+        header: 'Slippage',
+        cell: ({ getValue }) => {
+          const v = getValue() as number | null;
+          const color = v == null ? 'text-[var(--muted-foreground)]'
+            : v < 5 ? 'text-[var(--neon-green)]'
+            : v < 20 ? 'text-[var(--foreground)]'
+            : 'text-[var(--neon-red)]';
+          return <span className={`text-right block ${color}`}>{v != null ? `${v.toFixed(1)} bps` : '—'}</span>;
+        },
+      });
+    }
+
+    return cols;
+  }, [realizedPnlByLedgerId, hasNonZeroSlippage]);
 
   // ------------------------------------------------------------------
   // Trade history table columns
@@ -266,7 +313,7 @@ export function TradeLedger() {
         const v = row.original.exit_price;
         return v != null
           ? <span className={`text-right block ${row.original.open ? 'text-[var(--kraken-light)]' : 'text-[var(--foreground)]'}`}>${Number(v).toFixed(4)}</span>
-          : <span className="text-right block text-[var(--muted-foreground)] opacity-40">open</span>;
+          : <span className="text-right block text-[var(--muted-foreground)] opacity-40">—</span>;
       },
     },
     {
@@ -325,12 +372,20 @@ export function TradeLedger() {
           <Badge variant="outline" className="px-2">{ledgerTrades.length} RECORDS</Badge>
         </div>
         <div className="flex items-center space-x-2">
+          {/* Desktop filter buttons */}
           {(['ALL', 'BUY', 'SELL'] as const).map(side => (
-            <button key={side} onClick={() => setFilterSide(side)} className={`hidden lg:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${filterSide === side ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20' : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}`}>{side}</button>
+            <button key={side} onClick={() => setFilterSide(side)} className={`hidden md:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${filterSide === side ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20' : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}`}>{side}</button>
           ))}
           {(['ALL', 'WIN', 'LOSS'] as const).map(outcome => (
-            <button key={outcome} onClick={() => setFilterOutcome(outcome)} className={`hidden lg:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${filterOutcome === outcome ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20' : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}`}>{outcome}</button>
+            <button key={outcome} onClick={() => setFilterOutcome(outcome)} className={`hidden md:flex items-center px-3 py-1.5 border rounded-sm text-xs font-mono transition-colors ${filterOutcome === outcome ? 'border-[var(--kraken-purple)] text-[var(--kraken-light)] bg-[var(--kraken-purple)]/20' : 'bg-[var(--background)] border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]'}`}>{outcome}</button>
           ))}
+          {/* Mobile filter selects */}
+          <select value={filterSide} onChange={e => setFilterSide(e.target.value as any)} className="md:hidden bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm text-xs font-mono text-[var(--foreground)] px-1.5 py-1 outline-none">
+            {(['ALL', 'BUY', 'SELL'] as const).map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value as any)} className="md:hidden bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm text-xs font-mono text-[var(--foreground)] px-1.5 py-1 outline-none">
+            {(['ALL', 'WIN', 'LOSS'] as const).map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
           {lastRefresh && <span className="hidden lg:block text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">{lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           <button onClick={handleRefresh} disabled={refreshing} className="p-1.5 bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm hover:bg-[var(--background)] transition-colors text-[var(--muted-foreground)] disabled:opacity-40">
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
@@ -345,7 +400,12 @@ export function TradeLedger() {
         {[{ label: 'Equity', value: accountData?.equity, color: 'text-[var(--foreground)]' }, { label: 'Buying Power', value: accountData?.buying_power, color: 'text-[var(--foreground)]' }, { label: 'Cash', value: accountData?.cash, color: 'text-[var(--foreground)]' }, { label: 'Long Mkt Val', value: accountData?.long_market_value, color: 'text-[var(--neon-green)]' }].map(({ label, value, color }) => (
           <div key={label} className="flex flex-col px-4 py-2">
             <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider mb-0.5 leading-none">{label}</span>
-            <span className={`text-sm font-mono tabular-nums font-bold leading-snug ${color}`}>{value != null ? `$${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}</span>
+            {value != null
+              ? <span className={`text-sm font-mono tabular-nums font-bold leading-snug ${color}`}>${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              : accountData == null
+                ? <span className="inline-block animate-pulse bg-[var(--border)] h-3 w-16 rounded-sm mt-0.5" />
+                : <span className="text-sm font-mono tabular-nums font-bold leading-snug text-[var(--muted-foreground)]">$0.00</span>
+            }
           </div>
         ))}
       </div>
@@ -368,7 +428,7 @@ export function TradeLedger() {
           </thead>
           <tbody className="divide-y divide-[var(--border)]/30">
             {ledgerTable.getRowModel().rows.length === 0 ? (
-              <tr><td colSpan={9} className="p-6 text-center text-[var(--muted-foreground)]">{ledgerTrades.length === 0 ? 'No execution records yet' : 'No records match filters'}</td></tr>
+              <tr><td colSpan={ledgerColumns.length} className="p-6 text-center text-[var(--muted-foreground)]">{ledgerTrades.length === 0 ? 'No execution records yet' : 'No records match filters'}</td></tr>
             ) : ledgerTable.getRowModel().rows.map(row => (
               <tr key={row.id} className="hover:bg-[var(--panel-muted)] transition-colors cursor-default">
                 {row.getVisibleCells().map((cell, i) => (

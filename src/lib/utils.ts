@@ -22,6 +22,19 @@ export function cssVar(name: string): string {
  * so conversion to user-local display is skipped.  This helper appends 'Z'
  * when no timezone marker is present, forcing UTC interpretation.
  */
+/** Collapse consecutive duplicate log lines into `{message, count}` pairs. */
+export function collapseRepeats(logs: string[]): { message: string; count: number }[] {
+  const out: { message: string; count: number }[] = [];
+  for (const line of logs) {
+    if (out.length > 0 && out[out.length - 1].message === line) {
+      out[out.length - 1].count++;
+    } else {
+      out.push({ message: line, count: 1 });
+    }
+  }
+  return out;
+}
+
 export function parseUtc(ts: string | number | null | undefined): Date | null {
   if (ts == null || ts === '') return null;
   if (typeof ts === 'number') return new Date(ts);

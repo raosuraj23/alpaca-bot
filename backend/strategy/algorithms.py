@@ -110,10 +110,12 @@ class MomentumStrategy(BaseStrategy):
         self.ema_long:  dict[str, float] = {}
         self._ticks: dict[str, int] = {}
         self._last_cross: dict[str, str] = {}
-        
+        self._entry_price: dict[str, float] = {}
+
         self.alpha_short = getattr(self, 'alpha_short', 0.20)
         self.alpha_long = getattr(self, 'alpha_long', 0.05)
         self.warmup_ticks = getattr(self, 'warmup_ticks', 40)
+        self.min_profit_to_exit_pct = getattr(self, 'min_profit_to_exit_pct', 0.003)
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if symbol not in self.ema_short:
@@ -151,6 +153,10 @@ class MomentumStrategy(BaseStrategy):
                 }
             }
         elif spread < -0.002 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
+            if symbol in self._entry_price:
+                profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
+                if profit_pct < self.min_profit_to_exit_pct:
+                    return None
             self._last_cross[symbol] = "SELL"
             confidence = min(0.99, 0.70 + abs(spread) * 10)
             signal = {
@@ -167,6 +173,16 @@ class MomentumStrategy(BaseStrategy):
             logger.debug("[MOMENTUM] %s → %s (conf=%.2f, spread=%.4f%%)",
                          symbol, signal["action"], signal["confidence"], spread * 100)
         return signal
+
+    def notify_fill(self, symbol: str, action: str) -> None:
+        super().notify_fill(symbol, action)
+        if action == "BUY":
+            pass  # entry price set externally via set_entry_price()
+        elif action == "SELL":
+            self._entry_price.pop(symbol, None)
+
+    def set_entry_price(self, symbol: str, price: float) -> None:
+        self._entry_price[symbol] = price
 
     def get_state(self, symbol: str) -> dict | None:
         if symbol not in self.ema_short:
@@ -217,10 +233,12 @@ class StatArbStrategy(BaseStrategy):
         # Patchable by PortfolioDirector — use these names in UPDATE_STRATEGY_PARAMS
         self.lookback_period  = getattr(self, 'lookback_period', 20)   # Bollinger Band window (bars)
         self.sigma_multiplier = getattr(self, 'sigma_multiplier', 2.0) # Band width in standard deviations
+        self.min_profit_to_exit_pct = getattr(self, 'min_profit_to_exit_pct', 0.004)
         self.WINDOW = self.lookback_period  # internal alias kept for legacy references
         self._prices: dict[str, deque] = {}
         self._welford: dict[str, dict] = {} # Tracks count, mean, M2 for O(1) variance
         self._last_signal: dict[str, str] = {}
+        self._entry_price: dict[str, float] = {}
 
     def update_params(self, params: dict) -> None:
         """Extends BaseStrategy.update_params to sync lookback_period → WINDOW and reset state."""
@@ -293,6 +311,10 @@ class StatArbStrategy(BaseStrategy):
                 }
             }
         elif price > upper and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
+            if symbol in self._entry_price:
+                profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
+                if profit_pct < self.min_profit_to_exit_pct:
+                    return None
             deviation_sigma = (price - upper) / max((upper - lower) / 4, 0.001)
             confidence = min(0.95, 0.65 + deviation_sigma * 0.15)
             self._last_signal[symbol] = "SELL"
@@ -311,6 +333,14 @@ class StatArbStrategy(BaseStrategy):
             logger.debug("[STATARB] %s → %s (conf=%.2f, sma=%.2f, band=[%.2f, %.2f])",
                          symbol, signal["action"], signal["confidence"], sma, lower, upper)
         return signal
+
+    def notify_fill(self, symbol: str, action: str) -> None:
+        super().notify_fill(symbol, action)
+        if action == "SELL":
+            self._entry_price.pop(symbol, None)
+
+    def set_entry_price(self, symbol: str, price: float) -> None:
+        self._entry_price[symbol] = price
 
     def get_state(self, symbol: str) -> dict | None:
         if symbol not in self._prices or len(self._prices[symbol]) < self.WINDOW:
@@ -352,10 +382,11 @@ class HighFrequencyStrategy(BaseStrategy):
     Starts ACTIVE with 25% allocation. Position-aware to prevent naked SELLs.
     """
 
-    MOMENTUM_WINDOW = 3            # look-back ticks
-    MOMENTUM_THRESHOLD = 0.0003   # 0.03% move in 3 ticks triggers signal
-    COOLDOWN_TICKS = 5             # minimum ticks between signals per symbol
-    STOP_LOSS_PCT = 0.005          # 0.5% adverse move forces SELL exit
+    MOMENTUM_WINDOW = 3              # look-back ticks
+    MOMENTUM_THRESHOLD = 0.0003    # 0.03% move in 3 ticks triggers signal
+    COOLDOWN_TICKS = 5              # minimum ticks between signals per symbol
+    STOP_LOSS_PCT = 0.005           # 0.5% adverse move forces SELL exit
+    MIN_PROFIT_TO_EXIT_PCT = 0.002  # 0.2% minimum gain required before momentum-reversal exit
 
     def __init__(self, bot_id="hft-sniper", name="HFT Sniper", allocation=25, **kwargs):
         super().__init__(bot_id, name, allocation, "Micro-Scalp Momentum", **kwargs)
@@ -409,6 +440,10 @@ class HighFrequencyStrategy(BaseStrategy):
             self._cooldown[symbol] = self.COOLDOWN_TICKS
 
         elif momentum < -self.MOMENTUM_THRESHOLD and self._is_long(symbol):
+            if symbol in self._entry_price:
+                profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
+                if profit_pct < self.MIN_PROFIT_TO_EXIT_PCT:
+                    return None
             confidence = min(0.92, 0.60 + abs(momentum) * 500)
             signal = {
                 "bot": self.id, "symbol": symbol, "action": "SELL",

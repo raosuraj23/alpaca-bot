@@ -376,9 +376,8 @@ class StrategyEngine:
         if not bot:
             return
         bot.notify_fill(symbol, action)
-        if bot_id == "hft-sniper" and action == "BUY" and fill_price is not None:
-            if hasattr(bot, "set_entry_price"):
-                bot.set_entry_price(symbol, fill_price)
+        if action == "BUY" and fill_price is not None and hasattr(bot, "set_entry_price"):
+            bot.set_entry_price(symbol, fill_price)
 
     # ------------------------------------------------------------------
     # Signal Generation (called per market tick)

@@ -12,11 +12,11 @@ import {
 } from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore, RiskStatus } from '@/hooks/useTradingStream';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { parseUtc } from '@/lib/utils';
 
-type Tab = 'positions' | 'orders' | 'history';
+type Tab = 'positions' | 'orders' | 'risk';
 
 interface PositionRow {
   id: string;
@@ -36,26 +36,161 @@ interface OrderRow {
   timestamp: string | number;
 }
 
-interface HistoryRow {
-  id: string;
-  symbol: string;
-  side: string;
-  size: number;
-  price: number;
-  slippage_bps: number | null;
-  timestamp: string | number;
-}
-
 function SortIndicator({ sorted }: { sorted: false | 'asc' | 'desc' }) {
   if (sorted === 'asc')  return <span className="text-[var(--kraken-light)]">▲</span>;
   if (sorted === 'desc') return <span className="text-[var(--kraken-light)]">▼</span>;
   return <span className="opacity-20">⇅</span>;
 }
 
+// ---------------------------------------------------------------------------
+// Exposure heat map — horizontal bar split by notional per position
+// ---------------------------------------------------------------------------
+
+function ExposureBar({ positions }: { positions: PositionRow[] }) {
+  if (positions.length === 0) return null;
+
+  const notionals = positions.map(p => ({
+    symbol: p.symbol,
+    notional: Math.abs(p.size * p.entryPrice),
+    side: p.side,
+  }));
+  const total = notionals.reduce((s, n) => s + n.notional, 0);
+  if (total === 0) return null;
+
+  const COLORS = [
+    'var(--kraken-purple)',
+    'var(--neon-green)',
+    'var(--neon-blue)',
+    'var(--warning)',
+    'var(--agent-observe)',
+    'var(--agent-calculate)',
+  ];
+
+  return (
+    <div className="px-3 pt-2 pb-1.5 border-b border-[var(--border)] shrink-0">
+      <div className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider mb-1 opacity-60">Exposure</div>
+      <div className="flex h-2 rounded-sm overflow-hidden gap-px">
+        {notionals.map((n, i) => (
+          <div
+            key={n.symbol}
+            title={`${n.symbol}: $${n.notional.toFixed(0)}`}
+            style={{
+              flexBasis: `${(n.notional / total) * 100}%`,
+              background: COLORS[i % COLORS.length],
+              opacity: n.side === 'LONG' ? 1 : 0.6,
+            }}
+          />
+        ))}
+      </div>
+      <div className="flex gap-3 mt-1 flex-wrap">
+        {notionals.map((n, i) => (
+          <span key={n.symbol} className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-60 flex items-center gap-1">
+            <span className="inline-block w-1.5 h-1.5 rounded-sm" style={{ background: COLORS[i % COLORS.length] }} />
+            {n.symbol}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Risk Status Panel
+// ---------------------------------------------------------------------------
+
+function RiskStatusPanel({ riskStatus, fetchRiskStatus }: {
+  riskStatus: RiskStatus | null;
+  fetchRiskStatus: () => Promise<void>;
+}) {
+  React.useEffect(() => {
+    fetchRiskStatus();
+    const id = setInterval(fetchRiskStatus, 15_000);
+    return () => clearInterval(id);
+  }, [fetchRiskStatus]);
+
+  if (!riskStatus) {
+    return (
+      <div className="flex items-center justify-center h-full text-xs text-[var(--muted-foreground)] opacity-40">
+        Loading risk status...
+      </div>
+    );
+  }
+
+  const ddPct = riskStatus.drawdown_pct ?? 0;
+  const maxDdPct = riskStatus.max_drawdown_pct ?? 0.02;
+  const ddUtilization = maxDdPct > 0 ? Math.min(1, ddPct / maxDdPct) : 0;
+
+  return (
+    <div className="p-3 space-y-3">
+      {riskStatus.triggered && (
+        <div className="px-3 py-2 bg-[var(--neon-red)]/10 border border-[var(--neon-red)]/40 rounded-sm">
+          <span className="text-xs font-bold text-[var(--neon-red)] uppercase tracking-wider">
+            Kill Switch Active: {riskStatus.reason ?? 'Unknown reason'}
+          </span>
+        </div>
+      )}
+
+      {/* Drawdown utilization bar */}
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider">Daily Drawdown</span>
+          <span className={`text-xs font-mono tabular-nums font-bold ${ddPct > 0.015 ? 'text-[var(--neon-red)]' : ddPct > 0.01 ? 'text-[var(--warning)]' : 'text-[var(--foreground)]'}`}>
+            {(ddPct * 100).toFixed(2)}% / {(maxDdPct * 100).toFixed(0)}%
+          </span>
+        </div>
+        <div className="h-1.5 rounded-sm overflow-hidden" style={{ background: 'var(--border)' }}>
+          <div
+            className="h-full rounded-sm transition-all"
+            style={{
+              width: `${ddUtilization * 100}%`,
+              background: ddUtilization > 0.75 ? 'var(--neon-red)' : ddUtilization > 0.5 ? 'var(--warning)' : 'var(--neon-green)',
+            }}
+          />
+        </div>
+      </div>
+
+      {/* Risk parameters grid */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+        <div>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Max Position</span>
+          <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
+            {(riskStatus.max_position_pct * 100).toFixed(0)}% / ${riskStatus.max_position_usd.toLocaleString()}
+          </span>
+        </div>
+        <div>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Kelly Cap</span>
+          <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
+            {(riskStatus.max_kelly_fraction * 100).toFixed(0)}%
+          </span>
+        </div>
+        <div>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Min Confidence</span>
+          <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
+            {(riskStatus.min_confidence_gate * 100).toFixed(0)}%
+          </span>
+        </div>
+        <div>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">SOD Equity</span>
+          <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
+            {riskStatus.start_of_day_equity != null
+              ? `$${riskStatus.start_of_day_equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+              : '—'}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PositionsTable
+// ---------------------------------------------------------------------------
+
 export function PositionsTable() {
-  const positions    = useTradingStore(s => s.positions);
-  const recentTrades = useTradingStore(s => s.recentTrades);
-  const ledgerTrades = useTradingStore(s => s.ledgerTrades);
+  const positions      = useTradingStore(s => s.positions);
+  const recentTrades   = useTradingStore(s => s.recentTrades);
+  const riskStatus     = useTradingStore(s => s.riskStatus);
+  const fetchRiskStatus = useTradingStore(s => s.fetchRiskStatus);
 
   const [todayPl, setTodayPl] = React.useState<number | null>(null);
 
@@ -70,21 +205,11 @@ export function PositionsTable() {
     return () => clearInterval(id);
   }, []);
 
-  const ledgerByOrderId = React.useMemo(() => {
-    const map = new Map<string, { slippage_bps: number | null; confidence: number | null }>();
-    for (const r of ledgerTrades) {
-      if (r.order_id) map.set(r.order_id, { slippage_bps: r.slippage_bps ?? null, confidence: r.confidence ?? null });
-    }
-    return map;
-  }, [ledgerTrades]);
-
   const [activeTab, setActiveTab] = React.useState<Tab>('positions');
   const [posSorting, setPosSorting]     = React.useState<SortingState>([]);
   const [orderSorting, setOrderSorting] = React.useState<SortingState>([]);
-  const [histSorting, setHistSorting]   = React.useState<SortingState>([{ id: 'timestamp', desc: true }]);
 
   const openOrders = recentTrades.filter((t: any) => t.price === 0 || t.status === 'pending');
-  const history    = recentTrades.filter((t: any) => t.price > 0 && t.status !== 'pending');
 
   // ── Positions columns ──────────────────────────────────────────────────────
   const posColumns = React.useMemo<ColumnDef<PositionRow>[]>(() => [
@@ -183,73 +308,6 @@ export function PositionsTable() {
     },
   ], []);
 
-  // ── History columns ────────────────────────────────────────────────────────
-  const histColumns = React.useMemo<ColumnDef<HistoryRow>[]>(() => [
-    {
-      accessorKey: 'symbol',
-      header: 'Symbol',
-      cell: ({ getValue }) => (
-        <span className="font-bold text-[var(--foreground)]">{getValue() as string}</span>
-      ),
-    },
-    {
-      accessorKey: 'side',
-      header: 'Side',
-      cell: ({ getValue }) => {
-        const s = getValue() as string;
-        return (
-          <div className="flex justify-center">
-            <Badge variant={s === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{s}</Badge>
-          </div>
-        );
-      },
-    },
-    {
-      accessorKey: 'size',
-      header: 'Qty',
-      cell: ({ getValue }) => (
-        <span className="text-right block font-mono tabular-nums">{(getValue() as number).toFixed(4)}</span>
-      ),
-    },
-    {
-      accessorKey: 'price',
-      header: 'Fill Price',
-      cell: ({ getValue }) => (
-        <span className="text-right block font-mono tabular-nums font-bold text-[var(--foreground)]">
-          ${(getValue() as number).toFixed(2)}
-        </span>
-      ),
-    },
-    {
-      accessorKey: 'slippage_bps',
-      header: 'Slip (bps)',
-      cell: ({ getValue }) => {
-        const v = getValue() as number | null;
-        const cls = v == null ? 'text-[var(--muted-foreground)]'
-          : v < 0 ? 'text-[var(--neon-green)]'
-          : v > 5 ? 'text-[var(--neon-red)]'
-          : 'text-[var(--foreground)]';
-        return (
-          <span className={`text-right block font-mono tabular-nums ${cls}`}>
-            {v != null ? `${v > 0 ? '+' : ''}${v.toFixed(1)}` : '—'}
-          </span>
-        );
-      },
-    },
-    {
-      accessorKey: 'timestamp',
-      header: 'Time',
-      cell: ({ getValue }) => {
-        const ts = getValue() as string | number;
-        return (
-          <span className="text-right block text-[var(--muted-foreground)] font-mono tabular-nums">
-            {ts ? (parseUtc(ts)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}
-          </span>
-        );
-      },
-    },
-  ], []);
-
   // ── Table instances ────────────────────────────────────────────────────────
   const posTable = useReactTable({
     data: positions as PositionRow[],
@@ -265,29 +323,6 @@ export function PositionsTable() {
     columns: orderColumns,
     state: { sorting: orderSorting },
     onSortingChange: setOrderSorting,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-  });
-
-  const histData = React.useMemo<HistoryRow[]>(() =>
-    history.map((o: any) => {
-      const ledger = ledgerByOrderId.get(o.id?.slice(0, 8));
-      return {
-        id: o.id,
-        symbol: o.symbol,
-        side: o.side,
-        size: o.size,
-        price: o.price,
-        slippage_bps: ledger?.slippage_bps ?? null,
-        timestamp: o.timestamp,
-      };
-    }), [history, ledgerByOrderId]);
-
-  const histTable = useReactTable({
-    data: histData,
-    columns: histColumns,
-    state: { sorting: histSorting },
-    onSortingChange: setHistSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
   });
@@ -350,8 +385,8 @@ export function PositionsTable() {
           <CardTitle className={tabClass('orders')} onClick={() => setActiveTab('orders')}>
             Open Orders ({openOrders.length})
           </CardTitle>
-          <CardTitle className={tabClass('history')} onClick={() => setActiveTab('history')}>
-            History ({history.length})
+          <CardTitle className={tabClass('risk')} onClick={() => setActiveTab('risk')}>
+            Risk
           </CardTitle>
         </div>
         <div className="text-xs font-mono font-bold text-[var(--foreground)]">
@@ -366,10 +401,17 @@ export function PositionsTable() {
         </div>
       </CardHeader>
 
+      {/* Exposure heat map — only when positions are open */}
+      {activeTab === 'positions' && positions.length > 0 && (
+        <ExposureBar positions={positions as PositionRow[]} />
+      )}
+
       <CardContent className="flex-1 overflow-y-auto p-0">
-        {activeTab === 'positions' && renderTable(posTable,   'No open positions', 5)}
-        {activeTab === 'orders'    && renderTable(orderTable, 'No open orders',    5)}
-        {activeTab === 'history'   && renderTable(histTable,  'No trade history',  6)}
+        {activeTab === 'positions' && renderTable(posTable, 'No open positions', 5)}
+        {activeTab === 'orders'    && renderTable(orderTable, 'No open orders',  5)}
+        {activeTab === 'risk'      && (
+          <RiskStatusPanel riskStatus={riskStatus} fetchRiskStatus={fetchRiskStatus} />
+        )}
       </CardContent>
     </Card>
   );

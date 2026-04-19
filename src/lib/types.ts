@@ -221,3 +221,22 @@ export interface PortfolioSnapshot {
   equity: number;
   benchmark?: number;
 }
+
+export type ActionItemType = 'LIQUIDATE' | 'REACTIVATE' | 'HALT' | 'MONITOR' | 'ADJUST';
+export type ActionItemUrgency = 'HIGH' | 'MEDIUM' | 'LOW';
+
+export interface ActionItem {
+  type: ActionItemType;
+  symbol?: string;
+  strategy?: string;
+  title: string;
+  reason: string;
+  urgency: ActionItemUrgency;
+}
+
+export interface ActionItemsResponse {
+  items: ActionItem[];
+  generated_at: number;
+  cached: boolean;
+  error?: string;
+}

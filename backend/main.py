@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 
 load_dotenv()
 
@@ -2113,6 +2113,21 @@ async def trigger_scan():
 _commentary_cache: dict = {"generated_at": 0.0, "text": None}
 _COMMENTARY_TTL = 1800  # 30 minutes
 
+_ACTION_ITEMS_TTL = 600  # 10 minutes
+
+
+class _ActionItem(BaseModel):
+    type: Literal["LIQUIDATE", "REACTIVATE", "HALT", "MONITOR", "ADJUST"]
+    symbol: Optional[str] = None
+    strategy: Optional[str] = None
+    title: str
+    reason: str
+    urgency: Literal["HIGH", "MEDIUM", "LOW"]
+
+
+class _ActionItemList(BaseModel):
+    items: list[_ActionItem]
+
 
 @app.get("/api/market/news")
 def get_market_news(symbols: str = "BTC,ETH,SPY,QQQ,AAPL"):
@@ -2212,6 +2227,123 @@ async def get_market_commentary(force: bool = False):
     except Exception as e:
         logger.error("[COMMENTARY] %s", e)
         return {"text": None, "error": str(e)}
+
+
+@app.get("/api/market/action-items")
+async def get_action_items(force: bool = False):
+    """
+    Returns Haiku-generated portfolio action items (refreshed every 10 min).
+    Items are also stored in state.action_items for the Portfolio Director to consume.
+    Pass ?force=true to regenerate immediately.
+    """
+    from state import action_items as _ai_state
+
+    now = time.time()
+    cached_items = _ai_state.get_items()
+    if not force and cached_items and (now - _ai_state.get_generated_at()) < _ACTION_ITEMS_TTL:
+        return {"items": cached_items, "generated_at": _ai_state.get_generated_at(), "cached": True}
+
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        return {"items": [], "error": "ANTHROPIC_API_KEY not set"}
+
+    try:
+        bot_states = master_engine.get_bot_states()
+        bot_win_rates_ctx: list[str] = []
+        for b in bot_states:
+            line = (
+                f"{b['name']} ({b.get('algo','?')}) status={b['status']} "
+                f"yield24h=${b.get('yield24h',0):.2f} alloc={b.get('allocationPct',0):.0f}%"
+            )
+            bot_win_rates_ctx.append(line)
+
+        pos_lines: list[str] = []
+        if trading_client:
+            try:
+                raw_pos = trading_client.get_all_positions()
+                for p in raw_pos:
+                    pos_lines.append(
+                        f"{p.symbol} {p.side} qty={p.qty} unrealPnL=${p.unrealized_pl} "
+                        f"cost=${p.cost_basis}"
+                    )
+            except Exception:
+                pass
+        pos_ctx = "\n".join(pos_lines) if pos_lines else "No open positions"
+        bot_ctx = "\n".join(bot_win_rates_ctx) if bot_win_rates_ctx else "No active bots"
+
+        system_prompt = (
+            "You are a quantitative portfolio analyst assistant. "
+            "Analyze the live portfolio state and produce 3 to 5 structured action items. "
+            "Each item must cite specific data (PnL, qty, win rate, spread). "
+            "Urgency: HIGH = immediate risk or opportunity, MEDIUM = this session, LOW = watch. "
+            "Types: LIQUIDATE (exit a losing/illiquid position), REACTIVATE (resume a halted strategy), "
+            "HALT (pause an underperforming strategy), MONITOR (watch a price level or metric), "
+            "ADJUST (change allocation or params). "
+            "Be concise, data-driven, actionable."
+        )
+        user_prompt = (
+            f"Active bots:\n{bot_ctx}\n\n"
+            f"Open positions:\n{pos_ctx}\n\n"
+            "Generate portfolio action items now."
+        )
+
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        from config import CLAUDE_HAIKU_MODEL
+        response = client.messages.create(
+            model=CLAUDE_HAIKU_MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            tools=[{
+                "name": "submit_action_items",
+                "description": "Submit structured portfolio action items",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["type", "title", "reason", "urgency"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["LIQUIDATE", "REACTIVATE", "HALT", "MONITOR", "ADJUST"]},
+                                    "symbol": {"type": "string"},
+                                    "strategy": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "reason": {"type": "string"},
+                                    "urgency": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                                },
+                            },
+                        }
+                    },
+                    "required": ["items"],
+                },
+            }],
+            tool_choice={"type": "tool", "name": "submit_action_items"},
+        )
+
+        raw_items: list[dict] = []
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "submit_action_items":
+                raw_items = block.input.get("items", [])
+                break
+
+        validated: list[dict] = []
+        for item in raw_items:
+            try:
+                validated.append(_ActionItem(**item).model_dump())
+            except Exception:
+                pass
+
+        _ai_state.set_items(validated, now)
+        logger.info("[ACTION-ITEMS] Generated %d items", len(validated))
+        return {"items": validated, "generated_at": now, "cached": False}
+
+    except Exception as e:
+        logger.error("[ACTION-ITEMS] %s", e)
+        return {"items": [], "error": str(e)}
 
 
 async def _portfolio_snapshot_loop():

@@ -11,6 +11,7 @@ import {
 } from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/ui/empty-state";
 import { useTradingStore } from '@/hooks/useTradingStream';
 import { parseUtc } from '@/lib/utils';
 
@@ -21,6 +22,7 @@ interface LedgerEntry {
   side: string;
   bot: string;
   fill_price: number;
+  qty: number | null;
   slippage: number;
   slippage_bps: number | null;
   confidence: number;
@@ -33,7 +35,7 @@ export function ExecutionLog() {
   const [sorting, setSorting] = React.useState<SortingState>([{ id: 'timestamp', desc: true }]);
 
   const rows: LedgerEntry[] = React.useMemo(() => {
-    if (ledgerTrades.length > 0) return ledgerTrades;
+    if (ledgerTrades.length > 0) return ledgerTrades.map((t: any) => ({ ...t, qty: t.qty ?? t.size ?? null }));
     return recentTrades.map((t: any) => ({
       id:           t.id,
       order_id:     t.id,
@@ -41,6 +43,7 @@ export function ExecutionLog() {
       side:         t.side,
       bot:          '—',
       fill_price:   t.price,
+      qty:          t.size ?? null,
       slippage:     0,
       slippage_bps: null,
       confidence:   null,
@@ -48,74 +51,88 @@ export function ExecutionLog() {
     }));
   }, [recentTrades, ledgerTrades]);
 
-  const columns = React.useMemo<ColumnDef<LedgerEntry>[]>(() => [
-    {
-      accessorKey: 'timestamp',
-      header: 'Time',
-      cell: ({ getValue }) => {
-        const ts = getValue() as string | null;
-        return (
-          <span className="text-[var(--muted-foreground)]">
-            {ts ? new Date(ts).toLocaleTimeString(undefined, { hour12: false }) : '—'}
-          </span>
-        );
+  // Only show slippage column when at least one row has non-zero slippage
+  const hasNonZeroSlippage = React.useMemo(
+    () => rows.some(r => r.slippage_bps != null && r.slippage_bps !== 0),
+    [rows],
+  );
+
+  const columns = React.useMemo<ColumnDef<LedgerEntry>[]>(() => {
+    const cols: ColumnDef<LedgerEntry>[] = [
+      {
+        accessorKey: 'timestamp',
+        header: 'Time',
+        cell: ({ getValue }) => {
+          const ts = getValue() as string | null;
+          return (
+            <span className="text-[var(--muted-foreground)]">
+              {ts ? new Date(ts).toLocaleTimeString(undefined, { hour12: false }) : '—'}
+            </span>
+          );
+        },
       },
-    },
-    {
-      accessorKey: 'symbol',
-      header: 'Symbol',
-      cell: ({ getValue }) => (
-        <span className="text-[var(--foreground)] font-bold">{getValue() as string}</span>
-      ),
-    },
-    {
-      accessorKey: 'bot',
-      header: 'Bot',
-      cell: ({ getValue }) => {
-        const bot = getValue() as string;
-        return bot !== '—' ? (
-          <span className="px-1 py-0.5 rounded bg-[var(--panel-muted)] text-[var(--kraken-light)] truncate max-w-[80px] block">
-            {bot}
-          </span>
-        ) : <span className="text-[var(--muted-foreground)]">—</span>;
+      {
+        accessorKey: 'symbol',
+        header: 'Symbol',
+        cell: ({ getValue }) => (
+          <span className="text-[var(--foreground)] font-bold">{getValue() as string}</span>
+        ),
       },
-    },
-    {
-      accessorKey: 'side',
-      header: 'Side',
-      cell: ({ getValue }) => {
-        const side = (getValue() as string ?? '').replace('OrderSide.', '').toUpperCase();
-        return (
-          <span className={`font-bold ${side === 'BUY' ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-            {side}
-          </span>
-        );
+      {
+        accessorKey: 'bot',
+        header: 'Bot',
+        cell: ({ getValue }) => {
+          const bot = getValue() as string;
+          return bot !== '—' ? (
+            <span title={bot} className="px-1 py-0.5 rounded-sm bg-[var(--panel-muted)] text-[var(--kraken-light)] truncate max-w-[80px] block">
+              {bot}
+            </span>
+          ) : <span className="text-[var(--muted-foreground)]">—</span>;
+        },
       },
-    },
-    {
-      accessorKey: 'fill_price',
-      header: 'Fill $',
-      cell: ({ getValue }) => {
-        const v = getValue() as number;
-        return (
-          <span className="text-right block text-[var(--foreground)]">
-            {v != null ? `$${v.toFixed(2)}` : '—'}
-          </span>
-        );
+      {
+        accessorKey: 'side',
+        header: 'Side',
+        cell: ({ getValue }) => {
+          const side = (getValue() as string ?? '').replace('OrderSide.', '').toUpperCase();
+          return (
+            <span className={`font-bold ${side === 'BUY' ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
+              {side}
+            </span>
+          );
+        },
       },
-    },
-    {
-      accessorKey: 'slippage_bps',
-      header: 'Slip bps',
-      cell: ({ getValue }) => {
-        const v = getValue() as number | null;
-        const color = v != null
-          ? v < 5 ? 'text-[var(--neon-green)]' : v < 20 ? 'text-[var(--foreground)]' : 'text-[var(--neon-red)]'
-          : 'text-[var(--muted-foreground)]';
-        return <span className={`text-right block font-bold ${color}`}>{v != null ? `${v}` : '—'}</span>;
+      {
+        accessorKey: 'fill_price',
+        header: 'Fill $',
+        cell: ({ getValue }) => {
+          const v = getValue() as number;
+          return (
+            <span className="text-right block text-[var(--foreground)]">
+              {v != null ? `$${v.toFixed(2)}` : '—'}
+            </span>
+          );
+        },
       },
-    },
-  ], []);
+    ];
+
+    // Slippage column — only when data has non-zero values
+    if (hasNonZeroSlippage) {
+      cols.push({
+        accessorKey: 'slippage_bps',
+        header: 'Slip bps',
+        cell: ({ getValue }) => {
+          const v = getValue() as number | null;
+          const color = v != null
+            ? v < 5 ? 'text-[var(--neon-green)]' : v < 20 ? 'text-[var(--foreground)]' : 'text-[var(--neon-red)]'
+            : 'text-[var(--muted-foreground)]';
+          return <span className={`text-right block font-bold ${color}`}>{v != null ? `${v}` : '—'}</span>;
+        },
+      });
+    }
+
+    return cols;
+  }, [hasNonZeroSlippage]);
 
   const table = useReactTable({
     data: rows,
@@ -174,9 +191,7 @@ export function ExecutionLog() {
           </tbody>
         </table>
         {rows.length === 0 && (
-          <div className="flex items-center justify-center h-full text-xs text-[var(--muted-foreground)] italic mt-4">
-            No executions booked in current session.
-          </div>
+          <EmptyState message="No executions booked in current session" />
         )}
       </CardContent>
     </Card>

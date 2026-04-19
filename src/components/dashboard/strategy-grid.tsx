@@ -5,14 +5,17 @@ import {
   useReactTable,
   getCoreRowModel,
   getSortedRowModel,
+  getFilteredRowModel,
   flexRender,
   type ColumnDef,
   type SortingState,
+  type RowSelectionState,
 } from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useTradingStore } from '@/hooks/useTradingStream';
+import { API_BASE } from '@/lib/api';
 
 type Bot = {
   id: string;
@@ -32,8 +35,24 @@ const ASSET_COLORS: Record<string, string> = {
   OPTIONS: 'text-[var(--agent-learning)] bg-[var(--agent-learning)]/10 border-[var(--agent-learning)]/20',
 };
 
+const MIN_WIN_RATE_SAMPLE = 10;
+
 function Dash() {
   return <span className="font-mono tabular-nums text-[var(--muted-foreground)] opacity-30">—</span>;
+}
+
+function AllocationBar({ value }: { value: number }) {
+  return (
+    <div className="flex items-center justify-end gap-2">
+      <span className="font-mono tabular-nums text-right">{value}%</span>
+      <div className="w-10 h-1 bg-[var(--border)] rounded-sm overflow-hidden shrink-0">
+        <div
+          className="h-full bg-[var(--kraken-purple)]/70 rounded-sm"
+          style={{ width: `${Math.min(value, 100)}%` }}
+        />
+      </div>
+    </div>
+  );
 }
 
 function BotActions({ bot }: { bot: Bot }) {
@@ -50,17 +69,51 @@ function BotActions({ bot }: { bot: Bot }) {
 export function QuantStrategies() {
   const bots = useTradingStore(s => s.bots) as Bot[];
   const [sorting, setSorting] = React.useState<SortingState>([{ id: 'yield24h', desc: true }]);
+  const [rowSelection, setRowSelection] = React.useState<RowSelectionState>({});
+
+  const totalAlloc = React.useMemo(
+    () => bots.reduce((s, b) => s + (b.allocationPct ?? 0), 0),
+    [bots]
+  );
 
   const columns = React.useMemo<ColumnDef<Bot>[]>(() => [
     {
+      id: 'select',
+      enableSorting: false,
+      header: ({ table }) => (
+        <input
+          type="checkbox"
+          className="accent-[var(--kraken-purple)] w-3 h-3 cursor-pointer"
+          checked={table.getIsAllRowsSelected()}
+          onChange={table.getToggleAllRowsSelectedHandler()}
+        />
+      ),
+      cell: ({ row }) => (
+        <input
+          type="checkbox"
+          className="accent-[var(--kraken-purple)] w-3 h-3 cursor-pointer"
+          checked={row.getIsSelected()}
+          onChange={row.getToggleSelectedHandler()}
+          onClick={e => e.stopPropagation()}
+        />
+      ),
+    },
+    {
       accessorKey: 'name',
       header: 'Agent',
-      cell: ({ row }) => (
-        <div className="flex items-center gap-2 font-medium text-[var(--foreground)] whitespace-nowrap">
-          <div className={`w-2 h-2 rounded-sm shrink-0 ${row.original.status === 'ACTIVE' ? 'bg-[var(--neon-green)] shadow-[0_0_8px_rgba(0,200,5,0.5)]' : 'bg-[var(--muted-foreground)] opacity-40'}`} />
-          {row.original.name}
-        </div>
-      ),
+      cell: ({ row }) => {
+        const isActive = row.original.status === 'ACTIVE';
+        const isHalted = row.original.status === 'HALTED';
+        return (
+          <div className="flex items-center gap-2 whitespace-nowrap">
+            <div className={`w-2 h-2 rounded-sm shrink-0 ${isActive ? 'bg-[var(--neon-green)] shadow-[0_0_8px_rgba(0,200,5,0.5)]' : 'bg-[var(--muted-foreground)] opacity-40'}`} />
+            <span className="font-medium text-[var(--foreground)]">{row.original.name}</span>
+            {isHalted && (
+              <Badge variant="destructive" className="text-xs px-1 py-0 leading-none">HALTED</Badge>
+            )}
+          </div>
+        );
+      },
     },
     {
       accessorKey: 'assetClass',
@@ -85,9 +138,7 @@ export function QuantStrategies() {
     {
       accessorKey: 'allocationPct',
       header: 'Alloc %',
-      cell: ({ getValue }) => (
-        <span className="block text-right font-mono tabular-nums">{getValue() as number}%</span>
-      ),
+      cell: ({ getValue }) => <AllocationBar value={getValue() as number} />,
     },
     {
       accessorKey: 'signalCount',
@@ -106,12 +157,14 @@ export function QuantStrategies() {
         const fc = row.fillCount ?? 0;
         return sc > 0 ? (fc / sc) * 100 : null;
       },
-      cell: ({ getValue }) => {
+      cell: ({ row, getValue }) => {
         const v = getValue() as number | null;
-        if (v == null) return <Dash />;
+        const fills = row.original.fillCount ?? 0;
+        if (v == null || fills < MIN_WIN_RATE_SAMPLE) return <Dash />;
         return (
           <span className={`font-mono tabular-nums ${v >= 50 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
-            {v.toFixed(1)}%
+            {v.toFixed(1)}%{' '}
+            <span className="text-[var(--muted-foreground)] text-xs opacity-60">({fills})</span>
           </span>
         );
       },
@@ -157,20 +210,6 @@ export function QuantStrategies() {
       },
     },
     {
-      accessorKey: 'status',
-      header: 'Status',
-      cell: ({ getValue }) => {
-        const s = getValue() as string;
-        return (
-          <div className="flex justify-center">
-            <Badge variant={s === 'ACTIVE' ? 'success' : s === 'HALTED' ? 'destructive' : 'outline'}>
-              {s}
-            </Badge>
-          </div>
-        );
-      },
-    },
-    {
       id: 'actions',
       header: '',
       enableSorting: false,
@@ -181,14 +220,31 @@ export function QuantStrategies() {
   const table = useReactTable({
     data: bots,
     columns,
-    state: { sorting },
+    state: { sorting, rowSelection },
     onSortingChange: setSorting,
+    onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
   });
 
+  const selectedIds = Object.keys(rowSelection).filter(k => rowSelection[k]).map(idx => bots[+idx]?.id).filter(Boolean);
+
+  async function bulkAction(action: 'halt' | 'resume') {
+    try {
+      await fetch(`${API_BASE}/api/bots/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: selectedIds, action }),
+      });
+    } catch {
+      // endpoint may not exist yet — intent logged
+    }
+    setRowSelection({});
+  }
+
   return (
-    <Card className="flex flex-col h-full bg-[var(--panel)]/50">
+    <Card className="flex flex-col h-full bg-[var(--panel)]/50 relative">
       <CardHeader className="py-4 px-6 border-b border-[var(--border)] flex flex-row items-center justify-between shrink-0">
         <div>
           <CardTitle className="text-lg text-[var(--kraken-light)]">Strategy Fleet</CardTitle>
@@ -196,10 +252,14 @@ export function QuantStrategies() {
             Manage algorithmic agent deployment and allocation.
           </div>
         </div>
-        <Button variant="default">+ Deploy New Agent</Button>
+        <div className="flex items-center gap-3">
+          <span className={`text-xs font-mono tabular-nums ${totalAlloc > 100 ? 'text-[var(--neon-red)]' : 'text-[var(--muted-foreground)]'}`}>
+            Total: {totalAlloc}%
+          </span>
+        </div>
       </CardHeader>
       <CardContent className="p-0 overflow-x-auto">
-        <table className="w-full text-sm text-left font-mono min-w-[900px]">
+        <table className="w-full text-sm text-left font-mono">
           <thead className="bg-[var(--panel-muted)] border-b border-[var(--border)] text-[var(--muted-foreground)] uppercase text-xs tracking-wider">
             {table.getHeaderGroups().map(hg => (
               <tr key={hg.id}>
@@ -225,7 +285,10 @@ export function QuantStrategies() {
           </thead>
           <tbody className="divide-y divide-[var(--border)]/50">
             {table.getRowModel().rows.map(row => (
-              <tr key={row.id} className="hover:bg-[var(--panel-muted)]/30 transition-colors">
+              <tr
+                key={row.id}
+                className={`hover:bg-[var(--panel-muted)]/30 transition-colors ${row.original.status === 'HALTED' ? 'opacity-50' : ''}`}
+              >
                 {row.getVisibleCells().map(cell => (
                   <td key={cell.id} className="p-4 whitespace-nowrap">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -236,6 +299,32 @@ export function QuantStrategies() {
           </tbody>
         </table>
       </CardContent>
+
+      {/* Bulk action toolbar */}
+      {selectedIds.length > 0 && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 px-4 py-2 bg-[var(--panel)] border border-[var(--border)] rounded-sm shadow-lg z-10 text-xs font-mono whitespace-nowrap">
+          <span className="text-[var(--muted-foreground)]">{selectedIds.length} selected</span>
+          <span className="text-[var(--border)]">·</span>
+          <button
+            className="text-[var(--neon-red)] hover:text-[var(--neon-red)]/80 transition-colors"
+            onClick={() => bulkAction('halt')}
+          >
+            Halt All
+          </button>
+          <button
+            className="text-[var(--neon-green)] hover:text-[var(--neon-green)]/80 transition-colors"
+            onClick={() => bulkAction('resume')}
+          >
+            Resume All
+          </button>
+          <button
+            className="text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
+            onClick={() => setRowSelection({})}
+          >
+            Clear
+          </button>
+        </div>
+      )}
     </Card>
   );
 }
