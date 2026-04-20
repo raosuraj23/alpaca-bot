@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
 
     # Database
-    database_url: str = "sqlite:///./trading_bot.db"
+    database_url: str = "sqlite:///./alpaca_quant.db"
 
     # Observability
     log_level: str = "INFO"

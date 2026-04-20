@@ -281,11 +281,13 @@ class ScannerAgent:
                 try:
                     from alpaca.data.historical import StockHistoricalDataClient
                     from alpaca.data.requests import StockBarsRequest
+                    from alpaca.data.enums import DataFeed
                     client = StockHistoricalDataClient(api_key, api_secret)
                     req    = StockBarsRequest(
                         symbol_or_symbols=equity_syms,
                         timeframe=TimeFrame.Minute,
                         start=start, end=end,
+                        feed=DataFeed.IEX,
                     )
                     bars_df = client.get_stock_bars(req).df
                     if not bars_df.empty:

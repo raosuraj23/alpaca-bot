@@ -200,40 +200,64 @@ class OrchestratorEngine:
         cond       = signal_event.get("conditions", {})
 
         supervisor_prompt = (
-            f"The deterministic TA engine has identified a high-probability BUY setup on {asset}.\n\n"
-            f"Quant Signal Summary:\n"
-            f"  • Timestamp: {signal_ts}\n"
-            f"  • Golden Cross (EMA-50 crossed above EMA-200): {cond.get('golden_cross')} "
-            f"    (EMA-50={ema50:.2f}, EMA-200={ema200:.2f})\n"
-            f"  • RSI-14 in momentum zone (40–60): {cond.get('rsi_gate')} (RSI={rsi_val:.1f})\n"
-            f"  • Volume surge > 1.5× 20-bar SMA: {cond.get('volume_surge')} (ratio={vsr:.2f}×)\n\n"
-            f"Your task as LLM Supervisor:\n"
-            f"1. Comment briefly on the current macro/sentiment context for {asset} "
-            f"   based on your training knowledge (no live data access needed — use general market awareness).\n"
-            f"2. Decide: APPROVED (proceed to execution) or REJECTED (suppress this signal).\n"
-            f"3. Output your decision as a JSON block:\n"
-            f"   ```json\n"
-            f"   {{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
-            f"   ```\n\n"
-            f"Be brief. The math is already confirmed — your role is sentiment/context validation only."
+            f"IMPORTANT: Output ONLY the JSON code block below. "
+            f"No markdown headers, no preamble, no analysis text — nothing before or after the block.\n\n"
+            f"Asset: {asset}\n"
+            f"Signal timestamp: {signal_ts}\n"
+            f"Conditions: golden_cross={cond.get('golden_cross')}, "
+            f"rsi_gate={cond.get('rsi_gate')}, volume_surge={cond.get('volume_surge')}\n"
+            f"EMA-50={ema50:.2f}, EMA-200={ema200:.2f}, RSI={rsi_val:.1f}, vol_ratio={vsr:.2f}×\n\n"
+            f"Your role: sentiment/context validation only (the TA math is already confirmed).\n"
+            f"Decision: APPROVED if macro context supports the move, REJECTED if it does not.\n\n"
+            f"Respond with ONLY this block — nothing before or after it:\n"
+            f"```json\n"
+            f"{{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
+            f"```"
         )
 
         def _parse_voter_reply(reply: str) -> tuple[str, str]:
             """Extract decision and rationale from a voter's response."""
             decision  = "ERROR"
             rationale = "Could not parse LLM response."
-            pattern   = r"```json\s*(\{.*?\})\s*```"
-            for match in re.finditer(pattern, reply, re.DOTALL):
-                try:
-                    parsed    = json.loads(match.group(1))
-                    decision  = parsed.get("llm_decision", "ERROR").upper()
-                    rationale = parsed.get("rationale", rationale)
+
+            # Strategy 1: JSON inside a ```json ... ``` or ```json ... <eof> fence
+            for fence_pat in (r"```json\s*(\{.*?\})\s*(?:```|$)", r"```\s*(\{.*?\})\s*(?:```|$)"):
+                for match in re.finditer(fence_pat, reply, re.DOTALL):
+                    try:
+                        parsed = json.loads(match.group(1))
+                        if "llm_decision" in parsed:
+                            decision  = parsed["llm_decision"].upper()
+                            rationale = parsed.get("rationale", rationale)
+                            break
+                    except json.JSONDecodeError:
+                        pass
+                if decision in ("APPROVED", "REJECTED"):
                     break
-                except json.JSONDecodeError:
-                    pass
+
+            # Strategy 2: any bare JSON object with llm_decision (no fence required)
             if decision not in ("APPROVED", "REJECTED"):
-                decision  = "REJECTED"
-                rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
+                for match in re.finditer(r"\{[^{}]*\}", reply, re.DOTALL):
+                    try:
+                        parsed = json.loads(match.group(0))
+                        if "llm_decision" in parsed:
+                            decision  = parsed["llm_decision"].upper()
+                            rationale = parsed.get("rationale", rationale)
+                            break
+                    except json.JSONDecodeError:
+                        pass
+
+            # Strategy 3: keyword scan when no JSON found at all
+            if decision not in ("APPROVED", "REJECTED"):
+                upper = reply.upper()
+                if "APPROVED" in upper and "REJECTED" not in upper:
+                    decision  = "APPROVED"
+                    rationale = "[keyword fallback] " + reply[:200].strip()
+                elif "REJECTED" in upper:
+                    decision  = "REJECTED"
+                    rationale = "[keyword fallback] " + reply[:200].strip()
+                else:
+                    decision  = "REJECTED"
+                    rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
             return decision, rationale
 
         async def _call_voter(model, model_name: str, price_in: float, price_out: float):

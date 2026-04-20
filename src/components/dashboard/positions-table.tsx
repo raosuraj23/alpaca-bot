@@ -12,11 +12,11 @@ import {
 } from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useTradingStore, RiskStatus } from '@/hooks/useTradingStream';
+import { useTradingStore, RiskStatus } from '@/store';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { parseUtc } from '@/lib/utils';
 
-type Tab = 'positions' | 'orders' | 'risk';
+type Tab = 'positions' | 'risk';
 
 interface PositionRow {
   id: string;
@@ -60,10 +60,12 @@ function ExposureBar({ positions }: { positions: PositionRow[] }) {
   const COLORS = [
     'var(--kraken-purple)',
     'var(--neon-green)',
-    'var(--neon-blue)',
-    'var(--warning)',
-    'var(--agent-observe)',
+    'var(--agent-execute)',
+    'var(--agent-scanner)',
+    'var(--agent-learning)',
+    'var(--agent-research)',
     'var(--agent-calculate)',
+    'var(--neon-red)',
   ];
 
   return (
@@ -206,10 +208,7 @@ export function PositionsTable() {
   }, []);
 
   const [activeTab, setActiveTab] = React.useState<Tab>('positions');
-  const [posSorting, setPosSorting]     = React.useState<SortingState>([]);
-  const [orderSorting, setOrderSorting] = React.useState<SortingState>([]);
-
-  const openOrders = recentTrades.filter((t: any) => t.price === 0 || t.status === 'pending');
+  const [posSorting, setPosSorting] = React.useState<SortingState>([]);
 
   // ── Positions columns ──────────────────────────────────────────────────────
   const posColumns = React.useMemo<ColumnDef<PositionRow>[]>(() => [
@@ -231,6 +230,7 @@ export function PositionsTable() {
     {
       accessorKey: 'size',
       header: 'Size',
+      meta: { align: 'right' },
       cell: ({ getValue }) => (
         <span className="text-right block font-mono tabular-nums text-[var(--foreground)]">
           {(getValue() as number).toFixed(4)}
@@ -240,6 +240,7 @@ export function PositionsTable() {
     {
       accessorKey: 'entryPrice',
       header: 'Entry Price',
+      meta: { align: 'right' },
       cell: ({ getValue }) => (
         <span className="text-right block font-mono tabular-nums text-[var(--muted-foreground)]">
           ${(getValue() as number).toFixed(2)}
@@ -249,62 +250,12 @@ export function PositionsTable() {
     {
       accessorKey: 'unrealizedPnl',
       header: 'Unrealized PnL',
+      meta: { align: 'right' },
       cell: ({ getValue }) => (
         <div className="text-right">
           <ValueTicker value={getValue() as number} prefix="$" />
         </div>
       ),
-    },
-  ], []);
-
-  // ── Open Orders columns ────────────────────────────────────────────────────
-  const orderColumns = React.useMemo<ColumnDef<OrderRow>[]>(() => [
-    {
-      accessorKey: 'symbol',
-      header: 'Symbol',
-      cell: ({ getValue }) => (
-        <span className="font-bold text-[var(--foreground)]">{getValue() as string}</span>
-      ),
-    },
-    {
-      accessorKey: 'side',
-      header: 'Side',
-      cell: ({ getValue }) => {
-        const s = getValue() as string;
-        return (
-          <div className="flex justify-center">
-            <Badge variant={s === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5">{s}</Badge>
-          </div>
-        );
-      },
-    },
-    {
-      accessorKey: 'size',
-      header: 'Qty',
-      cell: ({ getValue }) => (
-        <span className="text-right block font-mono tabular-nums">{(getValue() as number).toFixed(4)}</span>
-      ),
-    },
-    {
-      accessorKey: 'status',
-      header: 'Status',
-      cell: () => (
-        <div className="text-right">
-          <Badge variant="warning" className="text-xs px-1.5 uppercase">PENDING</Badge>
-        </div>
-      ),
-    },
-    {
-      accessorKey: 'timestamp',
-      header: 'Submitted',
-      cell: ({ getValue }) => {
-        const ts = getValue() as string | number;
-        return (
-          <span className="text-right block text-[var(--muted-foreground)] font-mono tabular-nums">
-            {ts ? (parseUtc(ts)?.toLocaleTimeString(undefined, { hour12: false }) ?? '—') : '—'}
-          </span>
-        );
-      },
     },
   ], []);
 
@@ -314,15 +265,6 @@ export function PositionsTable() {
     columns: posColumns,
     state: { sorting: posSorting },
     onSortingChange: setPosSorting,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-  });
-
-  const orderTable = useReactTable({
-    data: openOrders as OrderRow[],
-    columns: orderColumns,
-    state: { sorting: orderSorting },
-    onSortingChange: setOrderSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
   });
@@ -339,13 +281,14 @@ export function PositionsTable() {
           <tr key={hg.id}>
             {hg.headers.map((header, i) => {
               const sorted = header.column.getIsSorted();
+              const align  = (header.column.columnDef.meta as any)?.align ?? 'left';
               return (
                 <th
                   key={header.id}
-                  className={`font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`}
+                  className={`font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${align === 'right' ? 'text-right' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`}
                   onClick={header.column.getToggleSortingHandler()}
                 >
-                  <span className="inline-flex items-center gap-1">
+                  <span className={`inline-flex items-center gap-1 ${align === 'right' ? 'justify-end' : ''}`}>
                     {flexRender(header.column.columnDef.header, header.getContext())}
                     {header.column.getCanSort() && <SortIndicator sorted={sorted} />}
                   </span>
@@ -382,9 +325,6 @@ export function PositionsTable() {
           <CardTitle className={tabClass('positions')} onClick={() => setActiveTab('positions')}>
             Positions ({positions.length})
           </CardTitle>
-          <CardTitle className={tabClass('orders')} onClick={() => setActiveTab('orders')}>
-            Open Orders ({openOrders.length})
-          </CardTitle>
           <CardTitle className={tabClass('risk')} onClick={() => setActiveTab('risk')}>
             Risk
           </CardTitle>
@@ -408,7 +348,6 @@ export function PositionsTable() {
 
       <CardContent className="flex-1 overflow-y-auto p-0">
         {activeTab === 'positions' && renderTable(posTable, 'No open positions', 5)}
-        {activeTab === 'orders'    && renderTable(orderTable, 'No open orders',  5)}
         {activeTab === 'risk'      && (
           <RiskStatusPanel riskStatus={riskStatus} fetchRiskStatus={fetchRiskStatus} />
         )}

@@ -4,7 +4,7 @@ import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { Sparkles } from 'lucide-react';
 

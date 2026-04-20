@@ -13,7 +13,7 @@ import {
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { BrainCircuit, SearchCode, Zap, Eye, Calculator, GraduationCap, Filter, Bot, Sparkles, Activity } from 'lucide-react';
 import { Badge } from "@/components/ui/badge";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { parseUtc } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -47,12 +47,13 @@ interface ReflectionEntry {
 
 // Reflection type → visual style mapping
 const TYPE_STYLES: Record<string, { icon: typeof Zap; label: string; color: string; border: string; bg: string }> = {
-  observe:   { icon: Eye,            label: 'OBSERVE',   color: 'text-[var(--agent-observe)]',        border: 'border-[var(--agent-observe)]/30',    bg: 'bg-[var(--agent-observe)]/5' },
-  calculate: { icon: Calculator,     label: 'POSITION',  color: 'text-[var(--agent-calculate)]',      border: 'border-[var(--agent-calculate)]/30',  bg: 'bg-[var(--agent-calculate)]/5' },
-  decision:  { icon: Zap,            label: 'DECISION',  color: 'text-[var(--neon-green)]',           border: 'border-[var(--neon-green)]/40',       bg: 'bg-[var(--neon-green)]/5' },
-  learning:  { icon: GraduationCap,  label: 'LEARNED',   color: 'text-[var(--agent-learning)]',       border: 'border-[var(--agent-learning)]/30',   bg: 'bg-[var(--agent-learning)]/5' },
-  director:  { icon: Bot,            label: 'DIRECTOR',  color: 'text-[var(--agent-execute)]',        border: 'border-[var(--agent-execute)]/30',    bg: 'bg-[var(--agent-execute)]/5' },
-  scanner:   { icon: Sparkles,       label: 'SCANNER',   color: 'text-[var(--agent-scanner)]',        border: 'border-[var(--agent-scanner)]/30',    bg: 'bg-[var(--agent-scanner)]/5' },
+  observe:   { icon: Eye,            label: 'OBSERVE',    color: 'text-[var(--agent-observe)]',        border: 'border-[var(--agent-observe)]/30',    bg: 'bg-[var(--agent-observe)]/5' },
+  calculate: { icon: Calculator,     label: 'POSITION',   color: 'text-[var(--agent-calculate)]',      border: 'border-[var(--agent-calculate)]/30',  bg: 'bg-[var(--agent-calculate)]/5' },
+  decision:  { icon: Zap,            label: 'DECISION',   color: 'text-[var(--neon-green)]',           border: 'border-[var(--neon-green)]/40',       bg: 'bg-[var(--neon-green)]/5' },
+  learning:  { icon: GraduationCap,  label: 'LEARNED',    color: 'text-[var(--agent-learning)]',       border: 'border-[var(--agent-learning)]/30',   bg: 'bg-[var(--agent-learning)]/5' },
+  director:  { icon: Bot,            label: 'DIRECTOR',   color: 'text-[var(--agent-execute)]',        border: 'border-[var(--agent-execute)]/30',    bg: 'bg-[var(--agent-execute)]/5' },
+  scanner:   { icon: Sparkles,       label: 'SCANNER',    color: 'text-[var(--agent-scanner)]',        border: 'border-[var(--agent-scanner)]/30',    bg: 'bg-[var(--agent-scanner)]/5' },
+  research:  { icon: SearchCode,     label: 'RESEARCH',   color: 'text-[var(--agent-research)]',       border: 'border-[var(--agent-research)]/30',   bg: 'bg-[var(--agent-research)]/5' },
 };
 
 function getTypeStyle(type: string | undefined) {
@@ -93,6 +94,14 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
     return { time, type: 'director', text, strategy: 'director', symbol: r.target_bot ?? '' };
   }
 
+  if (r.type === 'research') {
+    const raw       = r as any;
+    const theme     = raw.macro_theme ?? '';
+    const focus     = Array.isArray(raw.focus) ? (raw.focus as string[]).join(' · ') : '';
+    const text      = [theme, focus ? `Focus: ${focus}` : ''].filter(Boolean).join(' | ');
+    return { time, type: 'research', text: text || 'Research brief received', strategy: 'researcher', symbol: '' };
+  }
+
   if (r.text) {
     return { time, type: r.type ?? 'observe', text: r.text, strategy, symbol };
   }
@@ -118,7 +127,7 @@ function reflectionToDisplay(r: ReflectionEntry): { time: string; text: string; 
 // ---------------------------------------------------------------------------
 // Filter types
 // ---------------------------------------------------------------------------
-type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director' | 'scanner';
+type FilterType = 'ALL' | 'observe' | 'calculate' | 'decision' | 'learning' | 'director' | 'scanner' | 'research';
 const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
   { value: 'ALL',       label: 'All',      color: 'text-[var(--foreground)]' },
   { value: 'observe',   label: 'Observe',  color: 'text-[var(--agent-observe)]' },
@@ -127,6 +136,7 @@ const FILTER_OPTIONS: { value: FilterType; label: string; color: string }[] = [
   { value: 'learning',  label: 'Learning', color: 'text-[var(--agent-learning)]' },
   { value: 'director',  label: 'Director', color: 'text-[var(--agent-execute)]' },
   { value: 'scanner',   label: 'Scanner',  color: 'text-[var(--agent-scanner)]' },
+  { value: 'research',  label: 'Research', color: 'text-[var(--agent-research)]' },
 ];
 
 // ---------------------------------------------------------------------------

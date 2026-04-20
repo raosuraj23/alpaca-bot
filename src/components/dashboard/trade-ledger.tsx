@@ -13,7 +13,7 @@ import {
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Filter, Download, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { parseUtc } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -211,6 +211,7 @@ export function TradeLedger() {
       {
         accessorKey: 'side',
         header: 'Direction',
+        meta: { align: 'center' },
         cell: ({ getValue }) => (
           <div className="flex justify-center">
             <Badge variant={(getValue() as string) === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5 uppercase font-sans tracking-widest">
@@ -222,6 +223,7 @@ export function TradeLedger() {
       {
         accessorKey: 'bot',
         header: 'Origin Agent',
+        meta: { align: 'center' },
         cell: ({ getValue }) => (
           <div className="hidden md:flex justify-center">
             <Badge variant="outline" className="font-sans font-normal opacity-80">{(getValue() as string) ?? '—'}</Badge>
@@ -231,6 +233,7 @@ export function TradeLedger() {
       {
         accessorKey: 'confidence',
         header: 'Signal Conf.',
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           const pct = v != null ? v * 100 : null;
@@ -244,6 +247,7 @@ export function TradeLedger() {
       {
         accessorKey: 'fill_price',
         header: 'Fill Price',
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           return <span className="text-right block font-bold text-[var(--foreground)]">{v != null ? `$${Number(v).toFixed(2)}` : '—'}</span>;
@@ -252,6 +256,7 @@ export function TradeLedger() {
       {
         id: 'realized_pnl',
         header: 'Realized PnL',
+        meta: { align: 'right' },
         enableSorting: false,
         cell: ({ row }) => {
           const realPnl = row.original.side === 'SELL' ? (realizedPnlByLedgerId.get(row.original.id) ?? null) : null;
@@ -271,6 +276,7 @@ export function TradeLedger() {
       cols.splice(6, 0, {
         accessorKey: 'slippage_bps',
         header: 'Slippage',
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           const color = v == null ? 'text-[var(--muted-foreground)]'
@@ -300,15 +306,17 @@ export function TradeLedger() {
       ),
     },
     { accessorKey: 'strategy', header: 'Bot', cell: ({ getValue }) => <span className="text-[var(--muted-foreground)] truncate max-w-[90px] block">{getValue() as string}</span> },
-    { accessorKey: 'entry_price', header: 'Open @ price', cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">${Number(getValue()).toFixed(4)}</span> },
+    { accessorKey: 'entry_price', header: 'Open @ price', meta: { align: 'right' }, cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">${Number(getValue()).toFixed(4)}</span> },
     {
       accessorKey: 'entry_time',
       header: 'Open time',
+      meta: { align: 'right' },
       cell: ({ getValue }) => <span className="text-right block text-[var(--muted-foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
     },
     {
       accessorKey: 'exit_price',
       header: 'Close @ price',
+      meta: { align: 'right' },
       cell: ({ row }) => {
         const v = row.original.exit_price;
         return v != null
@@ -319,14 +327,16 @@ export function TradeLedger() {
     {
       accessorKey: 'exit_time',
       header: 'Close time',
+      meta: { align: 'right' },
       cell: ({ row }) => row.original.open
         ? <span className="text-right block text-[var(--neon-green)] opacity-70">live</span>
         : <span className="text-right block text-[var(--muted-foreground)]">{row.original.exit_time ? (parseUtc(row.original.exit_time)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
     },
-    { accessorKey: 'qty', header: 'Qty', cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">{(getValue() as number) != null ? Number(getValue()).toFixed(6) : '—'}</span> },
+    { accessorKey: 'qty', header: 'Qty', meta: { align: 'right' }, cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">{(getValue() as number) != null ? Number(getValue()).toFixed(6) : '—'}</span> },
     {
       accessorKey: 'pnl',
       header: 'PnL',
+      meta: { align: 'right' },
       cell: ({ row }) => {
         const pnl = row.original.open ? (row.original.unrealized_pnl ?? null) : row.original.pnl;
         const pos = pnl != null && pnl >= 0;
@@ -419,8 +429,8 @@ export function TradeLedger() {
             {ledgerTable.getHeaderGroups().map(hg => (
               <tr key={hg.id}>
                 {hg.headers.map((header, i) => (
-                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4 text-right text-[var(--kraken-light)]' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
-                    <span className="inline-flex items-center gap-1">{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
+                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${{ right: 'text-right', center: 'text-center' }[(header.column.columnDef.meta as any)?.align] ?? ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
+                    <span className={`inline-flex items-center gap-1 ${{ right: 'justify-end', center: 'justify-center' }[(header.column.columnDef.meta as any)?.align] ?? ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
                   </th>
                 ))}
               </tr>
@@ -457,8 +467,8 @@ export function TradeLedger() {
                 {historyTable.getHeaderGroups().map(hg => (
                   <tr key={hg.id}>
                     {hg.headers.map((header, i) => (
-                      <th key={header.id} className={`text-left font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4 text-right' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
-                        <span className="inline-flex items-center gap-1">{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
+                      <th key={header.id} className={`font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${(header.column.columnDef.meta as any)?.align === 'right' ? 'text-right' : 'text-left'} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
+                        <span className={`inline-flex items-center gap-1 ${(header.column.columnDef.meta as any)?.align === 'right' ? 'justify-end' : ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
                       </th>
                     ))}
                   </tr>

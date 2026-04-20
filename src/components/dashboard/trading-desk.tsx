@@ -24,7 +24,7 @@ export function TradingDesk() {
         <div className="flex-1 flex flex-col lg:flex-row gap-2 min-h-0">
 
           {/* Market & Tape */}
-          <section className="flex-1 flex flex-col gap-2 min-w-0 min-h-0">
+          <section className="flex-1 min-w-[220px] flex flex-col gap-2 min-h-0">
             <div className="flex-[0.7] min-h-0">
               <MarketOverview />
             </div>
@@ -34,12 +34,12 @@ export function TradingDesk() {
           </section>
 
           {/* Quant Controls */}
-          <section className="flex-[1] min-w-[300px] min-h-0">
+          <section className="flex-1 min-w-[220px] min-h-0">
             <BotControl />
           </section>
 
           {/* Streaming Intelligence */}
-          <section className="w-[380px] flex-shrink-0 min-h-0">
+          <section className="flex-1 min-w-[220px] min-h-0">
             <AiInsights />
           </section>
 

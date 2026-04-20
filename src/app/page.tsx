@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from 'react';
-import { useTradingEngine, useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingEngine, useTradingStore } from '@/store';
 import { Activity, LayoutDashboard, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 

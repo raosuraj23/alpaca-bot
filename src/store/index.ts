@@ -75,6 +75,7 @@ interface TradingStore {
   injectSocketData: (ticks: Array<{ symbol: string, price: number, volume?: number }>) => void;
   fetchAPIIntegrations: () => Promise<void>;
   fetchStrategyStates: () => Promise<void>;
+  fetchReflectionsHistory: () => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,8 +351,39 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
       if (Array.isArray(ledger) && ledger.length > 0) set({ ledgerTrades: ledger });
     } catch { /* silent fail */ }
 
+    // Strategy states — populates Strategy Mental Model in Brain tab
+    get().fetchStrategyStates();
+
+    // Seed Brain tab learning history from persisted reflection logs
+    get().fetchReflectionsHistory();
+
     // Market history is fetched separately — it's the heaviest call
     get().fetchMarketHistory(get().activeSymbol);
+  },
+
+  fetchReflectionsHistory: async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/reflections/history`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) return;
+      const rows: Array<{ strategy?: string; symbol?: string; action?: string; insight?: string; timestamp?: string }> =
+        await res.json();
+      if (!Array.isArray(rows) || rows.length === 0) return;
+      const mapped = rows.map(r => ({
+        type:      'learning' as const,
+        text:      r.insight ?? '',
+        strategy:  r.strategy,
+        symbol:    r.symbol,
+        action:    r.action,
+        timestamp: r.timestamp,
+      }));
+      // Only seed if SSE hasn't already populated learningHistory
+      const current = useTradingStore.getState().learningHistory;
+      if (current.length === 0) {
+        set({ learningHistory: mapped });
+      }
+    } catch { /* silent fail */ }
   },
 }));
 
@@ -515,7 +547,8 @@ export function useTradingEngine() {
     // Continuous polling — keep positions, orders, and ledger fresh
     const pollPositions = setInterval(() => {
       useTradingStore.getState().fetchPositions();
-    }, 30_000); // 30s — positions + orders + account
+      useTradingStore.getState().fetchStrategyStates();
+    }, 30_000); // 30s — positions + orders + account + strategy states
 
     const pollLedger = setInterval(() => {
       useTradingStore.getState().fetchLedger();

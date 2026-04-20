@@ -59,6 +59,8 @@ class ClosedTrade(Base):
     symbol = Column(String(20), index=True)
     entry_time = Column(DateTime(timezone=True))
     exit_time = Column(DateTime(timezone=True), index=True)
+    entry_execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
+    exit_execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
     qty = Column(Numeric(18, 8))
     avg_entry_price = Column(Numeric(18, 8))
     avg_exit_price = Column(Numeric(18, 8))
@@ -79,8 +81,23 @@ class PortfolioSnapshot(Base):
     timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
     total_equity = Column(Numeric(18, 4))
     cash_balance = Column(Numeric(18, 4))
+    margin_used = Column(Numeric(18, 4), nullable=True)
     unrealized_pnl = Column(Numeric(18, 4))
     realized_pnl_day = Column(Numeric(18, 4))
+    drawdown_threshold = Column(Numeric(18, 4), nullable=True)
+
+class MarketConditionSnapshot(Base):
+    """Stores the state of the market order book and indicators at exact execution time."""
+    __tablename__ = "market_condition_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
+    symbol = Column(String(20), index=True)
+    timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    bid_price = Column(Numeric(18, 8))
+    ask_price = Column(Numeric(18, 8))
+    spread = Column(Numeric(10, 6), nullable=True)
+    volume_profile = Column(JSON, nullable=True)
 
 # ---------------------------------------------------------
 # AGENT & SYSTEM LAYER

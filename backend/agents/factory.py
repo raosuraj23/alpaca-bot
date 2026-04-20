@@ -284,7 +284,7 @@ class SwarmFactory:
           discovery — gemini-2.5-flash  / haiku fallback  (800t,  symbol ranked selection)
           fast      — gemini-2.5-flash  / haiku fallback  (150t,  verdicts, learnings)
           chat      — claude-haiku      / flash fallback  (300t,  command parsing + caching)
-          signal    — gemini-2.5-flash  / haiku fallback  (50t,   binary APPROVED/REJECTED)
+          signal    — gemini-2.5-flash  / haiku fallback  (150t,  binary APPROVED/REJECTED + rationale)
           director  — claude-haiku      / flash fallback  (400t,  Pydantic structured output)
           smart     — claude-opus-4-6   / gemini-2.5-flash (legacy, uncapped)
           standard  — claude-sonnet-4-6 / gemini-2.5-flash (legacy, uncapped)
@@ -348,7 +348,7 @@ class SwarmFactory:
 
         # ── signal ───────────────────────────────────────────────────────────
         if model_level == "signal":
-            budget = max_tokens or 50
+            budget = max_tokens or 150
             return _resilient_flash(0, budget) or _haiku(0, budget)
 
         # ── director ─────────────────────────────────────────────────────────

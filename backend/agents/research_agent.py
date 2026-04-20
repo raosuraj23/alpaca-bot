@@ -201,6 +201,7 @@ class ResearchAgent:
                         "sentiment":  sig.get("sentiment"),
                         "rationale":  sig.get("rationale", ""),
                         "confidence": confidence,
+                        **self._compute_ta_fields(symbol),
                     }
                     asyncio.create_task(self._signal_callback(event))
                     logger.info("[RESEARCH] Breaking signal: %s %.0f%% %s",
@@ -391,6 +392,47 @@ class ResearchAgent:
                 logger.debug("[RESEARCH] RSS feed %s failed: %s", feed_name, exc)
 
         return items
+
+    def _compute_ta_fields(self, symbol: str) -> dict:
+        """Compute TA indicator snapshot for enriching breaking-news signals."""
+        try:
+            import pandas as pd  # noqa: F401 — available project-wide
+            buffer = self._get_buffer()
+            if buffer is None:
+                return {}
+            df = buffer.get_candles(symbol, "5Min")
+            if df is None or df.empty or len(df) < 20:
+                return {}
+            closes  = df["close"]
+            volumes = df["volume"]
+            n = len(closes)
+
+            ema50  = float(closes.ewm(span=50,  adjust=False).mean().iloc[-1]) if n >= 50  else 0.0
+            ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1]) if n >= 200 else 0.0
+
+            rsi_val: Optional[float] = None
+            if n >= 15:
+                deltas   = closes.diff().dropna().tolist()[-14:]
+                avg_gain = sum(d for d in deltas if d > 0) / 14
+                avg_loss = sum(-d for d in deltas if d < 0) / 14
+                rsi_val  = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+
+            avg_vol   = float(volumes.iloc[-20:].mean()) if n >= 20 else 0.0
+            vol_ratio = float(volumes.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+
+            return {
+                "ema_50":             round(ema50, 4),
+                "ema_200":            round(ema200, 4),
+                "rsi_14":             round(rsi_val, 2) if rsi_val is not None else 0.0,
+                "volume_surge_ratio": round(vol_ratio, 3),
+                "conditions": {
+                    "golden_cross": ema50 > ema200 and ema200 > 0,
+                    "rsi_gate":     rsi_val is not None and 40 < rsi_val < 60,
+                    "volume_surge": vol_ratio > 1.5,
+                },
+            }
+        except Exception:
+            return {}
 
     def _build_ta_summary(self, buffer) -> str:
         """Compact per-symbol price/ema snapshot for the research prompt."""
