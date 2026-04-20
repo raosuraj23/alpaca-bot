@@ -79,8 +79,8 @@ class CoveredCallStrategy(BaseStrategy):
     MAX_RSI         = 68.0
     COOLDOWN_TICKS  = 50
 
-    def __init__(self, bot_id="covered-call", name="Covered Call Writer", allocation=5):
-        super().__init__(bot_id, name, allocation, "Covered Call")
+    def __init__(self, bot_id="covered-call", name="Covered Call Writer", allocation=5, **kwargs):
+        super().__init__(bot_id, name, allocation, "Covered Call", **kwargs)
         self._ema_short:   dict[str, float] = {}
         self._ema_long:    dict[str, float] = {}
         self._prices:      dict[str, deque] = {}
@@ -122,7 +122,7 @@ class CoveredCallStrategy(BaseStrategy):
         loss = self._avg_loss[symbol]
         self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
         self._update_ema(symbol, price)
@@ -207,8 +207,8 @@ class ProtectivePutStrategy(BaseStrategy):
     COOLDOWN_TICKS   = 30
     ANNUALISE_FACTOR = 252 ** 0.5
 
-    def __init__(self, bot_id="protective-put", name="Protective Put", allocation=3):
-        super().__init__(bot_id, name, allocation, "Protective Put")
+    def __init__(self, bot_id="protective-put", name="Protective Put", allocation=3, **kwargs):
+        super().__init__(bot_id, name, allocation, "Protective Put", **kwargs)
         self._returns:    dict[str, deque] = {}
         self._last_price: dict[str, float] = {}
         self._rsi_prices: dict[str, deque] = {}
@@ -218,6 +218,32 @@ class ProtectivePutStrategy(BaseStrategy):
         self._rsi_init:   dict[str, bool]  = {}
         self._cooldown:   dict[str, int]   = {}
         self._put_open:   dict[str, bool]  = {}
+        # Welford sliding-window state for returns variance
+        self._w_mean: dict[str, float] = {}
+        self._w_M2:   dict[str, float] = {}
+        self._w_n:    dict[str, int]   = {}
+
+    def _update_welford_vol(self, symbol: str, ret: float) -> None:
+        """Welford's sliding-window variance update for returns (O(1)).
+        Must be called BEFORE appending ret to self._returns[symbol]."""
+        n_cur = len(self._returns[symbol])
+        if n_cur == 0:
+            self._w_mean[symbol] = ret
+            self._w_M2[symbol]   = 0.0
+            self._w_n[symbol]    = 1
+        elif n_cur < self.VOL_WINDOW:
+            self._w_n[symbol] += 1
+            delta = ret - self._w_mean[symbol]
+            self._w_mean[symbol] += delta / self._w_n[symbol]
+            self._w_M2[symbol]   += delta * (ret - self._w_mean[symbol])
+        else:
+            old_r    = self._returns[symbol][0]
+            old_mean = self._w_mean[symbol]
+            self._w_mean[symbol] += (ret - old_r) / self.VOL_WINDOW
+            self._w_M2[symbol]   += (ret - old_r) * (
+                (ret - self._w_mean[symbol]) + (old_r - old_mean)
+            )
+            self._w_M2[symbol] = max(0.0, self._w_M2[symbol])
 
     def _update_vol(self, symbol: str, price: float) -> float | None:
         if symbol not in self._returns:
@@ -226,14 +252,14 @@ class ProtectivePutStrategy(BaseStrategy):
             return None
         prev = self._last_price[symbol]
         if prev > 0:
-            self._returns[symbol].append((price - prev) / prev)
+            ret = (price - prev) / prev
+            self._update_welford_vol(symbol, ret)
+            self._returns[symbol].append(ret)
         self._last_price[symbol] = price
         if len(self._returns[symbol]) < self.VOL_WINDOW:
             return None
-        rets = list(self._returns[symbol])
-        mean = sum(rets) / len(rets)
-        var  = sum((r - mean) ** 2 for r in rets) / len(rets)
-        return (var ** 0.5) * self.ANNUALISE_FACTOR
+        var = self._w_M2[symbol] / self.VOL_WINDOW
+        return (max(0.0, var) ** 0.5) * self.ANNUALISE_FACTOR
 
     def _update_rsi(self, symbol: str, price: float):
         if symbol not in self._rsi_prices:
@@ -257,7 +283,7 @@ class ProtectivePutStrategy(BaseStrategy):
         loss = self._avg_loss[symbol]
         self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
 
-    def analyze(self, symbol: str, price: float) -> dict | None:
+    async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
             return None
         ann_vol = self._update_vol(symbol, price)
@@ -313,10 +339,8 @@ class ProtectivePutStrategy(BaseStrategy):
         rsi     = self._rsi.get(symbol)
         ann_vol = None
         if symbol in self._returns and len(self._returns[symbol]) >= self.VOL_WINDOW:
-            rets = list(self._returns[symbol])
-            mean = sum(rets) / len(rets)
-            var  = sum((r - mean) ** 2 for r in rets) / len(rets)
-            ann_vol = round((var ** 0.5) * self.ANNUALISE_FACTOR * 100, 2)
+            var     = self._w_M2.get(symbol, 0.0) / self.VOL_WINDOW
+            ann_vol = round((max(0.0, var) ** 0.5) * self.ANNUALISE_FACTOR * 100, 2)
         return {
             "strategy": self.id, "name": self.name, "asset_class": self.asset_class,
             "ann_vol_pct": ann_vol,

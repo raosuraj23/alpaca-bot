@@ -13,11 +13,43 @@ momentum readings). No LLM calls, no cost.
 """
 
 import asyncio
+import json
 import logging
+import pathlib
 from datetime import datetime
+from enum import Enum
 from typing import Callable, Optional
+from config import CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT
 
 logger = logging.getLogger(__name__)
+
+
+class FailureClass(str, Enum):
+    BAD_PREDICTION    = "BAD_PREDICTION"    # model was directionally wrong despite high confidence
+    TIMING            = "TIMING"            # correct direction, but entry/exit timing degraded P&L
+    EXECUTION_QUALITY = "EXECUTION"         # slippage or fill quality was the primary drag
+    MARKET_SHOCK      = "MARKET_SHOCK"      # exogenous catalyst (news, macro) invalidated signal
+
+
+def classify_failure(
+    signal_confidence: float,
+    realized_pnl: float,
+    slippage: float,
+    signal_price: float,
+    news_shock: bool = False,
+) -> FailureClass:
+    """
+    Deterministic failure classification for losing trades.
+    Priority: MARKET_SHOCK > EXECUTION_QUALITY > BAD_PREDICTION > TIMING
+    """
+    if news_shock:
+        return FailureClass.MARKET_SHOCK
+    slippage_pct = abs(slippage / signal_price) if signal_price > 0 else 0.0
+    if slippage_pct > 0.02:
+        return FailureClass.EXECUTION_QUALITY
+    if realized_pnl < 0 and signal_confidence > 0.70:
+        return FailureClass.BAD_PREDICTION
+    return FailureClass.TIMING
 
 # Cadence constants (seconds)
 OBSERVE_INTERVAL = 60
@@ -250,8 +282,20 @@ class ReflectionEngine:
         slippage = execution_data.get("slippage", 0)
         confidence = execution_data.get("confidence", 0)
         qty = execution_data.get("qty", 0)
+        realized_pnl      = execution_data.get("realized_pnl")       # only for SELL fills
+        entry_price       = execution_data.get("entry_price")        # only for SELL fills
+        market_conditions = execution_data.get("market_conditions")  # JSON string from execution agent
 
         now = datetime.utcnow()
+
+        # Compute hold duration for SELL fills (async DB lookup)
+        hold_duration_min = execution_data.get("hold_duration_min")
+        if hold_duration_min is None and action == "SELL":
+            hold_duration_min = await self._compute_hold_duration(strategy, symbol)
+
+        pnl_pct = 0.0
+        if realized_pnl is not None and entry_price and entry_price > 0 and qty > 0:
+            pnl_pct = (realized_pnl / (entry_price * qty)) * 100
 
         # Try LLM insight (Haiku, max_tokens=100)
         insight = None
@@ -261,19 +305,30 @@ class ReflectionEngine:
             if model:
                 from langchain_core.messages import SystemMessage, HumanMessage
                 sys_msg = SystemMessage(content=(
-                    "You are a quant trading analyst reviewing crypto paper trades. "
-                    "All prices and slippage are in USD. qty is a fractional coin amount "
-                    "(e.g. 0.0003 BTC, 0.005 ETH — never grams or kg). "
-                    "Produce ONE concise sentence (max 30 words) analysing slippage quality, "
-                    "confidence calibration, or market conditions. "
-                    "Reference specific USD figures from the data. No markdown, no preamble."
+                    "You are a quant trading analyst reviewing paper trades (equities and crypto). "
+                    "All prices and slippage are in USD. qty is a fractional amount. "
+                    "For BUY trades: assess entry timing quality — was confidence well-calibrated "
+                    "to market momentum? Was it a good entry point? "
+                    "For SELL trades: assess round-trip profitability — did the exit capture gains "
+                    "well? Was the exit premature or well-timed given the return? "
+                    "Produce ONE concise sentence (max 35 words). "
+                    "Reference specific USD figures and percentages from the data. No markdown, no preamble."
                 ))
-                user_msg = HumanMessage(content=(
-                    f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
-                    f"Qty: {qty:.6f} coins | Fill price: ${fill_price:.2f} USD | "
-                    f"Slippage: ${slippage:.4f} USD | Signal confidence: {confidence:.0%}"
-                ))
-                response = model.invoke(
+
+                if action == "SELL" and realized_pnl is not None and entry_price is not None:
+                    trade_context = (
+                        f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
+                        f"Qty: {qty:.6f} | Fill: ${fill_price:.2f} | Slippage: ${slippage:.4f} | Conf: {confidence:.0%}\n"
+                        f"Entry: ${entry_price:.2f} | Realized PnL: ${realized_pnl:+.4f} | Return: {pnl_pct:+.2f}%"
+                    )
+                else:
+                    trade_context = (
+                        f"Strategy: {strategy} | Action: {action} | Symbol: {symbol}\n"
+                        f"Qty: {qty:.6f} | Fill: ${fill_price:.2f} | Slippage: ${slippage:.4f} | Conf: {confidence:.0%}"
+                    )
+
+                user_msg = HumanMessage(content=trade_context)
+                response = await model.ainvoke(
                     [sys_msg, user_msg],
                     max_tokens=250,
                 )
@@ -284,13 +339,12 @@ class ReflectionEngine:
                     usage = getattr(response, "usage_metadata", None) or {}
                     t_in  = usage.get("input_tokens", 0)
                     t_out = usage.get("output_tokens", 0)
-                    # Haiku pricing: $0.80/M input, $4.00/M output
-                    cost  = (t_in * 0.80 + t_out * 4.00) / 1_000_000
+                    cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
                     from db.database import _get_session_factory
                     from db.models import LLMUsage
                     async with _get_session_factory()() as _s:
                         _s.add(LLMUsage(
-                            model="claude-haiku-4-5",
+                            model=CLAUDE_HAIKU_MODEL,
                             tokens_in=t_in,
                             tokens_out=t_out,
                             cost_usd=cost,
@@ -306,18 +360,49 @@ class ReflectionEngine:
         # Fallback template if no LLM
         if not insight:
             slip_quality = "excellent" if abs(slippage) < 0.5 else "acceptable" if abs(slippage) < 2 else "poor"
-            insight = (
-                f"{strategy} {action} {symbol} filled at ${fill_price:.2f} "
-                f"with {slip_quality} slippage (${slippage:.4f}). "
-                f"Signal confidence was {confidence:.0%}."
-            )
+            if action == "SELL" and realized_pnl is not None:
+                outcome = "profitable" if realized_pnl > 0 else "unprofitable"
+                insight = (
+                    f"{strategy} {action} {symbol} at ${fill_price:.2f}: "
+                    f"{outcome} round-trip (PnL=${realized_pnl:+.4f}, {pnl_pct:+.2f}%) "
+                    f"with {slip_quality} slippage."
+                )
+            else:
+                insight = (
+                    f"{strategy} {action} {symbol} filled at ${fill_price:.2f} "
+                    f"with {slip_quality} slippage (${slippage:.4f}). "
+                    f"Signal confidence was {confidence:.0%}."
+                )
 
         impact = f"Slip=${slippage:.4f} | Conf={confidence:.0%}"
+
+        # Classify failure and compute Brier Score contribution (for losing trades only)
+        failure_cls: Optional[str] = None
+        brier_contrib: Optional[float] = None
+        outcome = 1 if (realized_pnl is not None and realized_pnl > 0) else 0
+
+        if realized_pnl is not None:
+            if realized_pnl <= 0:
+                failure_cls = classify_failure(
+                    signal_confidence=confidence,
+                    realized_pnl=realized_pnl,
+                    slippage=slippage,
+                    signal_price=float(execution_data.get("signal_price", fill_price or 1.0)),
+                ).value
+            # Brier contribution: (forecast - outcome)^2 for every closed trade
+            brier_contrib = round((confidence - outcome) ** 2, 6)
+
+            # Feed into in-memory calibration tracker
+            try:
+                from risk.calibration import calibration_tracker
+                calibration_tracker.log(strategy, confidence, outcome)
+            except Exception as _ce:
+                logger.debug("[REFLECTION] Calibration log failed: %s", _ce)
 
         # Persist to BotAmend + ReflectionLog
         try:
             from db.database import _get_session_factory
-            from db.models import BotAmend, ReflectionLog
+            from db.models import BotAmend, ReflectionLog, CalibrationRecord
             async with _get_session_factory()() as session:
                 session.add(BotAmend(
                     model=strategy,
@@ -332,11 +417,30 @@ class ReflectionEngine:
                     action=action,
                     insight=insight,
                     tokens_used=execution_data.get("_tokens_used"),
+                    failure_class=failure_cls,
+                    brier_contribution=brier_contrib,
+                    entry_price=entry_price,
+                    exit_price=fill_price if action == "SELL" else None,
+                    hold_duration_min=hold_duration_min,
+                    market_conditions=market_conditions,
                     timestamp=now,
                 ))
+                if realized_pnl is not None:
+                    session.add(CalibrationRecord(
+                        strategy=strategy,
+                        forecast=round(confidence, 4),
+                        outcome=outcome,
+                        brier_contribution=brier_contrib,
+                    ))
                 await session.commit()
         except Exception as e:
             logger.warning("[REFLECTION] Failed to persist BotAmend/ReflectionLog: %s", e)
+
+        # Compound learning: invoke post_mortem agent for losing trades and persist to knowledge base
+        if realized_pnl is not None and realized_pnl < 0 and failure_cls is not None:
+            pm_result = await self._invoke_post_mortem(execution_data, failure_cls)
+            if pm_result and pm_result.get("knowledge_entry"):
+                self._append_knowledge(pm_result, execution_data)
 
         # Push to SSE stream
         self._push({
@@ -352,6 +456,125 @@ class ReflectionEngine:
         })
 
         logger.info("[REFLECTION] Trade learning: %s", insight[:80])
+
+    # ------------------------------------------------------------------
+    # Compound Learning (Post-Mortem → Knowledge Base)
+    # ------------------------------------------------------------------
+
+    async def _invoke_post_mortem(self, execution_data: dict, failure_cls: str) -> Optional[dict]:
+        """
+        Calls the post_mortem agent persona with losing trade data.
+        Returns parsed JSON dict (failure_class, root_cause, adjustment, knowledge_entry)
+        or None on any failure. Budget: 200 tokens via fast tier (Haiku).
+        """
+        try:
+            from agents.factory import swarm_factory
+            from langchain_core.messages import HumanMessage
+
+            model = swarm_factory.build_model(model_level="fast", max_tokens=200)
+            if not model:
+                return None
+
+            system_msg = swarm_factory.get_system_prompt("post_mortem")
+            if not system_msg:
+                logger.debug("[REFLECTION] post_mortem persona not found in factory")
+                return None
+
+            trade_payload = json.dumps({
+                "strategy":          execution_data.get("strategy", "unknown"),
+                "symbol":            execution_data.get("symbol", "?"),
+                "signal_confidence": execution_data.get("confidence", 0),
+                "realized_pnl":      execution_data.get("realized_pnl", 0),
+                "slippage_pct":      abs(execution_data.get("slippage", 0) /
+                                         max(execution_data.get("signal_price",
+                                             execution_data.get("fill_price", 1)) or 1, 0.01)),
+                "entry_price":       execution_data.get("entry_price", 0),
+                "exit_price":        execution_data.get("fill_price", 0),
+                "hold_duration_min": execution_data.get("hold_duration_min", 0),
+                "news_items":        [],
+                "failure_class":     failure_cls,
+            })
+
+            response = await model.ainvoke(
+                [system_msg, HumanMessage(content=trade_payload)],
+                max_tokens=200,
+            )
+
+            try:
+                usage = getattr(response, "usage_metadata", None) or {}
+                t_in  = usage.get("input_tokens", 0)
+                t_out = usage.get("output_tokens", 0)
+                cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
+                from db.database import _get_session_factory
+                from db.models import LLMUsage
+                async with _get_session_factory()() as _s:
+                    _s.add(LLMUsage(
+                        model=CLAUDE_HAIKU_MODEL,
+                        tokens_in=t_in, tokens_out=t_out,
+                        cost_usd=cost, purpose="post_mortem",
+                    ))
+                    await _s.commit()
+            except Exception as _le:
+                logger.debug("[REFLECTION] Post-mortem cost log failed: %s", _le)
+
+            raw = response.content.strip()
+            # Strip markdown fences if the model wraps in ```json ... ```
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw.strip())
+
+        except Exception as exc:
+            logger.debug("[REFLECTION] Post-mortem invocation failed: %s", exc)
+            return None
+
+    def _append_knowledge(self, entry: dict, execution_data: dict) -> None:
+        """Appends one structured entry to backend/knowledge/failure_log.jsonl."""
+        kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+        kb_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp":       datetime.utcnow().isoformat() + "Z",
+            "strategy":        execution_data.get("strategy", "unknown"),
+            "symbol":          execution_data.get("symbol", "?"),
+            "failure_class":   entry.get("failure_class", "UNKNOWN"),
+            "knowledge_entry": entry.get("knowledge_entry", ""),
+            "adjustment":      entry.get("adjustment", ""),
+        }
+        try:
+            with open(kb_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            logger.info("[REFLECTION] Knowledge appended: %s", record["knowledge_entry"][:80])
+        except Exception as exc:
+            logger.warning("[REFLECTION] Failed to append knowledge: %s", exc)
+
+    async def _compute_hold_duration(self, bot_id: str, symbol: str) -> int | None:
+        """Returns minutes between the last BUY fill and now for this bot+symbol pair."""
+        try:
+            from db.database import _get_session_factory
+            from db.models import SignalRecord, ExecutionRecord as _ER
+            from sqlalchemy import select, and_
+            async with _get_session_factory()() as session:
+                stmt = (
+                    select(_ER.timestamp)
+                    .join(SignalRecord, _ER.signal_id == SignalRecord.id)
+                    .where(and_(
+                        SignalRecord.strategy == bot_id,
+                        SignalRecord.symbol   == symbol,
+                        SignalRecord.action   == "BUY",
+                        _ER.status            == "FILLED",
+                    ))
+                    .order_by(_ER.timestamp.desc())
+                    .limit(1)
+                )
+                row = (await session.execute(stmt)).scalar_one_or_none()
+                if row:
+                    ts = row.replace(tzinfo=None) if row.tzinfo else row
+                    delta = datetime.utcnow() - ts
+                    return max(1, int(delta.total_seconds() / 60))
+        except Exception as exc:
+            logger.debug("[REFLECTION] hold_duration_min lookup failed: %s", exc)
+        return None
 
     def stop(self):
         self._running = False

@@ -2,8 +2,6 @@
   "permissions": {
     "allow": [
       "Bash(npm run:*)",
-      "Skill(code-review:code-review)",
-      "Skill(code-review:code-review:*)",
       "Bash(xargs grep:*)",
       "Bash(python -m pip show numpy alpaca-trade-api alpaca-py)",
       "Bash(python -c \"import sys; print\\(sys.version\\)\")",

@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import { useEffect, useRef } from 'react';
+import { toast } from 'sonner';
+import { API_BASE, WS_BASE } from '@/lib/api';
 
 import type {
   AssetClass,
@@ -58,15 +60,19 @@ interface TradingStore {
   scannerResults: any[];
   strategyStates: Record<string, any[]>;
   bots: any[];
-  performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean };
+  performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean; sharpe: number; sortino: number; realized_trades?: { pnl: number }[] };
+  lastSignal: { bot_id: string; action: string; symbol: string; confidence: number; timestamp: string } | null;
+  ohlcvData: { candles: { time: number; open: number; high: number; low: number; close: number; volume: number }[]; symbol: string } | null;
+  wsStatus: 'connected' | 'reconnecting' | 'offline';
 
   setAssetClass: (ac: AssetClass) => void;
   setActiveSymbol: (s: string) => void;
   fetchMarketHistory: (s: string) => Promise<void>;
+  fetchOHLCV: (symbol: string, period?: string) => Promise<void>;
   fetchRiskStatus: () => Promise<void>;
   fetchPositions: () => Promise<void>;
   fetchLedger: () => Promise<void>;
-  injectSocketData: (symbol: string, price: number, volume?: number) => void;
+  injectSocketData: (ticks: Array<{ symbol: string, price: number, volume?: number }>) => void;
   fetchAPIIntegrations: () => Promise<void>;
   fetchStrategyStates: () => Promise<void>;
 }
@@ -87,7 +93,10 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   positions:     [],
   botLogs:       [],
   bots:          [],
-  performance:   { history: [], net_pnl: 0, drawdown: 0, has_data: false },
+  performance:   { history: [], net_pnl: 0, drawdown: 0, has_data: false, sharpe: 0, sortino: 0 },
+  lastSignal:    null,
+  ohlcvData:     null,
+  wsStatus:      'offline',
   marketHistory: [],
   learningHistory: [],
   aiInsights:    null,
@@ -108,22 +117,48 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   fetchMarketHistory: async (s: string) => {
     try {
       const encoded = encodeURIComponent(s);
-      const res = await fetch(`http://localhost:8000/api/market/history?symbol=${encoded}`);
+      const res = await fetch(`${API_BASE}/api/market/history?symbol=${encoded}`, {
+        signal: AbortSignal.timeout(5000)
+      });
       if (res.ok) {
         set({ marketHistory: await res.json() });
       }
     } catch (err) {
       console.error('[ORCHESTRATOR] Error fetching market history', err);
+      // Don't retry immediately, let the periodic refresh handle it
+    }
+  },
+
+  fetchOHLCV: async (symbol: string, period = '1H') => {
+    try {
+      const encoded = encodeURIComponent(symbol);
+      const res = await fetch(
+        `${API_BASE}/api/ohlcv?symbol=${encoded}&period=${period}`,
+        { signal: AbortSignal.timeout(10_000) },
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.candles?.length > 0) {
+          set({ ohlcvData: { candles: data.candles, symbol: data.symbol } });
+        }
+      }
+    } catch (err) {
+      console.warn('[OHLCV] fetch failed — chart will use synthetic candles', err);
     }
   },
 
   fetchRiskStatus: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/risk/status', {
+      const res = await fetch(`${API_BASE}/api/risk/status`, {
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
-        set({ riskStatus: await res.json() });
+        const next = await res.json();
+        const prev = get().riskStatus;
+        if (next.triggered && !prev?.triggered) {
+          toast.error(`Kill Switch Active — ${next.reason ?? 'Trading Halted'}`, { duration: Infinity });
+        }
+        set({ riskStatus: next });
       }
     } catch {
       // Silent fail — risk status is non-critical for UI
@@ -132,7 +167,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
 
   fetchStrategyStates: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/strategy/states', {
+      const res = await fetch(`${API_BASE}/api/strategy/states`, {
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
@@ -155,9 +190,9 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     };
 
     const [account, posData, ordData] = await Promise.all([
-      safeFetch<AlpacaAccountResponse>('http://localhost:8000/api/account'),
-      safeFetch<AlpacaPositionResponse[]>('http://localhost:8000/api/positions'),
-      safeFetch<AlpacaOrderResponse[]>('http://localhost:8000/api/orders'),
+      safeFetch<AlpacaAccountResponse>(`${API_BASE}/api/account`),
+      safeFetch<AlpacaPositionResponse[]>(`${API_BASE}/api/positions`),
+      safeFetch<AlpacaOrderResponse[]>(`${API_BASE}/api/orders`),
     ]);
 
     if (account) {
@@ -199,7 +234,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   // Refreshes the execution ledger from DB. Called on 60s interval.
   fetchLedger: async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/ledger', { signal: AbortSignal.timeout(10000) });
+      const res = await fetch(`${API_BASE}/api/ledger`, { signal: AbortSignal.timeout(10000) });
       if (res.ok) {
         const ledger = await res.json();
         if (Array.isArray(ledger)) set({ ledgerTrades: ledger });
@@ -208,34 +243,44 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
   },
 
   // Real-time integration pipe for the Python FastAPI / Alpaca WebSocket bridge.
-  // Receives symbol + price from the backend stream and updates the Zustand store.
+  // Receives an array of batched ticks from the backend stream and updates the Zustand store once.
   // In production, Alpaca provides precise daily bars; the change24h here is a
   // rough visual approximation until the daily bar feed is wired up (Phase 1).
-  injectSocketData: (symbol, price, volume) => {
-    const currentList = get().watchlist;
-    const existing = currentList.find(w => w.symbol === symbol);
+  injectSocketData: (ticks) => {
+    let currentList = get().watchlist;
+    let newTicker = get().ticker;
+    let isActiveChanged = false;
 
-    let newWatchlist = currentList;
-    if (existing) {
-      const diff       = price - existing.price;
-      const changePct  = existing.change24h + (diff / price) * 100;
-      const updated    = { ...existing, price, volume: volume ?? existing.volume, change24h: changePct };
-      newWatchlist     = currentList.map(item => item.symbol === symbol ? updated : item);
+    // Use a map for O(1) deduplication of multiple ticks for the same symbol in a single batch
+    const latestTicks = new Map<string, { symbol: string, price: number, volume?: number }>();
+    for (const tick of ticks) {
+      latestTicks.set(tick.symbol, tick);
     }
 
-    const isActive = get().activeSymbol === symbol;
-    const newTicker = isActive && existing
-      ? { ...existing, price, volume: volume ?? existing.volume }
-      : get().ticker;
+    let watchlistUpdated = false;
+    for (const { symbol, price, volume } of latestTicks.values()) {
+      const existing = currentList.find(w => w.symbol === symbol);
+      if (existing) {
+        watchlistUpdated = true;
+        const diff       = price - existing.price;
+        const changePct  = existing.change24h + (diff / price) * 100;
+        const updated    = { ...existing, price, volume: volume ?? existing.volume, change24h: changePct };
+        currentList      = currentList.map(item => item.symbol === symbol ? updated : item);
 
-    // (Removed offline execution trace injection)
-    const newTrades = get().recentTrades;
+        const isActive = get().activeSymbol === symbol;
+        if (isActive) {
+          newTicker = { ...existing, price, volume: volume ?? existing.volume };
+          isActiveChanged = true;
+        }
+      }
+    }
 
-    set({
-      watchlist: newWatchlist,
-      recentTrades: newTrades,
-      ...(isActive && { ticker: newTicker }),
-    });
+    if (watchlistUpdated || isActiveChanged) {
+      set({
+        watchlist: currentList,
+        ...(isActiveChanged && { ticker: newTicker }),
+      });
+    }
   },
 
   // Polls the FastAPI REST endpoints for account/position/order snapshots.
@@ -253,11 +298,11 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
 
     // Parallel fetch — fast endpoints only
     const [account, posData, ordData, bots, performance] = await Promise.all([
-      safeFetchJSON<AlpacaAccountResponse>('http://localhost:8000/api/account'),
-      safeFetchJSON<AlpacaPositionResponse[]>('http://localhost:8000/api/positions'),
-      safeFetchJSON<AlpacaOrderResponse[]>('http://localhost:8000/api/orders'),
-      safeFetchJSON<any[]>('http://localhost:8000/api/bots'),
-      safeFetchJSON<any>('http://localhost:8000/api/performance')
+      safeFetchJSON<AlpacaAccountResponse>(`${API_BASE}/api/account`),
+      safeFetchJSON<AlpacaPositionResponse[]>(`${API_BASE}/api/positions`),
+      safeFetchJSON<AlpacaOrderResponse[]>(`${API_BASE}/api/orders`),
+      safeFetchJSON<any[]>(`${API_BASE}/api/bots`),
+      safeFetchJSON<any>(`${API_BASE}/api/performance`)
     ]);
 
     if (account) {
@@ -301,7 +346,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     get().fetchRiskStatus();
 
     try {
-      const ledger = await safeFetchJSON<any[]>('http://localhost:8000/api/ledger');
+      const ledger = await safeFetchJSON<any[]>(`${API_BASE}/api/ledger`);
       if (Array.isArray(ledger) && ledger.length > 0) set({ ledgerTrades: ledger });
     } catch { /* silent fail */ }
 
@@ -320,7 +365,7 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
  * falls back to the offline data already in the Zustand store.
  * Call this once at the app root (src/app/page.tsx).
  */
-const WS_URL = 'ws://localhost:8000/stream';
+const WS_URL = `${WS_BASE}/stream`;
 const WS_MAX_ATTEMPTS = 5;
 const WS_BASE_DELAY_MS = 2000;
 
@@ -339,21 +384,37 @@ export function useTradingEngine() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        attemptsRef.current = 0;  // reset backoff on successful connection
+        attemptsRef.current = 0;
+        useTradingStore.setState({ wsStatus: 'connected' });
       };
+
+      let batchedTicks: Array<{ symbol: string, price: number, volume?: number }> = [];
+      let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data) as SocketTickPayload;
           if (payload.type === 'QUOTE' || payload.type === 'TICK') {
             const { symbol, price, volume } = payload.data;
-            useTradingStore.getState().injectSocketData(symbol, price, volume);
+            batchedTicks.push({ symbol, price, volume });
+
+            if (!batchTimer) {
+              batchTimer = setTimeout(() => {
+                if (batchedTicks.length > 0) {
+                  useTradingStore.getState().injectSocketData(batchedTicks);
+                  batchedTicks = [];
+                }
+                batchTimer = null;
+              }, 100); // Batch updates every 100ms
+            }
           } else if (payload.type === 'SIGNAL') {
             const d = payload.data as any;
             const log = `[SIGNAL] ${d.bot_id?.toUpperCase()} ${d.action} ${d.symbol} qty=${Number(d.qty).toFixed(6)} conf=${d.confidence}`;
             useTradingStore.setState(s => ({
               botLogs: [...s.botLogs, log].slice(-100),
+              lastSignal: d,
             }));
+            toast.info(`Signal: ${d.action} ${d.symbol} @ ${Math.round(d.confidence * 100)}%`, { duration: 4000 });
           }
         } catch (err) {
           console.error('[ORCHESTRATOR] WebSocket message parse error', err);
@@ -369,8 +430,10 @@ export function useTradingEngine() {
         attemptsRef.current += 1;
         if (attemptsRef.current > WS_MAX_ATTEMPTS) {
           console.warn('[ORCHESTRATOR] WebSocket max reconnect attempts reached.');
+          useTradingStore.setState({ wsStatus: 'offline' });
           return;
         }
+        useTradingStore.setState({ wsStatus: 'reconnecting' });
         const delay = WS_BASE_DELAY_MS * Math.pow(2, attemptsRef.current - 1);
         console.warn(`[ORCHESTRATOR] WebSocket closed — reconnecting in ${delay}ms (attempt ${attemptsRef.current}/${WS_MAX_ATTEMPTS})`);
         retryTimer.current = setTimeout(connect, delay);
@@ -380,7 +443,7 @@ export function useTradingEngine() {
     connect();
 
     // SSE Endpoint connections
-    const reflectionsSSE = new EventSource('http://localhost:8000/api/reflections/stream');
+    const reflectionsSSE = new EventSource(`${API_BASE}/api/reflections/stream`);
     reflectionsSSE.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -397,6 +460,7 @@ export function useTradingEngine() {
         // Scanner results update the scannerResults store slice
         if (data.type === 'scanner' && Array.isArray(data.results)) {
           useTradingStore.setState({ scannerResults: data.results });
+          toast.success(`Scanner: ${data.results.length} picks updated`, { duration: 3000 });
         }
 
         // All reflection types go to learningHistory (observe, calculate, decision, learning)
@@ -423,7 +487,7 @@ export function useTradingEngine() {
       } catch (e) {}
     };
 
-    const logsSSE = new EventSource('http://localhost:8000/api/logs/stream');
+    const logsSSE = new EventSource(`${API_BASE}/api/logs/stream`);
     logsSSE.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -460,26 +524,38 @@ export function useTradingEngine() {
     // Poll bots + performance every 60s so strategy attribution + status stays current
     const pollBots = setInterval(() => {
       Promise.all([
-        fetch('http://localhost:8000/api/bots').then(r => r.ok ? r.json() : null),
-        fetch('http://localhost:8000/api/performance').then(r => r.ok ? r.json() : null),
+        fetch(`${API_BASE}/api/bots`).then(r => r.ok ? r.json() : null),
+        fetch(`${API_BASE}/api/performance`).then(r => r.ok ? r.json() : null),
       ]).then(([bots, perf]) => {
         if (Array.isArray(bots) && bots.length > 0) useTradingStore.setState({ bots });
         if (perf) useTradingStore.setState({ performance: perf });
       }).catch(() => {});
     }, 60_000); // 60s
 
+    const mergeWatchlistFromScan = (d: any[]) => {
+      useTradingStore.setState({ scannerResults: d });
+      const currentWl = useTradingStore.getState().watchlist;
+      const existing = new Set(currentWl.map(t => t.symbol));
+      const newEntries = d
+        .filter(r => r?.symbol && !existing.has(r.symbol))
+        .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0 }));
+      if (newEntries.length > 0) {
+        useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
+      }
+    };
+
     // Poll watchlist scanner results every 5 min (matches backend scan cadence)
     const pollWatchlist = setInterval(() => {
-      fetch('http://localhost:8000/api/watchlist')
+      fetch(`${API_BASE}/api/watchlist`)
         .then(r => r.ok ? r.json() : null)
-        .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+        .then(d => { if (Array.isArray(d) && d.length > 0) mergeWatchlistFromScan(d); })
         .catch(() => {});
     }, 300_000); // 5 min
 
     // Initial scanner load
-    fetch('http://localhost:8000/api/watchlist')
+    fetch(`${API_BASE}/api/watchlist`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { if (Array.isArray(d) && d.length > 0) useTradingStore.setState({ scannerResults: d }); })
+      .then(d => { if (Array.isArray(d) && d.length > 0) mergeWatchlistFromScan(d); })
       .catch(() => {});
 
     return () => {

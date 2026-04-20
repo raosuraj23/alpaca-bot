@@ -78,9 +78,21 @@ class RiskAgent:
                 passed=False, reason=reason,
                 kelly_fraction=0.0, recommended_notional=0.0, recommended_qty=0.0,
                 var_check_passed=False, var_limit=0.0,
+            )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+
+        # --- 3. Cumulative MDD gate (8% peak-to-trough across all time) ---
+        if not global_kill_switch.evaluate_cumulative_drawdown(eq):
+            status = global_kill_switch.get_status()
+            reason = status.get("reason") or "Cumulative MDD gate active"
+            logger.warning("[RISK AGENT] Cumulative MDD gate blocked signal from %s — %s",
+                           signal.get("bot"), reason)
+            return RiskCheckResult(
+                passed=False, reason=reason,
+                kelly_fraction=0.0, recommended_notional=0.0, recommended_qty=0.0,
+                var_check_passed=False, var_limit=0.0,
             )
 
-        # --- 3. Position sizing ---
+        # --- 4. Position sizing ---
         sizing: SizingResult = exposure_manager.size(signal, account_equity)
 
         if sizing.recommended_qty <= 0:
@@ -124,16 +136,29 @@ class RiskAgent:
         signal["qty"] = result.recommended_qty
         signal["notional"] = result.recommended_notional
         signal["kelly_fraction"] = result.kelly_fraction
+        # Annotate EV for formula tracking in DB
+        p = float(signal.get("confidence", 0))
+        b = exposure_manager.reward_risk_ratio
+        if 0.0 < p < 1.0 and b > 0:
+            signal["expected_value"] = round(p * b - (1.0 - p), 4)
         return signal
 
     def get_risk_status(self) -> dict:
         """Returns combined kill switch + exposure params for /api/risk/status."""
+        from agents.factory import _gemini_budget
+        from risk.calibration import calibration_tracker
         ks = global_kill_switch.get_status()
         return {
             **ks,
-            "max_position_pct":   exposure_manager.max_position_pct * 100,
-            "max_position_usd":   exposure_manager.max_position_usd,
-            "max_kelly_fraction": exposure_manager.max_kelly_fraction,
+            "max_position_pct":    exposure_manager.max_position_pct * 100,
+            "max_position_usd":    exposure_manager.max_position_usd,
+            "max_kelly_fraction":  exposure_manager.max_kelly_fraction,
+            "gemini_budget":       {
+                "remaining":      _gemini_budget.remaining,
+                "limit":          _gemini_budget.limit,
+                "hard_exhausted": _gemini_budget.hard_exhausted,
+            },
+            "calibration":         calibration_tracker.summary(),
         }
 
 

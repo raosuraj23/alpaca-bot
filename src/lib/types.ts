@@ -184,3 +184,59 @@ export interface BacktestResult {
   /** Equity curve data points [timestamp, equity] */
   equityCurve: [number, number][];
 }
+
+// ---------------------------------------------------------------------------
+// Analytics Types
+// ---------------------------------------------------------------------------
+
+export interface RealizedTrade {
+  id: string;
+  symbol: string;
+  assetClass: AssetClass;
+  strategy: string;
+  side: OrderSide;
+  entryPrice: number;
+  exitPrice: number;
+  qty: number;
+  pnl: number;
+  entryTime: number;
+  exitTime: number;
+  slippage?: number;
+  llmCostUsd?: number;
+}
+
+export interface LLMExecutionRecord {
+  id: string;
+  timestamp: number;
+  strategy: string;
+  latencyMs: number;
+  totalTokens: number;
+  costUsd: number;
+  tradePnl: number | null;
+  assetClass: AssetClass;
+}
+
+export interface PortfolioSnapshot {
+  timestamp: number;
+  equity: number;
+  benchmark?: number;
+}
+
+export type ActionItemType = 'LIQUIDATE' | 'REACTIVATE' | 'HALT' | 'MONITOR' | 'ADJUST';
+export type ActionItemUrgency = 'HIGH' | 'MEDIUM' | 'LOW';
+
+export interface ActionItem {
+  type: ActionItemType;
+  symbol?: string;
+  strategy?: string;
+  title: string;
+  reason: string;
+  urgency: ActionItemUrgency;
+}
+
+export interface ActionItemsResponse {
+  items: ActionItem[];
+  generated_at: number;
+  cached: boolean;
+  error?: string;
+}
