@@ -8,6 +8,7 @@ import type {
   TickerData,
   TradeLog,
   PositionData,
+  WatchlistTA,
   SocketTickPayload,
   AlpacaAccountResponse,
   AlpacaPositionResponse,
@@ -57,7 +58,7 @@ interface TradingStore {
   aiInsights: string | null;
   riskStatus: RiskStatus | null;
   ledgerTrades: any[];
-  scannerResults: any[];
+  scannerResults: WatchlistTA[];
   strategyStates: Record<string, any[]>;
   bots: any[];
   performance: { history: [number, number][]; net_pnl: number; drawdown: number; has_data: boolean; sharpe: number; sortino: number; realized_trades?: { pnl: number }[] };

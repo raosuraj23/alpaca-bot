@@ -66,3 +66,4 @@ backend/alpaca_quant.db
 backend/test_schema.db
 backend/_entry_prices.json
 alpaca_quant.db
+backend/knowledge/failure_log.jsonl

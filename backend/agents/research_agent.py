@@ -309,9 +309,9 @@ class ResearchAgent:
                 HumanMessage(content=user_payload),
             ])
 
-            # Log cost
-            await self._log_usage("gemini-2.5-flash", "research_deep",
-                                  _GEMINI_25_FLASH_IN, _GEMINI_25_FLASH_OUT)
+            # TODO: structured LLM (with_structured_output) returns a Pydantic model,
+            # not a raw AIMessage — usage_metadata is not accessible here.
+            # Token cost logging for research cycles is currently skipped.
 
             return result
 

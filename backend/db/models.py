@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
-from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Numeric, DateTime, Boolean, ForeignKey, JSON, Text
 from db.database import Base
 
 def _utcnow() -> datetime:
@@ -29,6 +29,7 @@ class SignalRecord(Base):
     mispricing_z_score  = Column(Numeric(8, 4), nullable=True)   # (p_model - p_mkt) / rolling_sigma
     xgboost_prob        = Column(Numeric(5, 4), nullable=True)   # XGBoost P(win) at signal time
     signal_features     = Column(JSON, nullable=True)            # TA feature vector used by XGBoost
+    asset_class         = Column(String(10), nullable=True, index=True)  # CRYPTO | EQUITY | OPTIONS
 
 class ExecutionRecord(Base):
     """Tracks physical Alpaca executions correlating to algorithmic signals."""
@@ -45,6 +46,9 @@ class ExecutionRecord(Base):
     status = Column(String(20), default="FILLED")
     failure_reason = Column(String(500), nullable=True)
     timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    asset_class = Column(String(10), nullable=True)  # CRYPTO | EQUITY | OPTIONS
+    bid_price = Column(Numeric(18, 8), nullable=True)   # best bid at submission time
+    ask_price = Column(Numeric(18, 8), nullable=True)   # best ask at submission time
 
 # ---------------------------------------------------------
 # PNL & PORTFOLIO LAYER (NEW - FIXES THE BUG)
@@ -72,6 +76,8 @@ class ClosedTrade(Base):
     entry_kelly        = Column(Numeric(5, 4), nullable=True)   # Kelly fraction at entry
     entry_edge         = Column(Numeric(5, 4), nullable=True)   # market_edge at entry
     brier_contribution = Column(Numeric(8, 6), nullable=True)   # (confidence - outcome)^2
+    asset_class        = Column(String(10), nullable=True)      # CRYPTO | EQUITY | OPTIONS
+    confidence         = Column(Numeric(5, 4), nullable=True)   # signal confidence at entry
 
 class PortfolioSnapshot(Base):
     """Time-series equity curve for fast UI rendering (bypasses Alpaca API limits)."""
@@ -113,6 +119,15 @@ class BotState(Base):
     allocation = Column(Numeric(18, 4), default=Decimal('0.0')) # Swapped to Numeric
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
+class BotParameterControl(Base):
+    """Single source of truth for the active strategy parameters of a bot."""
+    __tablename__ = "bot_parameter_control"
+    
+    bot_id = Column(String(80), primary_key=True, index=True)
+    params_json = Column(Text, nullable=False)
+    updated_by = Column(String(50), default="system")
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
 class LLMUsage(Base):
     """Tracks per-call LLM token consumption and USD cost for cost-vs-PnL analysis."""
     __tablename__ = "llm_usage"
@@ -130,10 +145,11 @@ class BotAmend(Base):
     id = Column(Integer, primary_key=True, index=True)
     model = Column(String(50))
     action = Column(String(50))
-    target_bot = Column(String(50), nullable=True)       
+    target_bot = Column(String(50), nullable=True)
     reason = Column(String(500))
-    impact = Column(String(100))                     
-    params_json = Column(String(500), nullable=True)      
+    impact = Column(String(100))
+    params_json = Column(String(500), nullable=True)
+    status = Column(String(20), default="logged")  # logged | acted | dismissed
     timestamp = Column(DateTime(timezone=True), default=_utcnow)
 
 class ReflectionLog(Base):
@@ -143,7 +159,7 @@ class ReflectionLog(Base):
     strategy = Column(String(50), index=True)
     symbol = Column(String(20))
     action = Column(String(10))
-    insight = Column(String(500))
+    insight = Column(Text)
     tokens_used = Column(Integer, nullable=True)
     # Compound / learning fields
     failure_class      = Column(String(30), nullable=True)      # BAD_PREDICTION | TIMING | EXECUTION | MARKET_SHOCK
@@ -175,6 +191,11 @@ class WatchlistItem(Base):
     verdict = Column(String(200), nullable=True)
     last_scanned = Column(DateTime(timezone=True), default=_utcnow)
     active = Column(Boolean, default=True)
+    asset_class  = Column(String(10), nullable=True)     # CRYPTO | EQUITY
+    rsi          = Column(Numeric(6, 2), nullable=True)  # RSI-14
+    ema_spread   = Column(Numeric(8, 6), nullable=True)  # (ema20 - price) / price
+    volume_ratio = Column(Numeric(8, 4), nullable=True)  # current_vol / 20-bar avg
+    bb_position  = Column(Numeric(5, 4), nullable=True)  # (price - lower) / (upper - lower)
 
 
 class SymbolStrategyAssignment(Base):

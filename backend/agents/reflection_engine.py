@@ -16,10 +16,10 @@ import asyncio
 import json
 import logging
 import pathlib
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Optional
-from config import CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT
+from config import GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ class ReflectionEngine:
         if not states:
             return
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         for symbol, bot_states in states.items():
             for state in bot_states:
@@ -207,7 +207,7 @@ class ReflectionEngine:
         if not positions:
             return
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         states = self._get_states()
 
         for pos in positions:
@@ -339,12 +339,12 @@ class ReflectionEngine:
                     usage = getattr(response, "usage_metadata", None) or {}
                     t_in  = usage.get("input_tokens", 0)
                     t_out = usage.get("output_tokens", 0)
-                    cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
+                    cost  = (t_in * GEMINI_COST_IN + t_out * GEMINI_COST_OUT) / 1_000_000
                     from db.database import _get_session_factory
                     from db.models import LLMUsage
                     async with _get_session_factory()() as _s:
                         _s.add(LLMUsage(
-                            model=CLAUDE_HAIKU_MODEL,
+                            model=GEMINI_3_1_FLASH_LITE_MODEL,
                             tokens_in=t_in,
                             tokens_out=t_out,
                             cost_usd=cost,
@@ -436,11 +436,24 @@ class ReflectionEngine:
         except Exception as e:
             logger.warning("[REFLECTION] Failed to persist BotAmend/ReflectionLog: %s", e)
 
-        # Compound learning: invoke post_mortem agent for losing trades and persist to knowledge base
-        if realized_pnl is not None and realized_pnl < 0 and failure_cls is not None:
-            pm_result = await self._invoke_post_mortem(execution_data, failure_cls)
-            if pm_result and pm_result.get("knowledge_entry"):
-                self._append_knowledge(pm_result, execution_data)
+        # Compound learning: invoke post_mortem agent for ALL closed trades and persist to knowledge base
+        if realized_pnl is not None:
+            effective_cls = failure_cls if failure_cls else "WIN"
+            pm_result = await self._invoke_post_mortem(execution_data, effective_cls)
+            if pm_result:
+                if pm_result.get("knowledge_entry"):
+                    self._append_knowledge(pm_result, execution_data, effective_cls)
+                
+                # Immediate Parameter Adjustment
+                adjustment = pm_result.get("adjustment")
+                if adjustment and isinstance(adjustment, dict):
+                    try:
+                        from strategy.engine import master_engine
+                        logger.info("[REFLECTION] Immediate parameter update for %s: %s", strategy, adjustment)
+                        master_engine.update_strategy_params(strategy, adjustment)
+                        asyncio.create_task(self._persist_bot_parameters(strategy, adjustment, "post_mortem"))
+                    except Exception as e:
+                        logger.warning("[REFLECTION] Failed to apply immediate parameter update: %s", e)
 
         # Push to SSE stream
         self._push({
@@ -461,17 +474,17 @@ class ReflectionEngine:
     # Compound Learning (Post-Mortem → Knowledge Base)
     # ------------------------------------------------------------------
 
-    async def _invoke_post_mortem(self, execution_data: dict, failure_cls: str) -> Optional[dict]:
+    async def _invoke_post_mortem(self, execution_data: dict, outcome_cls: str) -> Optional[dict]:
         """
-        Calls the post_mortem agent persona with losing trade data.
+        Calls the post_mortem agent persona with trade data (win or loss).
         Returns parsed JSON dict (failure_class, root_cause, adjustment, knowledge_entry)
-        or None on any failure. Budget: 200 tokens via fast tier (Haiku).
+        or None on any failure. Budget: 250 tokens via fast tier (Haiku).
         """
         try:
             from agents.factory import swarm_factory
             from langchain_core.messages import HumanMessage
 
-            model = swarm_factory.build_model(model_level="fast", max_tokens=200)
+            model = swarm_factory.build_model(model_level="fast", max_tokens=250)
             if not model:
                 return None
 
@@ -479,10 +492,37 @@ class ReflectionEngine:
             if not system_msg:
                 logger.debug("[REFLECTION] post_mortem persona not found in factory")
                 return None
+            
+            # Extract historical failures for this bot+symbol
+            strategy = execution_data.get("strategy", "unknown")
+            symbol   = execution_data.get("symbol", "?")
+            
+            kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+            recent_failures = []
+            if kb_path.exists():
+                with open(kb_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            item = json.loads(line)
+                            if item.get("strategy") == strategy and item.get("symbol") == symbol:
+                                recent_failures.append({
+                                    "outcome_class": item.get("outcome_class", item.get("failure_class")),
+                                    "knowledge_entry": item.get("knowledge_entry")
+                                })
+                        except json.JSONDecodeError:
+                            pass
+                recent_failures = recent_failures[-3:] # keep last 3
+
+            # Force actionable JSON parameters
+            system_msg.content += (
+                "\n\nCRITICAL INSTRUCTION: You must generate an actionable parameter tweak in the 'adjustment' field. "
+                "Instead of just text, return a specific JSON dictionary representing the parameter change "
+                "e.g. {\"MOMENTUM_THRESHOLD\": 0.0005}. Look at 'historical_failures' to avoid repeating the same mistakes or to double down on winning patterns."
+            )
 
             trade_payload = json.dumps({
-                "strategy":          execution_data.get("strategy", "unknown"),
-                "symbol":            execution_data.get("symbol", "?"),
+                "strategy":          strategy,
+                "symbol":            symbol,
                 "signal_confidence": execution_data.get("confidence", 0),
                 "realized_pnl":      execution_data.get("realized_pnl", 0),
                 "slippage_pct":      abs(execution_data.get("slippage", 0) /
@@ -491,8 +531,8 @@ class ReflectionEngine:
                 "entry_price":       execution_data.get("entry_price", 0),
                 "exit_price":        execution_data.get("fill_price", 0),
                 "hold_duration_min": execution_data.get("hold_duration_min", 0),
-                "news_items":        [],
-                "failure_class":     failure_cls,
+                "trade_outcome_class": outcome_cls,
+                "historical_failures": recent_failures,
             })
 
             response = await model.ainvoke(
@@ -504,12 +544,12 @@ class ReflectionEngine:
                 usage = getattr(response, "usage_metadata", None) or {}
                 t_in  = usage.get("input_tokens", 0)
                 t_out = usage.get("output_tokens", 0)
-                cost  = (t_in * HAIKU_COST_IN + t_out * HAIKU_COST_OUT) / 1_000_000
+                cost  = (t_in * GEMINI_COST_IN + t_out * GEMINI_COST_OUT) / 1_000_000
                 from db.database import _get_session_factory
                 from db.models import LLMUsage
                 async with _get_session_factory()() as _s:
                     _s.add(LLMUsage(
-                        model=CLAUDE_HAIKU_MODEL,
+                        model=GEMINI_3_1_FLASH_LITE_MODEL,
                         tokens_in=t_in, tokens_out=t_out,
                         cost_usd=cost, purpose="post_mortem",
                     ))
@@ -529,7 +569,7 @@ class ReflectionEngine:
             logger.debug("[REFLECTION] Post-mortem invocation failed: %s", exc)
             return None
 
-    def _append_knowledge(self, entry: dict, execution_data: dict) -> None:
+    def _append_knowledge(self, entry: dict, execution_data: dict, outcome_cls: str) -> None:
         """Appends one structured entry to backend/knowledge/failure_log.jsonl."""
         kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
         kb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,7 +577,8 @@ class ReflectionEngine:
             "timestamp":       datetime.utcnow().isoformat() + "Z",
             "strategy":        execution_data.get("strategy", "unknown"),
             "symbol":          execution_data.get("symbol", "?"),
-            "failure_class":   entry.get("failure_class", "UNKNOWN"),
+            "outcome_class":   outcome_cls,
+            "failure_class":   outcome_cls, # retained for backward compatibility
             "knowledge_entry": entry.get("knowledge_entry", ""),
             "adjustment":      entry.get("adjustment", ""),
         }
@@ -547,6 +588,36 @@ class ReflectionEngine:
             logger.info("[REFLECTION] Knowledge appended: %s", record["knowledge_entry"][:80])
         except Exception as exc:
             logger.warning("[REFLECTION] Failed to append knowledge: %s", exc)
+
+    async def _persist_bot_parameters(self, bot_id: str, params: dict, updated_by: str) -> None:
+        """Upsert the active strategy parameters into BotParameterControl."""
+        try:
+            from db.database import _get_session_factory
+            from db.models import BotParameterControl
+            from sqlalchemy import select
+            import json as _json
+            async with _get_session_factory()() as session:
+                row = (await session.execute(
+                    select(BotParameterControl).where(BotParameterControl.bot_id == bot_id)
+                )).scalar_one_or_none()
+                if not row:
+                    row = BotParameterControl(bot_id=bot_id, params_json="{}")
+                    session.add(row)
+                
+                # Merge parameters with existing to retain un-updated keys
+                existing = {}
+                if row.params_json:
+                    try:
+                        existing = _json.loads(row.params_json)
+                    except Exception:
+                        pass
+                existing.update(params)
+                row.params_json = _json.dumps(existing)
+                row.updated_by = updated_by
+                await session.commit()
+                logger.info("[REFLECTION] BotParameterControl updated for %s", bot_id)
+        except Exception as exc:
+            logger.warning("[REFLECTION] BotParameterControl persist failed: %s", exc)
 
     async def _compute_hold_duration(self, bot_id: str, symbol: str) -> int | None:
         """Returns minutes between the last BUY fill and now for this bot+symbol pair."""
@@ -578,7 +649,4 @@ class ReflectionEngine:
 
     def stop(self):
         self._running = False
-"""
-Description: Dedicated reflection engine that generates market observations (60s, no LLM),
-position analysis (120s, no LLM), and post-trade learnings (on fill, Haiku max_tokens=100).
-"""
+

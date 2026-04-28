@@ -63,7 +63,7 @@ function getTypeStyle(type: string | undefined) {
 function formatTimestamp(ts: string | number | undefined): string {
   if (!ts) return 'Live';
   try {
-    return (parseUtc(ts) ?? new Date()).toLocaleTimeString(undefined, { hour12: false });
+    return (parseUtc(ts) ?? new Date()).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
   } catch {
     return String(ts);
   }
@@ -643,7 +643,7 @@ function HistoricalAmends() {
                   </span>
                 </div>
                 <span className="text-xs text-[var(--muted-foreground)] font-mono tabular-nums">
-                  {item.date ? (parseUtc(item.date)?.toLocaleString(undefined, { hour12: false }) ?? 'Live') : 'Live'}
+                  {item.date ? (parseUtc(item.date)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? 'Live') : 'Live'}
                 </span>
               </div>
               <p className="text-xs text-[var(--muted-foreground)] mb-2 mt-2 leading-relaxed">

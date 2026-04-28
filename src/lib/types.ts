@@ -51,6 +51,8 @@ export interface TradeLog {
   /** Slippage from signal price to fill price */
   slippage?: number;
   status?: OrderStatus;
+  /** CRYPTO | EQUITY | OPTIONS */
+  assetClass?: AssetClass;
 }
 
 export interface PositionData {
@@ -65,6 +67,8 @@ export interface PositionData {
   realizedPnl: number;
   /** Position open timestamp (ms since epoch) */
   openedAt?: number;
+  /** CRYPTO | EQUITY | OPTIONS */
+  assetClass?: AssetClass;
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +86,7 @@ export interface StrategyBot {
   /** Strategy algorithm type */
   algo: string;
   /** Asset class this bot trades */
-  assetClass?: 'CRYPTO' | 'EQUITY' | 'OPTIONS';
+  assetClass?: AssetClass;
   /** Total signals emitted */
   signalCount?: number;
   /** Total confirmed fills */
@@ -203,6 +207,23 @@ export interface RealizedTrade {
   exitTime: number;
   slippage?: number;
   llmCostUsd?: number;
+  confidence?: number;
+  win?: boolean;
+}
+
+export interface WatchlistTA {
+  symbol: string;
+  score: number;
+  signal: string;
+  verdict?: string;
+  price?: number;
+  rsi?: number | null;
+  ema_spread?: number | null;
+  vol_surge?: number | null;
+  band_pct?: number | null;
+  asset_class?: AssetClass;
+  timestamp?: string;
+  last_scanned?: string;
 }
 
 export interface LLMExecutionRecord {

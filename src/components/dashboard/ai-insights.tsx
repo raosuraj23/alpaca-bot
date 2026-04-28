@@ -36,7 +36,7 @@ function stripCommandBlocks(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown components for Haiku commentary
+// Markdown components for AI commentary
 // ---------------------------------------------------------------------------
 
 const MD_COMPONENTS = {
@@ -216,7 +216,7 @@ function ActionItemCard({ item }: { item: ActionItem }) {
 }
 
 // ---------------------------------------------------------------------------
-// AiInsights — News Feed + Haiku Commentary + Portfolio Action Items
+// AiInsights — News Feed + AI Commentary + Portfolio Action Items
 // ---------------------------------------------------------------------------
 
 export function AiInsights() {
@@ -351,7 +351,7 @@ export function AiInsights() {
                 : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
             }`}
           >
-            <BrainCircuit className="w-3 h-3" /> Haiku
+            <BrainCircuit className="w-3 h-3" /> AI
           </button>
           <button
             onClick={() => setActiveSection('actions')}
@@ -424,7 +424,7 @@ export function AiInsights() {
             ) : commentary?.text ? (
               <div>
                 <div className="flex items-center gap-2 mb-3">
-                  <Badge variant="purple" className="text-xs">Claude Haiku</Badge>
+                  <Badge variant="purple" className="text-xs">AI Analyst</Badge>
                   {commentary.generated_at > 0 && (
                     <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">
                       {new Date(commentary.generated_at * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}
@@ -439,7 +439,7 @@ export function AiInsights() {
                 </ReactMarkdown>
               </div>
             ) : (
-              <EmptyState icon={<BrainCircuit />} message="Click refresh to generate Haiku market commentary" />
+              <EmptyState icon={<BrainCircuit />} message="Click refresh to generate AI market commentary" />
             )}
           </div>
         )}
@@ -451,11 +451,11 @@ export function AiInsights() {
                 Analyzing portfolio...
               </div>
             ) : actionItems.length === 0 ? (
-              <EmptyState icon={<Zap />} message="No action items — Haiku analyst is watching the portfolio." />
+              <EmptyState icon={<Zap />} message="No action items — AI analyst is watching the portfolio." />
             ) : (
               <div>
                 <div className="flex items-center gap-2 mb-3">
-                  <Badge variant="purple" className="text-xs">Claude Haiku</Badge>
+                  <Badge variant="purple" className="text-xs">AI Analyst</Badge>
                   {actionsTs > 0 && (
                     <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">
                       {new Date(actionsTs * 1000).toLocaleString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}

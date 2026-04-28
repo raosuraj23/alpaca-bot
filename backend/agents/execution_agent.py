@@ -7,14 +7,14 @@ to the SQLite database (SignalRecord + ExecutionRecord).
 """
 
 import logging
-import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Pre-execution guard thresholds (overridable via config.settings if available)
-_SLIPPAGE_ABORT_PCT   = float(os.getenv("SLIPPAGE_ABORT_PCT", "0.02"))   # abort if mid-quote drift > 2%
-_MAX_CONCURRENT_POS   = int(os.getenv("MAX_CONCURRENT_POSITIONS", "15"))  # hard cap on open positions
+# Pre-execution guard thresholds sourced from validated config (pydantic-settings)
+from config import settings as _cfg
+_SLIPPAGE_ABORT_PCT = _cfg.slippage_abort_pct
+_MAX_CONCURRENT_POS = _cfg.max_concurrent_positions
 
 # Lazy imports for DB to avoid circular imports at module load time
 
@@ -124,14 +124,46 @@ class ExecutionAgent:
             except Exception as _pe:
                 logger.debug("[EXECUTION AGENT] Position count check failed: %s", _pe)
 
+        # --- Pre-execution guard: buying power cap ---
+        if action == "BUY" and s_price > 0:
+            try:
+                account = trading_client.get_account()
+                buying_power = float(account.buying_power)
+                max_affordable_qty = buying_power / s_price
+                if max_affordable_qty <= 0:
+                    logger.warning(
+                        "[EXECUTION AGENT] Insufficient buying power ($%.2f) for %s @ $%.2f — aborting",
+                        buying_power, symbol, s_price,
+                    )
+                    self._persist_async(
+                        bot_id=bot_id, symbol=symbol, action=action,
+                        confidence=approved_signal.get("confidence", 0.0),
+                        order_id=None, fill_price=0.0, slippage=0.0,
+                        status="FAILED",
+                        failure_reason=f"insufficient buying power ${buying_power:.2f}",
+                    )
+                    return None
+                if qty > max_affordable_qty:
+                    adjusted_qty = round(max_affordable_qty * 0.95, 6)  # 5% buffer for price movement
+                    logger.warning(
+                        "[EXECUTION AGENT] Capping qty %.6f → %.6f for %s (buying_power=$%.2f @ $%.2f)",
+                        qty, adjusted_qty, symbol, buying_power, s_price,
+                    )
+                    qty = adjusted_qty
+                    approved_signal = {**approved_signal, "qty": qty}
+            except Exception as _bp:
+                logger.debug("[EXECUTION AGENT] Buying power check failed: %s — proceeding", _bp)
+
         # --- Pre-execution guard: slippage check via latest quote ---
+        _bid_at_submit = 0.0
+        _ask_at_submit = 0.0
         if s_price > 0:
             try:
                 quote = trading_client.get_latest_quote(symbol)
-                bid = float(getattr(quote, "bid_price", 0) or 0)
-                ask = float(getattr(quote, "ask_price", 0) or 0)
-                if bid > 0 and ask > 0:
-                    mid = (bid + ask) / 2
+                _bid_at_submit = float(getattr(quote, "bid_price", 0) or 0)
+                _ask_at_submit = float(getattr(quote, "ask_price", 0) or 0)
+                if _bid_at_submit > 0 and _ask_at_submit > 0:
+                    mid = (_bid_at_submit + _ask_at_submit) / 2
                     pre_slip_pct = abs(mid - s_price) / s_price
                     if pre_slip_pct > _SLIPPAGE_ABORT_PCT:
                         logger.warning(
@@ -149,6 +181,11 @@ class ExecutionAgent:
                         return None
             except Exception as _qe:
                 logger.debug("[EXECUTION AGENT] Quote slippage check failed: %s — proceeding", _qe)
+
+        # Options routing: branch before equity SELL guard.
+        _OPTIONS_ACTIONS = {"BUY_CALL", "SELL_CALL", "BUY_PUT", "SELL_PUT"}
+        if action in _OPTIONS_ACTIONS:
+            return self._execute_options_order(approved_signal, s_price, trading_client)
 
         # SELL guard: reject if we hold no position in this symbol.
         # Alpaca symbols may be "BTC/USD" (stream) or "BTCUSD" (position) — normalise both.
@@ -228,6 +265,8 @@ class ExecutionAgent:
                 mispricing_z_score=approved_signal.get("mispricing_z_score"),
                 xgboost_prob=approved_signal.get("xgboost_prob"),
                 signal_features=approved_signal.get("signal_features"),
+                bid_price=_bid_at_submit,
+                ask_price=_ask_at_submit,
             )
 
             market_conditions = self._extract_market_conditions(approved_signal) if action == "SELL" else None
@@ -263,6 +302,187 @@ class ExecutionAgent:
             )
             return None
 
+    # ------------------------------------------------------------------
+    # Options order helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_option_contract(
+        self,
+        trading_client,
+        underlying: str,
+        strike: float,
+        expiry_days: int,
+        option_type: str,  # "call" | "put"
+    ) -> str | None:
+        """Find the nearest-match OCC option contract symbol via Alpaca's options chain."""
+        from datetime import date, timedelta
+        try:
+            from alpaca.trading.requests import GetOptionContractsRequest
+
+            today = date.today()
+            target_date = today + timedelta(days=expiry_days)
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                type=option_type,
+                expiration_date_gte=str(target_date - timedelta(days=7)),
+                expiration_date_lte=str(target_date + timedelta(days=7)),
+                strike_price_gte=str(round(strike * 0.97, 2)),
+                strike_price_lte=str(round(strike * 1.03, 2)),
+            )
+            response = trading_client.get_option_contracts(req)
+            contracts = response.option_contracts or []
+            if not contracts:
+                logger.warning(
+                    "[EXECUTION AGENT] No option contracts found for %s %s strike=%.2f expiry≈%d DTE",
+                    underlying, option_type.upper(), strike, expiry_days,
+                )
+                return None
+            # Pick nearest by strike distance, break ties by closest DTE
+            best = min(
+                contracts,
+                key=lambda c: (
+                    abs(float(c.strike_price) - strike),
+                    abs((date.fromisoformat(str(c.expiration_date)) - target_date).days),
+                ),
+            )
+            logger.info(
+                "[EXECUTION AGENT] Resolved option contract: %s (strike=%.2f exp=%s)",
+                best.symbol, float(best.strike_price), best.expiration_date,
+            )
+            return str(best.symbol)
+        except Exception as e:
+            logger.error("[EXECUTION AGENT] Option contract resolution failed: %s", e)
+            return None
+
+    def _execute_options_order(
+        self,
+        approved_signal: dict,
+        s_price: float,
+        trading_client,
+    ) -> "ExecutionResult | None":
+        """Submit an options order (covered call, protective put, etc.)."""
+        from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest  # noqa: F401
+        from alpaca.trading.enums import OrderSide, OrderType, TimeInForce, PositionIntent
+
+        underlying = approved_signal.get("symbol", "UNKNOWN")
+        action      = approved_signal.get("action", "")
+        bot_id      = approved_signal.get("bot", "unknown")
+        meta        = approved_signal.get("meta") or {}
+        strike      = float(meta.get("strike", s_price))
+        expiry_days = int(meta.get("expiry_days", 30))
+        option_type = "call" if "CALL" in action else "put"
+        is_sell     = action.startswith("SELL_")
+
+        # For covered writes, require an underlying equity position.
+        held_qty = 0.0
+        if is_sell:
+            try:
+                positions = trading_client.get_all_positions()
+                held_qty = sum(
+                    float(p.qty) for p in positions
+                    if p.symbol.replace("/", "") == underlying
+                )
+            except Exception as pe:
+                logger.warning("[EXECUTION AGENT] OPTIONS guard: position check failed (%s) — proceeding", pe)
+
+            if held_qty < 100.0:
+                logger.warning(
+                    "[EXECUTION AGENT] OPTIONS guard: insufficient underlying for covered %s %s "
+                    "(held=%.4f shares, need ≥100 per contract) — aborting",
+                    action, underlying, held_qty,
+                )
+                self._persist_async(
+                    bot_id=bot_id, symbol=underlying, action=action,
+                    confidence=approved_signal.get("confidence", 0.0),
+                    order_id=None, fill_price=0.0, slippage=0.0,
+                    status="FAILED",
+                    failure_reason=f"insufficient underlying for covered write (held={held_qty:.4f} < 100)",
+                )
+                return None
+
+        # 1 contract covers 100 shares; guard above ensures held_qty ≥ 100 for sells.
+        contracts = int(held_qty / 100) if is_sell else 1
+
+        contract_symbol = self._resolve_option_contract(
+            trading_client, underlying, strike, expiry_days, option_type
+        )
+        if not contract_symbol:
+            self._persist_async(
+                bot_id=bot_id, symbol=underlying, action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None, fill_price=0.0, slippage=0.0,
+                status="FAILED", failure_reason="no matching option contract found",
+            )
+            return None
+
+        side             = OrderSide.SELL if is_sell else OrderSide.BUY
+        position_intent  = PositionIntent.SELL_TO_OPEN if is_sell else PositionIntent.BUY_TO_OPEN
+
+        try:
+            order = MarketOrderRequest(
+                symbol=contract_symbol,
+                qty=contracts,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                position_intent=position_intent,
+            )
+            result     = trading_client.submit_order(order_data=order)
+            order_id   = str(result.id)
+            fill_price = float(result.filled_avg_price) if result.filled_avg_price else s_price
+            slippage   = abs(fill_price - s_price)
+            slip_pct   = (slippage / s_price * 100) if s_price > 0 else 0.0
+
+            logger.info(
+                "[EXECUTION AGENT] OPTIONS FILLED %s %s contract=%s qty=%d fill=$%.4f signal=$%.2f slippage=$%.4f",
+                action, underlying, contract_symbol, contracts, fill_price, s_price, slippage,
+            )
+
+            self._persist_async(
+                bot_id=bot_id,
+                symbol=underlying,
+                action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=order_id,
+                fill_price=fill_price,
+                qty=float(contracts),
+                slippage=slippage,
+                status="FILLED",
+                failure_reason=None,
+                expected_value=approved_signal.get("expected_value"),
+                kelly_fraction=approved_signal.get("kelly_fraction"),
+                market_edge=approved_signal.get("market_edge"),
+                market_implied_prob=approved_signal.get("market_implied_prob"),
+                mispricing_z_score=approved_signal.get("mispricing_z_score"),
+                xgboost_prob=approved_signal.get("xgboost_prob"),
+                signal_features=approved_signal.get("signal_features"),
+            )
+
+            return ExecutionResult(
+                order_id=order_id,
+                symbol=underlying,
+                action=action,
+                qty=float(contracts),
+                fill_price=fill_price,
+                signal_price=s_price,
+                slippage=slippage,
+                slippage_pct=round(slip_pct, 6),
+                bot_id=bot_id,
+                timestamp=datetime.utcnow().isoformat(),
+                market_conditions=None,
+                hold_duration_min=None,
+            )
+
+        except Exception as e:
+            failure_reason = str(e)
+            logger.error("[EXECUTION AGENT] OPTIONS submission failed for %s %s: %s", action, underlying, failure_reason)
+            self._persist_async(
+                bot_id=bot_id, symbol=underlying, action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None, fill_price=0.0, slippage=0.0,
+                status="FAILED", failure_reason=failure_reason,
+            )
+            return None
+
     def _persist_async(
         self,
         bot_id: str,
@@ -282,6 +502,8 @@ class ExecutionAgent:
         mispricing_z_score: float | None = None,
         xgboost_prob: float | None = None,
         signal_features: list | None = None,
+        bid_price: float = 0.0,
+        ask_price: float = 0.0,
     ):
         """
         Spawns a background coroutine to write SignalRecord + ExecutionRecord.
@@ -309,6 +531,8 @@ class ExecutionAgent:
                     mispricing_z_score=mispricing_z_score,
                     xgboost_prob=xgboost_prob,
                     signal_features=signal_features,
+                    bid_price=bid_price,
+                    ask_price=ask_price,
                 ))
         except RuntimeError:
             # No running event loop (e.g. in tests) — skip persistence
@@ -333,11 +557,15 @@ class ExecutionAgent:
         mispricing_z_score: float | None = None,
         xgboost_prob: float | None = None,
         signal_features: list | None = None,
+        bid_price: float = 0.0,
+        ask_price: float = 0.0,
     ):
-        """Writes a SignalRecord and linked ExecutionRecord to SQLite."""
+        """Writes SignalRecord, ExecutionRecord, and MarketConditionSnapshot to SQLite."""
         try:
             from db.database import _get_session_factory
-            from db.models import SignalRecord, ExecutionRecord
+            from db.models import SignalRecord, ExecutionRecord, MarketConditionSnapshot
+
+            asset_class = "CRYPTO" if "/" in symbol else "EQUITY"
 
             async with _get_session_factory()() as session:
                 sig = SignalRecord(
@@ -353,6 +581,7 @@ class ExecutionAgent:
                     mispricing_z_score=mispricing_z_score,
                     xgboost_prob=xgboost_prob,
                     signal_features=signal_features,
+                    asset_class=asset_class,
                 )
                 session.add(sig)
                 await session.flush()  # populate sig.id
@@ -365,12 +594,28 @@ class ExecutionAgent:
                     slippage=slippage,
                     status=status,
                     failure_reason=failure_reason,
+                    asset_class=asset_class,
+                    bid_price=bid_price if bid_price > 0 else None,
+                    ask_price=ask_price if ask_price > 0 else None,
                 )
                 session.add(exe)
+                await session.flush()  # populate exe.id
+
+                # Write market condition snapshot whenever we have valid quote data
+                if bid_price > 0 and ask_price > 0:
+                    mcs = MarketConditionSnapshot(
+                        execution_id=exe.id,
+                        symbol=symbol,
+                        bid_price=bid_price,
+                        ask_price=ask_price,
+                        spread=round(ask_price - bid_price, 8),
+                    )
+                    session.add(mcs)
+
                 await session.commit()
                 logger.debug(
-                    "[EXECUTION AGENT] DB write OK — signal_id=%d alpaca=%s status=%s",
-                    sig.id, order_id, status
+                    "[EXECUTION AGENT] DB write OK — signal_id=%d alpaca=%s status=%s asset=%s",
+                    sig.id, order_id, status, asset_class
                 )
 
         except Exception as e:

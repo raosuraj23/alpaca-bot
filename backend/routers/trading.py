@@ -99,19 +99,27 @@ def get_market_history(symbol: str = "BTC/USD"):
         return []
 
     try:
-        from alpaca.data.historical import CryptoHistoricalDataClient
-        from alpaca.data.requests import CryptoBarsRequest
         from alpaca.data.timeframe import TimeFrame
         from datetime import datetime, timedelta
 
-        client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-        req = CryptoBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Hour,
-            start=datetime.utcnow() - timedelta(days=2),
-            end=datetime.utcnow(),
-        )
-        bars = client.get_crypto_bars(req)
+        is_crypto = "/" in symbol
+        start = datetime.utcnow() - timedelta(days=2)
+        end = datetime.utcnow()
+
+        if is_crypto:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+            client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, start=start, end=end)
+            bars = client.get_crypto_bars(req)
+        else:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.enums import DataFeed
+            client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, start=start, end=end, feed=DataFeed.IEX)
+            bars = client.get_stock_bars(req)
+
         if bars.df.empty:
             return []
 
@@ -148,8 +156,9 @@ async def get_ohlcv(symbol: str = "BTC/USD", period: str = "1H"):
         else:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.enums import DataFeed
             client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
+            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end, feed=DataFeed.IEX)
             bars = client.get_stock_bars(req)
 
         if bars.df.empty:
@@ -320,9 +329,9 @@ async def get_market_commentary(force: bool = False):
     if not force and _commentary_cache["text"] and (now - _commentary_cache["generated_at"]) < _COMMENTARY_TTL:
         return {"text": _commentary_cache["text"], "generated_at": _commentary_cache["generated_at"], "cached": True}
 
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-    if not ANTHROPIC_API_KEY:
-        return {"text": None, "error": "ANTHROPIC_API_KEY not set"}
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        return {"text": None, "error": "GEMINI_API_KEY not set"}
 
     try:
         bot_states = master_engine.get_bot_states()
@@ -338,7 +347,8 @@ async def get_market_commentary(force: bool = False):
             pass
         if client:
             try:
-                raw_pos = client.get_all_positions()
+                import asyncio
+                raw_pos = await asyncio.to_thread(client.get_all_positions)
                 pos_list = [f"{p.symbol} {p.side} qty={p.qty} unrealPnL=${p.unrealized_pl}" for p in raw_pos]
             except Exception:
                 pass
@@ -354,15 +364,11 @@ async def get_market_commentary(force: bool = False):
             f"Avoid generic disclaimers. Write for a quantitative trader."
         )
 
-        from anthropic import Anthropic
-        from config import CLAUDE_HAIKU_MODEL
-        client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        msg = client.messages.create(
-            model=CLAUDE_HAIKU_MODEL,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = msg.content[0].text if msg.content else None
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from config import GEMINI_3_1_FLASH_LITE_MODEL
+        model = ChatGoogleGenerativeAI(model=GEMINI_3_1_FLASH_LITE_MODEL, max_output_tokens=512, google_api_key=GEMINI_API_KEY)
+        msg = await model.ainvoke(prompt)
+        text = msg.content
         _commentary_cache["generated_at"] = now
         _commentary_cache["text"] = text
         return {"text": text, "generated_at": now, "cached": False}
@@ -380,9 +386,9 @@ async def get_action_items(force: bool = False):
     if not force and cached_items and (now - _ai_state.get_generated_at()) < _ACTION_ITEMS_TTL:
         return {"items": cached_items, "generated_at": _ai_state.get_generated_at(), "cached": True}
 
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-    if not ANTHROPIC_API_KEY:
-        return {"items": [], "error": "ANTHROPIC_API_KEY not set"}
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    if not GEMINI_API_KEY:
+        return {"items": [], "error": "GEMINI_API_KEY not set"}
 
     try:
         bot_states = master_engine.get_bot_states()
@@ -398,7 +404,8 @@ async def get_action_items(force: bool = False):
             pass
         if client:
             try:
-                raw_pos = client.get_all_positions()
+                import asyncio
+                raw_pos = await asyncio.to_thread(client.get_all_positions)
                 for p in raw_pos:
                     pos_lines.append(
                         f"{p.symbol} {p.side} qty={p.qty} unrealPnL=${p.unrealized_pl} cost=${p.cost_basis}"
@@ -421,68 +428,69 @@ async def get_action_items(force: bool = False):
         )
         user_prompt = f"Active bots:\n{bot_ctx}\n\nOpen positions:\n{pos_ctx}\n\nGenerate portfolio action items now."
 
-        import anthropic as _anthropic
-        from config import CLAUDE_HAIKU_MODEL
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from config import GEMINI_3_1_FLASH_LITE_MODEL
+        from pydantic import BaseModel, field_validator, model_validator
+        from typing import Literal
 
-        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=CLAUDE_HAIKU_MODEL,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-            tools=[{
-                "name": "submit_action_items",
-                "description": "Submit structured portfolio action items",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "items": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "required": ["type", "title", "reason", "urgency"],
-                                "properties": {
-                                    "type": {"type": "string", "enum": ["LIQUIDATE", "REACTIVATE", "HALT", "MONITOR", "ADJUST"]},
-                                    "symbol": {"type": "string"},
-                                    "strategy": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "reason": {"type": "string"},
-                                    "urgency": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
-                                },
-                            },
-                        },
-                    },
-                    "required": ["items"],
-                },
-            }],
-            tool_choice={"type": "tool", "name": "submit_action_items"},
-        )
+        class ActionItem(BaseModel):
+            type: Literal["LIQUIDATE", "REACTIVATE", "HALT", "MONITOR", "ADJUST"]
+            symbol: str | None = None
+            strategy: str | None = None
+            title: str | None = None  # optional — we generate a fallback below
+            reason: str
+            urgency: Literal["HIGH", "MEDIUM", "LOW"]
 
-        raw_items = []
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "submit_action_items":
-                raw_items = block.input.get("items", [])
-                break
+            @model_validator(mode="after")
+            def _ensure_title(self) -> "ActionItem":
+                if not self.title:
+                    target = self.symbol or self.strategy or "Portfolio"
+                    self.title = f"{self.type}: {target}"
+                return self
+            
+        class ActionItemsOutput(BaseModel):
+            items: list[ActionItem]
+            
+        model = ChatGoogleGenerativeAI(model=GEMINI_3_1_FLASH_LITE_MODEL, max_output_tokens=1024, google_api_key=GEMINI_API_KEY, temperature=0.1)
+        structured_model = model.with_structured_output(ActionItemsOutput)
 
-        validated = []
-        for item in raw_items:
-            try:
-                from pydantic import BaseModel
+        response = await structured_model.ainvoke([
+            ("system", system_prompt),
+            ("user", user_prompt)
+        ])
 
-                class _ActionItem(BaseModel):
-                    type: str
-                    symbol: str | None = None
-                    strategy: str | None = None
-                    title: str
-                    reason: str
-                    urgency: str
-
-                validated.append(_ActionItem(**item).dict())
-            except Exception:
-                pass
+        validated = [item.model_dump() for item in response.items]
 
         _ai_state.set_items(validated, now)
         logger.info("[ACTION-ITEMS] Generated %d items", len(validated))
+
+        # Persist action items to BotAmend with status="pending" for director to act on
+        try:
+            import json as _json
+            from db.database import _get_session_factory as _ai_gsf
+            from db.models import BotAmend as _BA
+
+            async with _ai_gsf()() as _aisess:
+                for item in validated:
+                    _aisess.add(_BA(
+                        model="gemini-action-items",
+                        action=f"ACTION_ITEM:{item['type']}",
+                        target_bot=item.get("strategy") or item.get("symbol"),
+                        reason=f"{item['title']}: {item['reason']}"[:500],
+                        impact=f"{item['urgency']} urgency",
+                        params_json=_json.dumps({
+                            "type": item["type"],
+                            "symbol": item.get("symbol"),
+                            "strategy": item.get("strategy"),
+                            "urgency": item["urgency"],
+                        }),
+                        status="pending",
+                    ))
+                await _aisess.commit()
+            logger.info("[ACTION-ITEMS] Persisted %d items to BotAmend (status=pending)", len(validated))
+        except Exception as _persist_err:
+            logger.warning("[ACTION-ITEMS] BotAmend persist failed: %s", _persist_err)
+
         return {"items": validated, "generated_at": now, "cached": False}
     except Exception as e:
         logger.error("[ACTION-ITEMS] %s", e)

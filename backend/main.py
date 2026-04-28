@@ -3,7 +3,9 @@ import json
 import asyncio
 import logging
 import warnings
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+
 
 # langchain-google-genai imports deprecated google.generativeai internally;
 # suppress until the package ships a google.genai-based release.
@@ -23,9 +25,9 @@ app = FastAPI(title="Alpaca Multi-Agent API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 from deps import ALPACA_API_KEY, ALPACA_API_SECRET, PAPER_TRADING, trading_client
@@ -120,7 +122,8 @@ async def _portfolio_snapshot_loop():
             total_equity = cash_balance = unrealized_pnl = realized_pnl_day = 0.0
             if trading_client:
                 try:
-                    acc = trading_client.get_account()
+                    import asyncio
+                    acc = await asyncio.to_thread(trading_client.get_account)
                     total_equity = float(getattr(acc, "equity", None) or 0.0)
                     cash_balance = float(getattr(acc, "cash", None) or 0.0)
                     for attr in ("unrealized_pl", "unrealized_plpc"):
@@ -144,6 +147,19 @@ async def _portfolio_snapshot_loop():
                 await _s.commit()
         except Exception as snap_err:
             logger.debug("[SNAPSHOT] %s", snap_err)
+
+        # Prune snapshots older than 48h to prevent unbounded table growth
+        try:
+            from db.models import PortfolioSnapshot
+            from sqlalchemy import delete as _del
+            from datetime import timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            async with _get_session_factory()() as _ps:
+                await _ps.execute(_del(PortfolioSnapshot).where(PortfolioSnapshot.timestamp < cutoff))
+                await _ps.commit()
+        except Exception as _prune_err:
+            logger.debug("[SNAPSHOT] Prune failed: %s", _prune_err)
+
         await asyncio.sleep(60)
 
 
@@ -175,6 +191,9 @@ async def _write_closed_trade(
     realized_pnl = (exit_price - entry_price) * qty if direction == "LONG" else (entry_price - exit_price) * qty
     win = realized_pnl > 0
 
+    asset_class      = "CRYPTO" if "/" in symbol else "EQUITY"
+    entry_confidence: float | None = None
+
     entry_ev = entry_kelly = entry_edge = brier_contrib = None
     if entry_exec_id is not None:
         try:
@@ -190,6 +209,8 @@ async def _write_closed_trade(
                         entry_edge = float(sig_row.market_edge) if sig_row.market_edge is not None else None
                         conf = float(sig_row.confidence or 0)
                         brier_contrib = round((conf - (1 if win else 0)) ** 2, 6)
+                        entry_confidence = conf
+                        asset_class = sig_row.asset_class or asset_class
         except Exception as _fme:
             logger.debug("[CLOSED TRADE] formula metrics lookup failed: %s", _fme)
 
@@ -202,6 +223,8 @@ async def _write_closed_trade(
                 entry_time=_parse_ts(entry_time), exit_time=_parse_ts(exit_time),
                 entry_ev=entry_ev, entry_kelly=entry_kelly, entry_edge=entry_edge,
                 brier_contribution=brier_contrib,
+                asset_class=asset_class,
+                confidence=entry_confidence,
             ))
             await _s.commit()
     except Exception as e:
@@ -229,7 +252,7 @@ async def startup_event():
     # Restore persisted bot halt/resume states
     try:
         from db.database import _get_session_factory
-        from db.models import BotState, BotAmend
+        from db.models import BotState, BotParameterControl
         from sqlalchemy import select as _select
         import json as _json
         async with _get_session_factory()() as _session:
@@ -238,18 +261,15 @@ async def startup_event():
                 {"bot_id": s.bot_id, "status": s.status, "allocation": float(s.allocation)}
                 for s in _bot_states
             ])
-            _amends = (await _session.execute(
-                _select(BotAmend)
-                .where(BotAmend.action == "UPDATE_STRATEGY_PARAMS")
-                .order_by(BotAmend.timestamp)
-            )).scalars().all()
-            for _amend in _amends:
-                if _amend.target_bot and _amend.params_json:
+            
+            _param_controls = (await _session.execute(_select(BotParameterControl))).scalars().all()
+            for _pc in _param_controls:
+                if _pc.params_json:
                     try:
-                        _params = _json.loads(_amend.params_json)
-                        master_engine.update_strategy_params(_amend.target_bot, _params)
+                        _params = _json.loads(_pc.params_json)
+                        master_engine.update_strategy_params(_pc.bot_id, _params)
                     except Exception as _pe:
-                        logger.debug("[STARTUP] BotAmend re-apply failed for %s: %s", _amend.target_bot, _pe)
+                        logger.debug("[STARTUP] BotParameterControl restore failed for %s: %s", _pc.bot_id, _pe)
             from db.models import SymbolStrategyAssignment as _SSA
             from sqlalchemy import select as _ssa_select
             _assignments = (await _session.execute(
@@ -260,6 +280,16 @@ async def startup_event():
                 logger.info("[STARTUP] Restored %d symbol-strategy assignments", len(_assignments))
     except Exception as _exc:
         logger.warning("[STARTUP] BotState restore failed: %s", _exc)
+
+    # Restore per-strategy LONG position state from persisted entry prices so
+    # strategies can generate SELL signals for positions opened in prior sessions.
+    from core.state import _entry_prices as _ep
+    _restored = 0
+    for (_bot_id, _sym), _ep_price in _ep.items():
+        master_engine.notify_fill(_bot_id, _sym, "BUY", _ep_price)
+        _restored += 1
+    if _restored:
+        logger.info("[STARTUP] Restored LONG position state for %d open entries", _restored)
 
     _get_log_queue()
     _get_reflection_queue()
@@ -391,6 +421,8 @@ async def startup_event():
     _director.set_research_fn(lambda: _research_agent)
     asyncio.create_task(_director.run())
     logger.info("[DIRECTOR] Autonomous Portfolio Director scheduled (15 min interval)")
+
+
 
     # Nightly Consolidation
     from agents.nightly_consolidation import NightlyConsolidation

@@ -29,7 +29,9 @@ interface ClosedTrade {
   qty:         number | null;
   entry_time:  string | null;
   exit_time:   string | null;
-  confidence:  number;
+  confidence:  number | null;
+  asset_class?: import('@/lib/types').AssetClass;
+  win?:        boolean;
   open?:       boolean;
 }
 
@@ -201,12 +203,29 @@ export function TradeLedger() {
       {
         accessorKey: 'timestamp',
         header: 'Timestamp',
-        cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+        cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
       },
       {
         accessorKey: 'symbol',
         header: 'Symbol',
         cell: ({ getValue }) => <span className="font-bold text-[var(--foreground)]">{(getValue() as string) ?? '—'}</span>,
+      },
+      {
+        accessorKey: 'asset_class',
+        header: 'Asset',
+        meta: { align: 'center' },
+        cell: ({ getValue }) => {
+          const ac = (getValue() as string) ?? null;
+          if (!ac) return <span className="text-center block text-[var(--muted-foreground)] opacity-40">—</span>;
+          const color = ac === 'CRYPTO'
+            ? 'border-[var(--neon-green)] text-[var(--neon-green)]'
+            : 'border-[var(--kraken-light)] text-[var(--kraken-light)]';
+          return (
+            <div className="flex justify-center">
+              <span className={`text-xs font-mono border px-1 py-px rounded-sm ${color}`}>{ac}</span>
+            </div>
+          );
+        },
       },
       {
         accessorKey: 'side',
@@ -311,7 +330,7 @@ export function TradeLedger() {
       accessorKey: 'entry_time',
       header: 'Open time',
       meta: { align: 'right' },
-      cell: ({ getValue }) => <span className="text-right block text-[var(--muted-foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+      cell: ({ getValue }) => <span className="text-right block text-[var(--muted-foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
     },
     {
       accessorKey: 'exit_price',
@@ -330,7 +349,7 @@ export function TradeLedger() {
       meta: { align: 'right' },
       cell: ({ row }) => row.original.open
         ? <span className="text-right block text-[var(--neon-green)] opacity-70">live</span>
-        : <span className="text-right block text-[var(--muted-foreground)]">{row.original.exit_time ? (parseUtc(row.original.exit_time)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+        : <span className="text-right block text-[var(--muted-foreground)]">{row.original.exit_time ? (parseUtc(row.original.exit_time)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
     },
     { accessorKey: 'qty', header: 'Qty', meta: { align: 'right' }, cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">{(getValue() as number) != null ? Number(getValue()).toFixed(6) : '—'}</span> },
     {
@@ -396,7 +415,7 @@ export function TradeLedger() {
           <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value as any)} className="md:hidden bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm text-xs font-mono text-[var(--foreground)] px-1.5 py-1 outline-none">
             {(['ALL', 'WIN', 'LOSS'] as const).map(o => <option key={o} value={o}>{o}</option>)}
           </select>
-          {lastRefresh && <span className="hidden lg:block text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">{lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+          {lastRefresh && <span className="hidden lg:block text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">{lastRefresh.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}</span>}
           <button onClick={handleRefresh} disabled={refreshing} className="p-1.5 bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm hover:bg-[var(--background)] transition-colors text-[var(--muted-foreground)] disabled:opacity-40">
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
@@ -429,8 +448,8 @@ export function TradeLedger() {
             {ledgerTable.getHeaderGroups().map(hg => (
               <tr key={hg.id}>
                 {hg.headers.map((header, i) => (
-                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${{ right: 'text-right', center: 'text-center' }[(header.column.columnDef.meta as any)?.align] ?? ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
-                    <span className={`inline-flex items-center gap-1 ${{ right: 'justify-end', center: 'justify-center' }[(header.column.columnDef.meta as any)?.align] ?? ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
+                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${({ right: 'text-right', center: 'text-center' } as Record<string, string>)[(header.column.columnDef.meta as { align?: string })?.align ?? ''] ?? ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
+                    <span className={`inline-flex items-center gap-1 ${({ right: 'justify-end', center: 'justify-center' } as Record<string, string>)[(header.column.columnDef.meta as { align?: string })?.align ?? ''] ?? ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
                   </th>
                 ))}
               </tr>

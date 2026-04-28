@@ -34,8 +34,8 @@ import logging
 import re
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from config import (
-    CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT,
-    GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT,
+    GEMINI_3_FLASH_MODEL, GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_2_5_FLASH_LITE_MODEL,
+    GEMINI_COST_IN, GEMINI_COST_OUT
 )
 
 from agents.factory import swarm_factory
@@ -74,17 +74,12 @@ class OrchestratorEngine:
     def __init__(self):
         # chat tier — Claude Haiku with prompt caching for command parsing (300t)
         self.model = swarm_factory.build_model(model_level="chat")
-        # signal tier — Gemini 2.5 Flash primary voter (50t)
+        # signal tier — Gemini 2.5 Flash Lite primary voter (150t)
         self.signal_model = swarm_factory.build_model(model_level="signal")
-        # second voter — Claude Haiku independent signal approval (100t)
-        self.haiku_voter = swarm_factory.build_model(model_level="chat", max_tokens=100)
+        # second voter — Gemini 3.1 Flash Lite independent signal approval (150t)
+        self.secondary_voter = swarm_factory.build_model(model_level="fast", max_tokens=150)
         raw_prompt = swarm_factory.get_system_prompt("orchestrator-agent")
-        # Cache the system prompt at Anthropic's ephemeral tier — avoids paying
-        # full input token cost (~2k tokens) on every invocation.
-        self.system_prompt = SystemMessage(
-            content=raw_prompt.content,
-            additional_kwargs={"cache_control": {"type": "ephemeral"}},
-        )
+        self.system_prompt = SystemMessage(content=raw_prompt.content)
         self._history: list = []   # rolling in-memory conversation buffer
 
     # ------------------------------------------------------------------
@@ -105,8 +100,8 @@ class OrchestratorEngine:
             response = await self.model.ainvoke(messages)
             reply = response.content
             self._history.append(AIMessage(content=reply))
-            await _log_llm_cost(response, CLAUDE_HAIKU_MODEL,
-                                "orchestrator_chat", HAIKU_COST_IN, HAIKU_COST_OUT)
+            await _log_llm_cost(response, GEMINI_3_1_FLASH_LITE_MODEL,
+                                "orchestrator_chat", GEMINI_COST_IN, GEMINI_COST_OUT)
 
             # Parse and execute any embedded commands; collect results
             commands = self._extract_commands(reply)
@@ -158,7 +153,7 @@ class OrchestratorEngine:
                 "signal_event": dict,   # original signal passed through
             }
         """
-        if not self.signal_model and not self.haiku_voter and not self.model:
+        if not self.signal_model and not self.secondary_voter and not self.model:
             logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s",
                            signal_event.get("asset"))
             return {
@@ -191,24 +186,62 @@ class OrchestratorEngine:
             logger.debug("[ORCHESTRATOR] XGBoost gate skipped: %s", _xgb_exc)
         # --- End XGBoost gate ---
 
+        # Normalise TA fields — strategies store them either at top-level or in meta{}
+        _meta = signal_event.get("meta") or {}
+        if not signal_event.get("ema_50") and _meta.get("ema_short"):
+            signal_event["ema_50"] = _meta["ema_short"]
+        if not signal_event.get("ema_200") and _meta.get("ema_long"):
+            signal_event["ema_200"] = _meta["ema_long"]
+
         asset      = signal_event.get("asset", "UNKNOWN")
         signal_ts  = signal_event.get("timestamp", "")
-        ema50      = signal_event.get("ema_50", 0)
-        ema200     = signal_event.get("ema_200", 0)
-        rsi_val    = signal_event.get("rsi_14", 0)
-        vsr        = signal_event.get("volume_surge_ratio", 0)
+        ema50      = signal_event.get("ema_50") or 0
+        ema200     = signal_event.get("ema_200") or 0
+        rsi_val    = signal_event.get("rsi_14") or 0
+        vsr        = signal_event.get("volume_surge_ratio") or 0
         cond       = signal_event.get("conditions", {})
+
+        def _fmt(v: float) -> str:
+            return f"{v:.2f}" if v else "N/A"
+
+        # Fetch recent lessons for this asset and strategy from the knowledge base
+        recent_lessons = ""
+        try:
+            import pathlib
+            kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+            if kb_path.exists():
+                strategy = signal_event.get('bot', 'unknown')
+                lessons = []
+                with open(kb_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            item = json.loads(line)
+                            if item.get("strategy") == strategy and item.get("symbol") == asset:
+                                entry = item.get("knowledge_entry")
+                                if entry:
+                                    lessons.append(entry)
+                        except json.JSONDecodeError:
+                            pass
+                if lessons:
+                    lessons_text = "\n".join(f"- {l}" for l in lessons[-3:])
+                    recent_lessons = f"\nRecent Lessons (Historical Failures for this setup):\n{lessons_text}\n"
+                    recent_lessons += "CRITICAL: If the current context matches these failure patterns, you MUST REJECT this signal."
+        except Exception as kb_err:
+            logger.debug("[ORCHESTRATOR] KB read failed: %s", kb_err)
 
         supervisor_prompt = (
             f"IMPORTANT: Output ONLY the JSON code block below. "
             f"No markdown headers, no preamble, no analysis text — nothing before or after the block.\n\n"
             f"Asset: {asset}\n"
             f"Signal timestamp: {signal_ts}\n"
+            f"Strategy: {signal_event.get('bot', 'unknown')}\n"
             f"Conditions: golden_cross={cond.get('golden_cross')}, "
             f"rsi_gate={cond.get('rsi_gate')}, volume_surge={cond.get('volume_surge')}\n"
-            f"EMA-50={ema50:.2f}, EMA-200={ema200:.2f}, RSI={rsi_val:.1f}, vol_ratio={vsr:.2f}×\n\n"
+            f"EMA-50={_fmt(ema50)}, EMA-200={_fmt(ema200)}, RSI={_fmt(rsi_val)}, vol_ratio={_fmt(vsr)}×\n"
+            f"Note: N/A indicators are not tracked by this strategy — treat them as neutral.\n\n"
             f"Your role: sentiment/context validation only (the TA math is already confirmed).\n"
-            f"Decision: APPROVED if macro context supports the move, REJECTED if it does not.\n\n"
+            f"Decision: APPROVED if macro context supports the move, REJECTED if it does not.\n"
+            f"{recent_lessons}\n\n"
             f"Respond with ONLY this block — nothing before or after it:\n"
             f"```json\n"
             f"{{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
@@ -269,7 +302,7 @@ class OrchestratorEngine:
                     [self.system_prompt, HumanMessage(content=supervisor_prompt)]
                 )
                 await _log_llm_cost(response, model_name,
-                                    "orchestrator_signal_vote", price_in, price_out)
+                                    "Validation", price_in, price_out)
                 return _parse_voter_reply(response.content)
             except Exception as exc:
                 logger.error("[ORCHESTRATOR] Voter %s failed: %s", model_name, exc)
@@ -277,33 +310,33 @@ class OrchestratorEngine:
 
         try:
             gemini_decision, gemini_rationale = "ERROR", "Gemini unavailable"
-            haiku_decision,  haiku_rationale  = "ERROR", "Haiku unavailable"
+            secondary_decision, secondary_rationale = "ERROR", "Secondary model unavailable"
 
-            # Run both voters concurrently — total latency = max(gemini, haiku), not sum
-            gemini_result, haiku_result = await asyncio.gather(
+            # Run both voters concurrently — total latency = max(gemini, secondary)
+            gemini_result, secondary_result = await asyncio.gather(
                 _call_voter(self.signal_model or self.model,
-                            GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT),
-                _call_voter(self.haiku_voter or self.model,
-                            CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT),
+                            GEMINI_2_5_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
+                _call_voter(self.secondary_voter or self.model,
+                            GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
             )
             gemini_decision, gemini_rationale = gemini_result
-            haiku_decision,  haiku_rationale  = haiku_result
+            secondary_decision, secondary_rationale = secondary_result
 
             # AND logic: both must APPROVE; disagreement → REJECT
-            if gemini_decision == "APPROVED" and haiku_decision == "APPROVED":
+            if gemini_decision == "APPROVED" and secondary_decision == "APPROVED":
                 final_decision  = "APPROVED"
-                final_rationale = f"Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
+                final_rationale = f"Primary: {gemini_rationale} | Secondary: {secondary_rationale}"
             else:
                 final_decision = "REJECTED"
-                if gemini_decision != haiku_decision:
+                if gemini_decision != secondary_decision:
                     final_rationale = (
-                        f"[VOTER DISAGREEMENT] Gemini={gemini_decision} ({gemini_rationale}) | "
-                        f"Haiku={haiku_decision} ({haiku_rationale})"
+                        f"[VOTER DISAGREEMENT] Primary={gemini_decision} ({gemini_rationale}) | "
+                        f"Secondary={secondary_decision} ({secondary_rationale})"
                     )
                     logger.warning("[ORCHESTRATOR] Voter disagreement on %s: %s", asset, final_rationale)
                 else:
                     final_rationale = (
-                        f"Both rejected — Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
+                        f"Both rejected — Primary: {gemini_rationale} | Secondary: {secondary_rationale}"
                     )
 
             logger.info("[ORCHESTRATOR] Signal %s %s → ensemble: %s | %s",

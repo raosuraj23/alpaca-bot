@@ -6,6 +6,12 @@ from core.state import _entry_prices, _entry_times
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
+
+def _infer_asset_class(symbol: str | None, stored: str | None = None) -> str:
+    if stored:
+        return stored
+    return "CRYPTO" if symbol and "/" in symbol else "EQUITY"
+
 @router.get("/ledger")
 async def get_ledger(limit: int = 50):
     """Returns historical execution records joined with their originating signals."""
@@ -26,6 +32,7 @@ async def get_ledger(limit: int = 50):
                     SignalRecord.symbol,
                     SignalRecord.action,
                     SignalRecord.confidence,
+                    SignalRecord.asset_class,
                 )
                 .join(SignalRecord, ExecutionRecord.signal_id == SignalRecord.id, isouter=True)
                 .order_by(desc(ExecutionRecord.timestamp))
@@ -44,6 +51,7 @@ async def get_ledger(limit: int = 50):
                 "slippage": r.slippage,
                 "slippage_bps": round(r.slippage / r.fill_price * 10000, 2) if r.fill_price else None,
                 "confidence": r.confidence,
+                "asset_class": _infer_asset_class(r.symbol, r.asset_class),
                 "timestamp": r.timestamp.isoformat() if r.timestamp else None,
             }
             for r in rows
@@ -134,9 +142,20 @@ async def get_performance(period: str = "1M"):
         if not timestamps:
             return {"history": [], "net_pnl": 0.0, "drawdown": 0.0, "has_data": False}
 
-        curve = [[timestamps[i] * 1000, equities[i]] for i in range(len(timestamps)) if equities[i] is not None]
+        # Use profit_loss (cumulative PnL from period start) for the equity curve so the
+        # chart shows meaningful gain/loss rather than a flat absolute-equity line.
         valid_pnl = [p for p in profit_loss if p is not None]
         net_pnl = valid_pnl[-1] if valid_pnl else 0.0
+
+        # Build curve from profit_loss; fall back to equity if profit_loss is empty
+        if any(p is not None for p in profit_loss):
+            curve = [
+                [timestamps[i] * 1000, profit_loss[i]]
+                for i in range(len(timestamps))
+                if i < len(profit_loss) and profit_loss[i] is not None
+            ]
+        else:
+            curve = [[timestamps[i] * 1000, equities[i]] for i in range(len(timestamps)) if equities[i] is not None]
 
         max_dd = 0.0
         if equities:
@@ -176,75 +195,54 @@ async def get_performance(period: str = "1M"):
                         sortino = round((mean_r / down_std) * ann, 3)
 
         realized_trades = []
+        formula_metrics = {}
+        total_trades = 0
         try:
             from db.database import _get_session_factory as _gsf
             from db.models import ClosedTrade as _CT
-            from sqlalchemy import select as _sel
+            from sqlalchemy import select as _sel, func as _func
 
-            async def _fetch_trades():
-                async with _gsf()() as _s:
-                    _stmt = _sel(_CT).order_by(_CT.exit_time)
-                    return (await _s.execute(_stmt)).scalars().all()
+            async with _gsf()() as _s:
+                _ct_rows = (await _s.execute(_sel(_CT).order_by(_CT.exit_time))).scalars().all()
+                total_trades = (await _s.execute(_sel(_func.count()).select_from(_CT))).scalar() or 0
 
-            _rows = await _fetch_trades()
-            for _r in _rows:
+            for _r in _ct_rows:
                 realized_trades.append({
                     "strategy": _r.bot_id,
                     "symbol": _r.symbol,
                     "pnl": round(float(_r.realized_pnl or 0), 4),
                     "timestamp": _r.exit_time.isoformat() if _r.exit_time else None,
                 })
-        except Exception as _rt_exc:
-            logger.debug("[PERFORMANCE] realized_trades fetch failed: %s", _rt_exc)
 
-        brier_score = None
-        total_trades = 0
-        try:
-            from db.database import _get_session_factory as _gsf
-            from db.models import CalibrationRecord as _CR, ClosedTrade as _CT2
-            from sqlalchemy import select as _sel2
-
-            async def _fetch_calibration():
-                async with _gsf()() as _s:
-                    return (await _s.execute(_sel2(_CR))).scalars().all()
-
-            async def _count_trades():
-                async with _gsf()() as _s:
-                    return len((await _s.execute(_sel2(_CT2))).scalars().all())
-
-            _cal_rows = await _fetch_calibration()
-            if _cal_rows:
-                brier_score = round(
-                    sum(float(r.brier_contribution or 0) for r in _cal_rows) / len(_cal_rows), 4
-                )
-            total_trades = await _count_trades()
-        except Exception as _be:
-            logger.debug("[PERFORMANCE] brier_score/total_trades fetch failed: %s", _be)
-
-        formula_metrics = {}
-        try:
-            from db.database import _get_session_factory as _gsf3
-            from db.models import ClosedTrade as _CT3
-            from sqlalchemy import select as _sel3
-
-            async def _fetch_formula():
-                async with _gsf3()() as _s:
-                    return (await _s.execute(_sel3(_CT3))).scalars().all()
-
-            _frows = await _fetch_formula()
-            if _frows:
+            if _ct_rows:
                 def _avg(vals):
                     filtered = [v for v in vals if v is not None]
                     return round(sum(filtered) / len(filtered), 4) if filtered else None
 
                 formula_metrics = {
-                    "avg_ev": _avg([float(r.entry_ev) for r in _frows if r.entry_ev is not None]),
-                    "avg_kelly": _avg([float(r.entry_kelly) for r in _frows if r.entry_kelly is not None]),
-                    "avg_market_edge": _avg([float(r.entry_edge) for r in _frows if r.entry_edge is not None]),
-                    "avg_brier": _avg([float(r.brier_contribution) for r in _frows if r.brier_contribution is not None]),
+                    "avg_ev": _avg([float(r.entry_ev) for r in _ct_rows if r.entry_ev is not None]),
+                    "avg_kelly": _avg([float(r.entry_kelly) for r in _ct_rows if r.entry_kelly is not None]),
+                    "avg_market_edge": _avg([float(r.entry_edge) for r in _ct_rows if r.entry_edge is not None]),
+                    "avg_brier": _avg([float(r.brier_contribution) for r in _ct_rows if r.brier_contribution is not None]),
                 }
-        except Exception as _fm_exc:
-            logger.debug("[PERFORMANCE] formula_metrics fetch failed: %s", _fm_exc)
+        except Exception as _rt_exc:
+            logger.debug("[PERFORMANCE] ClosedTrade fetch failed: %s", _rt_exc)
+
+        brier_score = None
+        try:
+            from db.database import _get_session_factory as _gsf
+            from db.models import CalibrationRecord as _CR
+            from sqlalchemy import select as _sel2
+
+            async with _gsf()() as _s:
+                _cal_rows = (await _s.execute(_sel2(_CR))).scalars().all()
+
+            if _cal_rows:
+                brier_score = round(
+                    sum(float(r.brier_contribution or 0) for r in _cal_rows) / len(_cal_rows), 4
+                )
+        except Exception as _be:
+            logger.debug("[PERFORMANCE] brier_score fetch failed: %s", _be)
 
         return {
             "history": curve,
@@ -381,6 +379,12 @@ async def get_signals_analytics(period: str = "1D"):
                 pnl_by_bot[r.bot_id] = pnl_by_bot.get(r.bot_id, 0.0) + float(r.total_pnl or 0)
                 avg_loss_pnl[r.bot_id] = float(r.avg_pnl or 0)
 
+        asset_class_by_strat: dict = {
+            r.strategy: r.asset_class
+            for r in sig_rows
+            if r.strategy and r.asset_class
+        }
+
         agent_map: dict = {}
         for r in cal_rows:
             strat = r.strategy or "unknown"
@@ -398,6 +402,7 @@ async def get_signals_analytics(period: str = "1D"):
                     "win_rate": round(v["wins"] / v["total"], 4),
                     "trade_count": v["total"],
                     "total_pnl": round(pnl_by_bot.get(k, 0.0), 2),
+                    "asset_class": asset_class_by_strat.get(k, "EQUITY" if "/" not in k else "CRYPTO"),
                 }
                 for k, v in agent_map.items() if v["total"] >= 1
             ],
@@ -500,9 +505,9 @@ async def get_llm_cost(period: str = "1M"):
                     if i < len(profit_loss) and profit_loss[i] is not None:
                         cum_pnl = profit_loss[i]
                         pnl_series.append([ts_epoch * 1000, round(cum_pnl, 2)])
-                        if alpaca_tf == "1D":
-                            day = datetime.utcfromtimestamp(ts_epoch).strftime("%Y-%m-%d")
-                            daily_pnl[day] = round(profit_loss[i], 2)
+                        # Bucket into calendar day regardless of timeframe (last value wins = end-of-day cumulative)
+                        day = datetime.utcfromtimestamp(ts_epoch).strftime("%Y-%m-%d")
+                        daily_pnl[day] = round(profit_loss[i], 2)
         except Exception as pnl_err:
             logger.debug("[ANALYTICS] portfolio history: %s", pnl_err)
 
@@ -677,21 +682,23 @@ async def get_realized_pnl():
                 "pnl": round(float(row.realized_pnl or 0), 4),
                 "entry_time": row.entry_time.isoformat() if row.entry_time else None,
                 "exit_time": row.exit_time.isoformat() if row.exit_time else None,
-                "confidence": 0.0,
+                "confidence": round(float(row.confidence), 4) if row.confidence is not None else None,
+                "asset_class": _infer_asset_class(row.symbol, row.asset_class),
+                "win": bool(row.win),
             })
+
+        live_positions: dict[str, float] = {}
+        if trading_client and _entry_prices:
+            try:
+                for p in trading_client.get_all_positions():
+                    live_positions[str(p.symbol)] = round(float(p.qty or 0), 6)
+            except Exception:
+                pass
 
         open_positions = []
         for (bot, sym), price in _entry_prices.items():
-            qty = None
             entry_time = _entry_times.get((bot, sym))
-            if trading_client:
-                try:
-                    for p in trading_client.get_all_positions():
-                        if str(p.symbol) == sym:
-                            qty = round(float(p.qty or 0), 6)
-                            break
-                except Exception:
-                    qty = None
+            qty = live_positions.get(sym)
 
             open_positions.append({
                 "strategy": bot,
@@ -704,6 +711,7 @@ async def get_realized_pnl():
                 "entry_time": entry_time,
                 "exit_time": None,
                 "confidence": None,
+                "asset_class": _infer_asset_class(sym),
                 "open": True,
             })
 
@@ -751,3 +759,96 @@ async def get_realized_pnl():
     except Exception as e:
         logger.error("[REALIZED PNL] %s", e)
         return {"trades": [], "open_positions": [], "total_closed": 0, "error": str(e)}
+
+
+@router.get("/analytics/watchlist-ta")
+async def get_watchlist_ta():
+    """Returns all WatchlistItem rows with TA metrics for analytics display."""
+    try:
+        from db.database import _get_session_factory
+        from db.models import WatchlistItem
+        from sqlalchemy import select
+
+        async with _get_session_factory()() as session:
+            rows = (await session.execute(
+                select(WatchlistItem).where(WatchlistItem.active == True).order_by(WatchlistItem.score.desc())
+            )).scalars().all()
+
+        return [
+            {
+                "symbol": r.symbol,
+                "score": float(r.score) if r.score is not None else 0.0,
+                "signal": r.signal,
+                "verdict": r.verdict,
+                "asset_class": _infer_asset_class(r.symbol, r.asset_class),
+                "rsi": float(r.rsi) if r.rsi is not None else None,
+                "ema_spread": float(r.ema_spread) if r.ema_spread is not None else None,
+                "vol_surge": float(r.volume_ratio) if r.volume_ratio is not None else None,
+                "band_pct": float(r.bb_position) if r.bb_position is not None else None,
+                "last_scanned": r.last_scanned.isoformat() if r.last_scanned else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error("[WATCHLIST-TA] %s", e)
+        return []
+
+
+@router.get("/analytics/signals-by-asset-class")
+async def get_signals_by_asset_class(period: str = "1D"):
+    """Returns signal and trade stats broken down by CRYPTO vs EQUITY."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta
+    from db.database import _get_session_factory
+    from db.models import SignalRecord, ClosedTrade
+    from sqlalchemy import select as _sel, func as _func
+
+    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180, "ALL": 36500}
+    days = period_days.get(period.upper(), 1)
+    cutoff = _dt.now(_tz.utc) - timedelta(days=days)
+
+    try:
+        async with _get_session_factory()() as session:
+            sig_rows = (await session.execute(
+                _sel(
+                    SignalRecord.asset_class,
+                    _func.count(SignalRecord.id).label("signal_count"),
+                    _func.avg(SignalRecord.confidence).label("avg_confidence"),
+                    _func.avg(SignalRecord.market_edge).label("avg_edge"),
+                    _func.avg(SignalRecord.xgboost_prob).label("avg_xgboost"),
+                )
+                .where(SignalRecord.timestamp >= cutoff)
+                .group_by(SignalRecord.asset_class)
+            )).all()
+
+            trade_rows = (await session.execute(
+                _sel(
+                    ClosedTrade.asset_class,
+                    _func.count(ClosedTrade.id).label("trade_count"),
+                    _func.sum(ClosedTrade.net_pnl).label("total_pnl"),
+                    _func.avg(ClosedTrade.net_pnl).label("avg_pnl"),
+                )
+                .where(ClosedTrade.exit_time >= cutoff)
+                .group_by(ClosedTrade.asset_class)
+            )).all()
+
+        trade_map = {(r.asset_class or "UNKNOWN"): r for r in trade_rows}
+
+        result = []
+        for r in sig_rows:
+            ac = r.asset_class or "UNKNOWN"
+            tr = trade_map.get(ac)
+            result.append({
+                "asset_class": ac,
+                "signal_count": int(r.signal_count or 0),
+                "avg_confidence": round(float(r.avg_confidence or 0), 4),
+                "avg_edge": round(float(r.avg_edge or 0), 4) if r.avg_edge is not None else None,
+                "avg_xgboost_prob": round(float(r.avg_xgboost or 0), 4) if r.avg_xgboost is not None else None,
+                "trade_count": int(tr.trade_count) if tr else 0,
+                "total_pnl": round(float(tr.total_pnl or 0), 2) if tr else 0.0,
+                "avg_pnl": round(float(tr.avg_pnl or 0), 2) if tr else 0.0,
+            })
+
+        return {"has_data": bool(result), "by_asset_class": result}
+    except Exception as e:
+        logger.error("[SIGNALS-BY-ASSET-CLASS] %s", e)
+        return {"has_data": False, "by_asset_class": []}

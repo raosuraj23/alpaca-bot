@@ -66,7 +66,7 @@ export function ExecutionLog() {
           const ts = getValue() as string | null;
           return (
             <span className="text-[var(--muted-foreground)]">
-              {ts ? new Date(ts).toLocaleTimeString(undefined, { hour12: false }) : '—'}
+              {ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : '—'}
             </span>
           );
         },

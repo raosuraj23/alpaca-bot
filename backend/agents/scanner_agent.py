@@ -9,9 +9,9 @@ Two-tier autonomous loop:
     Newly discovered symbols are persisted to WatchlistItem and injected into
     the active scan list.
 
-  TIER 2 — TA Screener (every 5 min, Haiku)
+  TIER 2 — TA Screener (every 5 min, AI)
     Scores active symbols with deterministic TA (EMA, RSI, Volume, Bollinger).
-    Haiku writes one-line verdicts per symbol.
+    AI writes one-line verdicts per symbol.
     Results pushed to SSE stream and persisted to WatchlistItem.
 
 Portfolio integration:
@@ -189,7 +189,7 @@ class ScannerAgent:
     Tier 1 (30 min): Sonnet evaluates the UNIVERSE_SYMBOLS universe,
     scores TA signals, and selects the top MAX_ACTIVE_SYMBOLS for active monitoring.
 
-    Tier 2 (5 min): Haiku scores active symbols and writes verdicts.
+    Tier 2 (5 min): AI scores active symbols and writes verdicts.
     Results pushed to SSE + persisted to DB.
     """
 
@@ -520,7 +520,7 @@ class ScannerAgent:
             return
 
         scored.sort(key=lambda x: abs(x["score"]), reverse=True)
-        haiku_verdicts = await self._haiku_rank(scored)
+        ai_verdicts = await self._ai_rank(scored)
 
         now = _utcnow()
         self._last_scan = now
@@ -533,7 +533,7 @@ class ScannerAgent:
                 "rsi":           s.get("rsi"),
                 "vol_surge":     s.get("vol_surge"),
                 "summary":       s["summary"],
-                "verdict":       haiku_verdicts.get(s["symbol"], s["summary"]),
+                "verdict":       ai_verdicts.get(s["symbol"], s["summary"]),
                 "anomaly_flags": s.get("anomaly_flags", []),
                 "timestamp":     now.isoformat(),
             }
@@ -630,6 +630,7 @@ class ScannerAgent:
                 for flag in anomaly_flags:
                     logger.warning("[SCANNER] ANOMALY %s: %s", flag.flag_type, flag.description)
 
+            ema_spread = round((ema20 - price) / price, 6) if price > 0 else 0.0
             return {
                 "symbol":        symbol,
                 "score":         score,
@@ -639,6 +640,7 @@ class ScannerAgent:
                 "rsi":           round(rsi, 1) if rsi is not None else None,
                 "vol_surge":     round(vol_surge, 2),
                 "band_pct":      round(band_pct, 3),
+                "ema_spread":    ema_spread,
                 "anomaly_flags": [{"type": f.flag_type, "description": f.description} for f in anomaly_flags],
             }
 
@@ -658,11 +660,11 @@ class ScannerAgent:
         return 100 - (100 / (1 + avg_gain / avg_loss))
 
     # ------------------------------------------------------------------
-    # LLM verdict (Haiku — fast tier)
+    # LLM verdict (AI — fast tier)
     # ------------------------------------------------------------------
 
-    async def _haiku_rank(self, scored: list[dict]) -> dict[str, str]:
-        """Haiku produces a one-line verdict per symbol. Falls back to TA summary."""
+    async def _ai_rank(self, scored: list[dict]) -> dict[str, str]:
+        """AI produces a one-line verdict per symbol. Falls back to TA summary."""
         verdicts: dict[str, str] = {}
         try:
             from agents.factory import swarm_factory
@@ -675,7 +677,7 @@ class ScannerAgent:
                 f"- {s['symbol']}: score={s['score']:+.2f}, signal={s['signal']}, {s['summary']}"
                 for s in scored
             )
-            response = model.invoke(
+            response = await model.ainvoke(
                 [
                     SystemMessage(content=(
                         "You are a crypto quant screener. For each symbol, write ONE phrase "
@@ -718,7 +720,7 @@ class ScannerAgent:
                 logger.debug("[SCANNER] LLM usage log failed: %s", _le)
 
         except Exception as e:
-            logger.debug("[SCANNER] Haiku unavailable: %s", e)
+            logger.debug("[SCANNER] AI unavailable: %s", e)
 
         for s in scored:
             if s["symbol"] not in verdicts:
@@ -731,7 +733,7 @@ class ScannerAgent:
     # ------------------------------------------------------------------
 
     async def _persist(self, results: list[dict]):
-        """Upserts WatchlistItem rows in SQLite."""
+        """Upserts WatchlistItem rows in SQLite including TA metrics."""
         try:
             from db.database import _get_session_factory
             from db.models import WatchlistItem
@@ -739,22 +741,34 @@ class ScannerAgent:
 
             async with _get_session_factory()() as session:
                 for r in results:
+                    sym = r["symbol"]
+                    ac = "CRYPTO" if "/" in sym else "EQUITY"
                     row = (await session.execute(
-                        select(WatchlistItem).where(WatchlistItem.symbol == r["symbol"])
+                        select(WatchlistItem).where(WatchlistItem.symbol == sym)
                     )).scalar_one_or_none()
                     if row:
                         row.score        = r["score"]
                         row.signal       = r["signal"]
                         row.verdict      = r["verdict"]
                         row.last_scanned = _utcnow()
+                        row.asset_class  = ac
+                        row.rsi          = r.get("rsi")
+                        row.ema_spread   = r.get("ema_spread")
+                        row.volume_ratio = r.get("vol_surge")
+                        row.bb_position  = r.get("band_pct")
                     else:
                         session.add(WatchlistItem(
-                            symbol=r["symbol"],
+                            symbol=sym,
                             score=r["score"],
                             signal=r["signal"],
                             verdict=r["verdict"],
                             last_scanned=_utcnow(),
                             active=True,
+                            asset_class=ac,
+                            rsi=r.get("rsi"),
+                            ema_spread=r.get("ema_spread"),
+                            volume_ratio=r.get("vol_surge"),
+                            bb_position=r.get("band_pct"),
                         ))
                 await session.commit()
         except Exception as e:

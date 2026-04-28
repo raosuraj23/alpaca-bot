@@ -33,12 +33,12 @@ import asyncio
 import json
 import logging
 import pathlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Callable, Optional
 
-from pydantic import BaseModel, Field
-from config import CLAUDE_HAIKU_MODEL
+from pydantic import BaseModel, Field, field_validator
+from config import GEMINI_3_1_FLASH_LITE_MODEL
 from state import action_items as _ai_state
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,12 @@ For each pending symbol, emit one of:
 ═══════════════════════════════════════════════════════════════
 PORTFOLIO OPTIMIZATION RULES (run after pending assignments):
 ═══════════════════════════════════════════════════════════════
+- CRITICAL: target_bot MUST be set to an exact bot id from the 'bots' context for HALT_BOT,
+  RESUME_BOT, ADJUST_ALLOCATION, and UPDATE_STRATEGY_PARAMS. If you cannot name a specific bot
+  from the list, emit NO_ACTION instead — never emit a command with a missing target_bot.
 - Only HALT bots with clear negative evidence (fill_rate < 0.1 AND yield24h < -0.5)
+- A $0.00 24h yield alone is NOT sufficient to halt — no trades may simply mean no signal fired.
+  Check fill_rate and trade_history before halting.
 - Bots with win_rate < 0.35 AND total >= 10 trades are strong candidates for HALT or ADJUST_ALLOCATION down
 - Bots with win_rate > 0.60 AND total >= 5 trades may warrant ADJUST_ALLOCATION increase
 - ADJUST_ALLOCATION requires new_allocation_pct (a float 5.0–40.0). NEVER emit ADJUST_ALLOCATION without it.
@@ -92,6 +97,17 @@ PORTFOLIO OPTIMIZATION RULES (run after pending assignments):
 - kb_lessons contains recent post-mortem findings with concrete adjustment suggestions.
   Use these to inform UPDATE_STRATEGY_PARAMS commands — translate natural-language suggestions
   into registry-valid parameter changes (e.g. "raise confidence threshold" → higher MOMENTUM_THRESHOLD).
+
+═══════════════════════════════════════════════════════════════
+POSITION COUNT MANAGEMENT (LIQUIDATE_POSITION):
+═══════════════════════════════════════════════════════════════
+The context includes position_count (current open positions) and position_limit (max allowed).
+When position_count >= position_limit AND a new high-priority signal is pending:
+  - Emit LIQUIDATE_POSITION for the weakest position to free a slot.
+  - Use params.symbol to specify the position to close and params.reason for the rationale.
+  - "Weakest" = most negative unrealized PnL, or a position that no bot is actively managing.
+  - NEVER liquidate a position without a specific symbol in params.symbol.
+  - Only liquidate if there is a clear reason (freeing cap for a better opportunity).
 
 ═══════════════════════════════════════════════════════════════
 STRATEGY PARAMETER REGISTRY — exact attribute names:
@@ -138,6 +154,7 @@ class CommandAction(str, Enum):
     ASSIGN_EXISTING_STRATEGY    = "ASSIGN_EXISTING_STRATEGY"
     CREATE_NEW_STRATEGY_INSTANCE = "CREATE_NEW_STRATEGY_INSTANCE"
     UNASSIGN_STRATEGY           = "UNASSIGN_STRATEGY"
+    LIQUIDATE_POSITION          = "LIQUIDATE_POSITION"
     NO_ACTION                   = "NO_ACTION"
 
 
@@ -151,6 +168,36 @@ class CommandParams(BaseModel):
     # Symbol assignment fields
     symbol:          Optional[str]   = Field(None, description="Symbol to assign/unassign strategy to")
     algorithm_type:  Optional[str]   = Field(None, description="Algorithm template type for CREATE_NEW_STRATEGY_INSTANCE")
+
+    @field_validator("strategy_params", mode="before")
+    @classmethod
+    def _coerce_strategy_params(cls, v):
+        """Coerce LLM string outputs like 'KEY=val' or '{...}' into a proper dict."""
+        if v is None or isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            v = v.strip()
+            # Try JSON first
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            # Try key=value pairs (e.g. "MOMENTUM_THRESHOLD=0.85, COOLDOWN_TICKS=10")
+            result = {}
+            for part in v.split(","):
+                part = part.strip()
+                if "=" in part:
+                    k, _, val = part.partition("=")
+                    k = k.strip()
+                    val = val.strip()
+                    try:
+                        result[k] = float(val) if "." in val else int(val)
+                    except ValueError:
+                        result[k] = val
+            return result if result else None
+        return v
 
 
 class DirectorCommand(BaseModel):
@@ -184,6 +231,7 @@ class CommandDispatcher:
             CommandAction.ASSIGN_EXISTING_STRATEGY:     self._handle_assign_existing_strategy,
             CommandAction.CREATE_NEW_STRATEGY_INSTANCE: self._handle_create_new_strategy_instance,
             CommandAction.UNASSIGN_STRATEGY:            self._handle_unassign_strategy,
+            CommandAction.LIQUIDATE_POSITION:           self._handle_liquidate_position,
         }
 
     async def dispatch(
@@ -249,7 +297,10 @@ class CommandDispatcher:
                 "[DIRECTOR] ADJUST_ALLOCATION clamped %.2f%% → %.2f%% for bot=%s",
                 raw_pct, clamped_pct, cmd.target_bot,
             )
-        return engine.adjust_allocation(cmd.target_bot, clamped_pct)
+        success = engine.adjust_allocation(cmd.target_bot, clamped_pct)
+        if success:
+            asyncio.create_task(persist_fn(cmd.target_bot, "ACTIVE", engine))
+        return success
 
     async def _handle_update_strategy_params(
         self, cmd: DirectorCommand, engine, persist_fn: Callable
@@ -262,11 +313,11 @@ class CommandDispatcher:
             return False
 
         # Zero-trust guardrail: intersect with actual strategy attributes
+        # Bot objects ARE the strategy instances — there is no separate .strategy attr
         bot = engine.bots.get(cmd.target_bot)
-        if bot and hasattr(bot, "strategy"):
-            valid_keys = set(vars(bot.strategy).keys())
-            sanitised  = {k: v for k, v in raw_params.items() if k in valid_keys}
-            discarded  = set(raw_params.keys()) - valid_keys
+        if bot:
+            sanitised  = {k: v for k, v in raw_params.items() if hasattr(bot, k) and not callable(getattr(bot, k))}
+            discarded  = set(raw_params.keys()) - set(sanitised.keys())
             if discarded:
                 logger.warning(
                     "[DIRECTOR] UPDATE_STRATEGY_PARAMS discarded unknown keys %s for bot=%s",
@@ -279,7 +330,10 @@ class CommandDispatcher:
                 "[DIRECTOR] UPDATE_STRATEGY_PARAMS all keys invalid for bot=%s", cmd.target_bot
             )
             return False
-        return engine.update_strategy_params(cmd.target_bot, raw_params)
+        success = engine.update_strategy_params(cmd.target_bot, raw_params)
+        if success:
+            asyncio.create_task(self._persist_bot_parameters(cmd.target_bot, raw_params, "director"))
+        return success
 
     async def _handle_spawn_bot_variant(
         self, cmd: DirectorCommand, engine, persist_fn: Callable
@@ -349,6 +403,50 @@ class CommandDispatcher:
             asyncio.create_task(self._deactivate_symbol_assignment(symbol, bot_id))
         return success
 
+    async def _handle_liquidate_position(
+        self, cmd: DirectorCommand, engine, persist_fn: Callable
+    ) -> bool:
+        symbol = cmd.params.symbol
+        if not symbol:
+            logger.warning("[DIRECTOR] LIQUIDATE_POSITION missing params.symbol")
+            return False
+        try:
+            from agents.execution_agent import execution_agent, _get_trading_client
+
+            trading_client = _get_trading_client()
+            if not trading_client:
+                logger.warning("[DIRECTOR] LIQUIDATE_POSITION: trading client unavailable")
+                return False
+            norm = symbol.replace("/", "")
+            positions = trading_client.get_all_positions()
+            held_qty = sum(
+                float(p.qty) for p in positions
+                if p.symbol.upper() == norm.upper() or p.symbol.upper() == symbol.upper()
+            )
+            if held_qty <= 0:
+                logger.warning("[DIRECTOR] LIQUIDATE_POSITION: no position found for %s", symbol)
+                return False
+
+            signal = {
+                "action": "SELL",
+                "symbol": symbol,
+                "qty": held_qty,
+                "bot": cmd.target_bot or "director",
+                "strategy": "director-liquidation",
+                "confidence": 1.0,
+                "meta": {"reason": cmd.params.reason},
+            }
+            result = await execution_agent.execute(signal)
+            success = result is not None and getattr(result, "status", None) not in ("FAILED", None)
+            logger.info(
+                "[DIRECTOR] LIQUIDATE_POSITION %s qty=%.4f success=%s",
+                symbol, held_qty, success,
+            )
+            return success
+        except Exception as exc:
+            logger.error("[DIRECTOR] LIQUIDATE_POSITION failed for %s: %s", symbol, exc)
+            return False
+
     async def _persist_symbol_assignment(
         self, symbol: str, bot_id: str, algo_type: str, engine, cmd: "DirectorCommand"
     ) -> None:
@@ -402,6 +500,35 @@ class CommandDispatcher:
         except Exception as exc:
             logger.warning("[DIRECTOR] Deactivate assignment failed: %s", exc)
 
+    async def _persist_bot_parameters(self, bot_id: str, params: dict, updated_by: str) -> None:
+        """Upsert the active strategy parameters into BotParameterControl."""
+        try:
+            from db.models import BotParameterControl
+            from sqlalchemy import select
+            import json as _json
+            async with self._db_factory()() as session:
+                row = (await session.execute(
+                    select(BotParameterControl).where(BotParameterControl.bot_id == bot_id)
+                )).scalar_one_or_none()
+                if not row:
+                    row = BotParameterControl(bot_id=bot_id, params_json="{}")
+                    session.add(row)
+                
+                # Merge parameters with existing to retain un-updated keys
+                existing = {}
+                if row.params_json:
+                    try:
+                        existing = _json.loads(row.params_json)
+                    except Exception:
+                        pass
+                existing.update(params)
+                row.params_json = _json.dumps(existing)
+                row.updated_by = updated_by
+                await session.commit()
+                logger.info("[DIRECTOR] BotParameterControl updated for %s", bot_id)
+        except Exception as exc:
+            logger.warning("[DIRECTOR] BotParameterControl persist failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Autonomous Portfolio Director
@@ -443,13 +570,14 @@ class AutonomousPortfolioDirector:
 
     def _load_kb_context(self, n: int = 10) -> list[dict]:
         """Read the last n entries from failure_log.jsonl for injection into Director context."""
+        from collections import deque
         kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
         if not kb_path.exists():
             return []
         try:
-            lines = kb_path.read_text(encoding="utf-8").strip().splitlines()
+            tail = deque(kb_path.open(encoding="utf-8"), maxlen=n)
             entries = []
-            for line in lines[-n:]:
+            for line in tail:
                 try:
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
@@ -499,22 +627,13 @@ class AutonomousPortfolioDirector:
 
         raw_trades = await self._get_trade_history()
 
-        # Compute per-bot win rate for the LLM (token-efficient summary)
-        # Only include bot IDs that currently exist in the engine — stale variant IDs
-        # from DB history would cause the LLM to hallucinate commands on non-existent bots.
+        # Compute per-bot stats using the 48h lookback window
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        bot_win_rates = await self._compute_strategy_stats(cutoff)
+        
+        # Filter to only live bots
         live_bot_ids = set(engine.bots.keys())
-        bot_win_rates: dict[str, dict] = {}
-        for t in raw_trades:
-            bid = t["bot_id"] or "unknown"
-            if bid not in live_bot_ids:
-                continue  # skip trades from bots no longer in the engine
-            if bid not in bot_win_rates:
-                bot_win_rates[bid] = {"wins": 0, "total": 0, "net_pnl": 0.0}
-            bot_win_rates[bid]["total"]   += 1
-            bot_win_rates[bid]["wins"]    += 1 if t["win"] else 0
-            bot_win_rates[bid]["net_pnl"] += t["net_pnl"]
-        for v in bot_win_rates.values():
-            v["win_rate"] = round(v["wins"] / v["total"], 3) if v["total"] else 0.0
+        bot_win_rates = {k: v for k, v in bot_win_rates.items() if k in live_bot_ids}
 
         # Gather per-symbol TA snapshots for pending symbols
         pending = engine.get_pending_assignment()
@@ -527,18 +646,29 @@ class AutonomousPortfolioDirector:
         if self._get_research:
             try:
                 research_agent = self._get_research()
-                if research_agent and hasattr(research_agent, "_last_brief") and research_agent._last_brief:
-                    brief = research_agent._last_brief
-                    for s in getattr(brief, "sentiment_by_symbol", []):
-                        research_edges[s.symbol] = {
-                            "sentiment":  s.sentiment,
-                            "edge":       round(getattr(s, "edge", 0.0), 4),
-                            "confidence": round(getattr(s, "confidence", 0.5), 3),
-                        }
+                if research_agent:
+                    brief = research_agent.get_latest_brief()  # TTL-aware (35 min)
+                    if brief:
+                        for s in getattr(brief, "sentiment_by_symbol", []):
+                            research_edges[s.symbol] = {
+                                "sentiment":  s.sentiment,
+                                "edge":       round(getattr(s, "edge", 0.0), 4),
+                                "confidence": round(getattr(s, "confidence", 0.5), 3),
+                            }
             except Exception as _re:
                 logger.debug("[DIRECTOR] Research brief unavailable: %s", _re)
 
         haiku_items = _ai_state.get_items()
+
+        # Fetch live position count for LIQUIDATE_POSITION decisions
+        position_count = 0
+        position_limit = int(__import__("os").getenv("MAX_CONCURRENT_POSITIONS", "15"))
+        try:
+            from deps import trading_client as _tc
+            if _tc:
+                position_count = len(_tc.get_all_positions())
+        except Exception:
+            pass
 
         context = {
             "bots":               engine.get_bot_states(),
@@ -553,6 +683,8 @@ class AutonomousPortfolioDirector:
             "research_edges":     research_edges,
             "kb_lessons":         self._load_kb_context(10),
             "haiku_recommendations": haiku_items,
+            "position_count":     position_count,
+            "position_limit":     position_limit,
             "ts":                 datetime.now(timezone.utc).isoformat(),
         }
 
@@ -561,13 +693,72 @@ class AutonomousPortfolioDirector:
             logger.info("[DIRECTOR] No actions recommended this cycle")
             return
 
-        # MAX_CMDS enforced here before entering dispatcher loop
+        # Pre-dispatch validation: silently drop malformed commands rather than
+        # wasting a BotAmend row on them.
+        valid_commands = []
         for cmd in commands[:MAX_CMDS]:
             if cmd.action == CommandAction.NO_ACTION:
                 continue
+            rejection = self._validate_command(cmd, engine)
+            if rejection:
+                logger.warning("[DIRECTOR] Command dropped — %s", rejection)
+            else:
+                valid_commands.append(cmd)
+
+        for cmd in valid_commands:
             success = await self._dispatcher.dispatch(cmd, engine, self._persist_bot_state)
             await self._log_amend(cmd, success)
             self._push_sse(cmd, success)
+
+    async def _compute_strategy_stats(self, cutoff: datetime) -> dict[str, dict]:
+        """Return per-strategy aggregates from CalibrationRecord + ReflectionLog."""
+        from db.models import CalibrationRecord, ReflectionLog
+        from sqlalchemy import select
+
+        stats: dict[str, dict] = {}
+
+        try:
+            async with self._db_factory()() as session:
+                cal_rows = (await session.execute(
+                    select(CalibrationRecord).where(CalibrationRecord.timestamp >= cutoff)
+                )).scalars().all()
+
+                for r in cal_rows:
+                    strat = r.strategy or "unknown"
+                    if strat not in stats:
+                        stats[strat] = {
+                            "wins": 0, "total": 0, "conf_sum": 0.0,
+                            "brier_sum": 0.0, "failure_classes": [],
+                        }
+                    stats[strat]["total"] += 1
+                    stats[strat]["wins"] += int(r.outcome or 0)
+                    stats[strat]["conf_sum"] += float(r.forecast or 0)
+                    stats[strat]["brier_sum"] += float(r.brier_contribution or 0)
+
+                ref_rows = (await session.execute(
+                    select(ReflectionLog.strategy, ReflectionLog.failure_class)
+                    .where(ReflectionLog.timestamp >= cutoff)
+                    .where(ReflectionLog.failure_class.is_not(None))
+                )).all()
+
+            for r in ref_rows:
+                strat = r.strategy or "unknown"
+                if strat in stats and r.failure_class:
+                    stats[strat]["failure_classes"].append(r.failure_class)
+
+            # Compute derived metrics
+            for strat, s in stats.items():
+                n = s["total"] or 1
+                s["win_rate"] = round(s["wins"] / n, 4)
+                s["avg_confidence"] = round(s["conf_sum"] / n, 4)
+                s["avg_brier"] = round(s["brier_sum"] / n, 6)
+                fcs = s["failure_classes"]
+                s["dominant_failure"] = max(set(fcs), key=fcs.count) if fcs else None
+                del s["failure_classes"]
+        except Exception as exc:
+            logger.warning("[DIRECTOR] Stats computation failed: %s", exc)
+
+        return stats
 
     async def _get_trade_history(self) -> list[dict]:
         """Fetch recent closed trades from SQLite for win-rate analysis."""
@@ -592,6 +783,30 @@ class AutonomousPortfolioDirector:
             logger.warning("[DIRECTOR] Trade history fetch failed: %s", exc)
             return []
 
+    def _validate_command(self, cmd: DirectorCommand, engine) -> str | None:
+        """
+        Sanity-check a command before dispatching.
+        Returns an error string if the command should be dropped, else None.
+        """
+        requires_target = {
+            CommandAction.HALT_BOT,
+            CommandAction.RESUME_BOT,
+            CommandAction.ADJUST_ALLOCATION,
+            CommandAction.UPDATE_STRATEGY_PARAMS,
+            CommandAction.SPAWN_BOT_VARIANT,
+        }
+        if cmd.action in requires_target:
+            if not cmd.target_bot:
+                return f"{cmd.action.value} missing target_bot (reason: {cmd.params.reason[:80]})"
+            if cmd.target_bot not in engine.bots:
+                return f"{cmd.action.value} target_bot='{cmd.target_bot}' not in active bots"
+        if cmd.action == CommandAction.ADJUST_ALLOCATION and cmd.params.new_allocation_pct is None:
+            return f"ADJUST_ALLOCATION missing new_allocation_pct for bot={cmd.target_bot}"
+        if cmd.action in (CommandAction.ASSIGN_EXISTING_STRATEGY, CommandAction.UNASSIGN_STRATEGY,
+                          CommandAction.LIQUIDATE_POSITION) and not cmd.params.symbol:
+            return f"{cmd.action.value} missing params.symbol"
+        return None
+
     async def _generate_commands(self, context: dict) -> list[DirectorCommand]:
         """Invoke the structured-output LLM and return a validated command list."""
         try:
@@ -605,6 +820,9 @@ class AutonomousPortfolioDirector:
             user   = HumanMessage(content=json.dumps(context, default=str))
 
             result: ActionList = await structured_llm.ainvoke([system, user])
+            if not result:
+                logger.warning("[DIRECTOR] LLM returned empty structured output (likely rate limited)")
+                return []
             logger.info("[DIRECTOR] Generated %d command(s)", len(result.commands))
             return result.commands
 
@@ -635,8 +853,9 @@ class AutonomousPortfolioDirector:
         """Write a BotAmend row to the SQLite audit trail."""
         try:
             from db.models import BotAmend
+            from sqlalchemy import select
             amend = BotAmend(
-                model       = CLAUDE_HAIKU_MODEL,
+                model       = GEMINI_3_1_FLASH_LITE_MODEL,
                 action      = cmd.action.value,
                 target_bot  = cmd.target_bot,
                 reason      = cmd.params.reason[:500],
@@ -645,6 +864,24 @@ class AutonomousPortfolioDirector:
             )
             async with self._db_factory()() as session:
                 session.add(amend)
+                
+                # Update status of AI recommendations if acted upon
+                ai_items = _ai_state.get_items()
+                acted_titles = [item.get("title") for item in ai_items if item.get("title") and item["title"] in cmd.params.reason]
+                
+                if acted_titles:
+                    pending = (await session.execute(
+                        select(BotAmend)
+                        .where(BotAmend.action.like("ACTION_ITEM:%"))
+                        .where(BotAmend.status == "pending")
+                    )).scalars().all()
+                    
+                    for p in pending:
+                        for title in acted_titles:
+                            if p.reason and p.reason.startswith(title + ":"):
+                                p.status = "acted"
+                                logger.info("[DIRECTOR] Marked AI recommendation as acted: %s", title)
+                                
                 await session.commit()
             logger.info(
                 "[DIRECTOR] BotAmend logged: %s → %s (success=%s)",

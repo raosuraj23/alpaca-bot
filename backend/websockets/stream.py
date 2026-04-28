@@ -164,7 +164,7 @@ async def stream_manager(write_closed_trade_fn=None):
         logger.warning("[STREAM] No API keys — live stream disabled.")
         return
 
-    CONNECTION_LIMIT_COOLDOWN = 65
+    conn_limit_wait = 65
     backoff = 5
     max_backoff = 120
     attempts = 0
@@ -190,21 +190,24 @@ async def stream_manager(write_closed_trade_fn=None):
 
                 signal_price = price
                 signals = await master_engine.process_tick(symbol, price)
+                if not signals:
+                    return
+
+                equity = 0.0
+                try:
+                    if trading_client:
+                        equity = float(trading_client.get_account().equity)
+                except Exception:
+                    pass
+
+                from risk.kill_switch import global_kill_switch
+                global_kill_switch.evaluate_portfolio(equity)
+
                 for signal in signals:
                     meta_str = ", ".join(f"{k}={v}" for k, v in signal.get("meta", {}).items())
                     _push_log(
                         f"[{signal['bot'].upper()}] {signal['action']} signal on {symbol} @ ${price:,.2f} (conf: {signal['confidence']}) {meta_str}"
                     )
-
-                    equity = 0.0
-                    try:
-                        if trading_client:
-                            equity = float(trading_client.get_account().equity)
-                    except Exception:
-                        pass
-
-                    from risk.kill_switch import global_kill_switch
-                    global_kill_switch.evaluate_portfolio(equity)
 
                     from predict.feature_extractor import extract_features, compute_market_implied_prob
                     from predict.xgboost_classifier import xgb_classifier
@@ -339,10 +342,10 @@ async def stream_manager(write_closed_trade_fn=None):
             err_str = str(e).lower()
             attempts += 1
             if "connection limit" in err_str:
-                wait = CONNECTION_LIMIT_COOLDOWN
-                logger.warning("[STREAM] Connection limit hit (attempt %d/%d). Waiting %ds for Alpaca to release stale connection...", attempts, max_attempts, wait)
-                _push_log(f"[STREAM] ⏳ Alpaca connection limit — waiting {wait}s for stale session to expire...")
-                await asyncio.sleep(wait)
+                logger.warning("[STREAM] Connection limit hit (attempt %d/%d). Waiting %ds for Alpaca to release stale connection...", attempts, max_attempts, conn_limit_wait)
+                _push_log(f"[STREAM] ⏳ Alpaca connection limit — waiting {conn_limit_wait}s for stale session to expire...")
+                await asyncio.sleep(conn_limit_wait)
+                conn_limit_wait = min(int(conn_limit_wait * 1.5), 180)
             else:
                 logger.warning("[STREAM] Error (attempt %d/%d): %s", attempts, max_attempts, e)
                 _push_log(f"[STREAM] Connection error — retrying in {backoff}s ({attempts}/{max_attempts})...")
@@ -356,6 +359,10 @@ async def stream_manager(write_closed_trade_fn=None):
 async def equity_stream_manager(write_closed_trade_fn=None):
     from strategy.equity_algorithms import _is_market_hours
 
+    # Stagger startup so crypto stream connects first and doesn't compete for the same slot.
+    await asyncio.sleep(15)
+
+    conn_limit_wait = 65
     backoff = 10
     max_backoff = 120
     attempts = 0
@@ -377,20 +384,24 @@ async def equity_stream_manager(write_closed_trade_fn=None):
                 }})
                 signal_price = price
                 signals = await master_engine.process_tick(symbol, price)
+                if not signals:
+                    return
+
+                equity_bal = 0.0
+                try:
+                    if trading_client:
+                        equity_bal = float(trading_client.get_account().equity)
+                except Exception:
+                    pass
+
+                from risk.kill_switch import global_kill_switch
+                global_kill_switch.evaluate_portfolio(equity_bal)
+
                 for signal in signals:
                     meta_str = ", ".join(f"{k}={v}" for k, v in signal.get("meta", {}).items())
                     _push_log(
                         f"[{signal['bot'].upper()}] {signal['action']} signal on {symbol} @ ${price:,.2f} (conf: {signal['confidence']}) {meta_str}"
                     )
-                    equity_bal = 0.0
-                    try:
-                        if trading_client:
-                            equity_bal = float(trading_client.get_account().equity)
-                    except Exception:
-                        pass
-
-                    from risk.kill_switch import global_kill_switch
-                    global_kill_switch.evaluate_portfolio(equity_bal)
 
                     from predict.feature_extractor import extract_features, compute_market_implied_prob
                     from predict.xgboost_classifier import xgb_classifier
@@ -484,10 +495,10 @@ async def equity_stream_manager(write_closed_trade_fn=None):
             err_str = str(e).lower()
             attempts += 1
             if "connection limit" in err_str:
-                wait = 65
-                logger.warning("[EQUITY STREAM] Connection limit hit (attempt %d/%d). Waiting %ds for Alpaca to release stale connection...", attempts, max_attempts, wait)
-                _push_log(f"[EQUITY STREAM] ⏳ Alpaca connection limit — waiting {wait}s for stale session to expire...")
-                await asyncio.sleep(wait)
+                logger.warning("[EQUITY STREAM] Connection limit hit (attempt %d/%d). Waiting %ds for Alpaca to release stale connection...", attempts, max_attempts, conn_limit_wait)
+                _push_log(f"[EQUITY STREAM] ⏳ Alpaca connection limit — waiting {conn_limit_wait}s for stale session to expire...")
+                await asyncio.sleep(conn_limit_wait)
+                conn_limit_wait = min(int(conn_limit_wait * 1.5), 180)
             else:
                 logger.warning("[EQUITY STREAM] Error (attempt %d/%d): %s", attempts, max_attempts, e)
                 _push_log(f"[EQUITY STREAM] Error — retrying in {backoff}s ({attempts}/{max_attempts})...")

@@ -49,7 +49,12 @@ function SystemClock() {
 }
 
 function WsStatusDot() {
+  const [mounted, setMounted] = React.useState(false);
   const wsStatus = useTradingStore(s => s.wsStatus);
+
+  React.useEffect(() => { setMounted(true); }, []);
+  if (!mounted) return null;
+
   if (wsStatus === 'connected') {
     return (
       <div className="flex items-center gap-1.5">

@@ -83,16 +83,25 @@ class EquityMomentumStrategy(BaseStrategy):
         spread = (short - long_) / long_
 
         signal = None
+        _ta = {
+            "ema_50": round(short, 4), "ema_200": round(long_, 4),
+            "volume_surge_ratio": 1.0,
+            "conditions": {
+                "golden_cross": short > long_,
+                "rsi_gate": False,
+                "volume_surge": False,
+            },
+        }
         if spread > 0.0015 and self._last_cross.get(symbol) != "BUY" and self._is_flat(symbol):
             self._last_cross[symbol] = "BUY"
-            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
+            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}, **_ta}
         elif spread < -0.0015 and self._last_cross.get(symbol) != "SELL" and self._is_long(symbol):
             if symbol in self._entry_price:
                 profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
                 if profit_pct < self.min_profit_to_exit_pct:
                     return None
             self._last_cross[symbol] = "SELL"
-            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}}
+            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.68 + abs(spread) * 15), "price": price, "meta": {"spread_pct": spread}, **_ta}
 
         if signal:
             self.signal_count += 1
@@ -197,16 +206,25 @@ class EquityRSIStrategy(BaseStrategy):
         rsi = self._rsi[symbol]
         signal = None
 
+        _ta = {
+            "rsi_14": round(rsi, 2),
+            "volume_surge_ratio": 1.0,
+            "conditions": {
+                "golden_cross": False,
+                "rsi_gate": True,
+                "volume_surge": False,
+            },
+        }
         if rsi < self.RSI_OVERSOLD and self._last_signal.get(symbol) != "BUY" and self._is_flat(symbol):
             self._last_signal[symbol] = "BUY"
-            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.60 + (self.RSI_OVERSOLD - rsi) / 30 * 0.35), "price": price}
+            signal = {"bot": self.id, "symbol": symbol, "action": "BUY", "confidence": min(0.95, 0.60 + (self.RSI_OVERSOLD - rsi) / 30 * 0.35), "price": price, **_ta}
         elif rsi > self.RSI_OVERBOUGHT and self._last_signal.get(symbol) != "SELL" and self._is_long(symbol):
             if symbol in self._entry_price:
                 profit_pct = (price - self._entry_price[symbol]) / self._entry_price[symbol]
                 if profit_pct < self.min_profit_to_exit_pct:
                     return None
             self._last_signal[symbol] = "SELL"
-            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.60 + (rsi - self.RSI_OVERBOUGHT) / 30 * 0.35), "price": price}
+            signal = {"bot": self.id, "symbol": symbol, "action": "SELL", "confidence": min(0.95, 0.60 + (rsi - self.RSI_OVERBOUGHT) / 30 * 0.35), "price": price, **_ta}
 
         if signal:
             self.signal_count += 1
@@ -315,13 +333,22 @@ class EquityPairsStrategy(BaseStrategy):
         std = math.sqrt(variance) if variance > 0 else 1e-9
         z_score = (spread - mean) / std
 
+        _ta = {
+            "volume_surge_ratio": 1.0,
+            "meta": {"z_score": round(z_score, 4), "pair_spread": round(spread, 6)},
+            "conditions": {
+                "golden_cross": False,
+                "rsi_gate": False,
+                "volume_surge": False,
+            },
+        }
         signal = None
         if z_score < -self.Z_THRESHOLD and self._last_signal != "BUY" and self._is_flat(self.leg_a):
             self._last_signal = "BUY"
-            signal = {"bot": self.id, "symbol": self.leg_a, "action": "BUY", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price}
+            signal = {"bot": self.id, "symbol": self.leg_a, "action": "BUY", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price, **_ta}
         elif z_score > self.Z_THRESHOLD and self._last_signal != "SELL" and self._is_long(self.leg_a):
             self._last_signal = "SELL"
-            signal = {"bot": self.id, "symbol": self.leg_a, "action": "SELL", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price}
+            signal = {"bot": self.id, "symbol": self.leg_a, "action": "SELL", "confidence": min(0.93, 0.65 + abs(z_score) * 0.08), "price": price, **_ta}
 
         if signal:
             self.signal_count += 1
