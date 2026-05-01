@@ -60,11 +60,12 @@ def _load_knowledge_context(n: int = 20) -> str:
     if not _KB_PATH.exists():
         return ""
     try:
-        lines = _KB_PATH.read_text(encoding="utf-8").strip().splitlines()
-        if not lines:
+        from collections import deque
+        tail = deque(open(_KB_PATH, encoding="utf-8"), maxlen=n)
+        if not tail:
             return ""
         entries = []
-        for line in lines[-n:]:
+        for line in tail:
             try:
                 rec = json.loads(line)
                 ke = rec.get("knowledge_entry", "").strip()
@@ -107,7 +108,7 @@ def get_universe() -> list[str]:
     return seed_order + extras
 
 
-# Back-compat alias imported by research_agent.py — always reflects current dynamic universe
+# Back-compat alias — snapshot at import time; call get_universe() for a live list
 UNIVERSE_SYMBOLS = get_universe()
 
 SCAN_INTERVAL      = 300   # 5 min — TA screener cadence
@@ -199,11 +200,13 @@ class ScannerAgent:
         get_buffer_fn: Callable,
         get_research_fn: Optional[Callable] = None,
         set_equity_symbols_fn: Optional[Callable] = None,
+        on_universe_update: Optional[Callable[[list], None]] = None,
     ):
         self._push                  = push_fn
         self._get_buffer            = get_buffer_fn
         self._get_research          = get_research_fn
         self._set_equity_symbols_fn = set_equity_symbols_fn
+        self._on_universe_update    = on_universe_update
         self._running     = False
         self._last_scan:      Optional[datetime] = None
         self._last_discovery: Optional[datetime] = None
@@ -215,7 +218,26 @@ class ScannerAgent:
 
     def get_last_results(self) -> list[dict]:
         """Returns the most recent scan results for REST polling."""
-        return self._results
+        if self._results:
+            return self._results
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        return [
+            {
+                "symbol":       s,
+                "score":        0.0,
+                "signal":       "WARMING_UP",
+                "price":        0.0,
+                "rsi":          None,
+                "vol_surge":    None,
+                "summary":      "Awaiting market data…",
+                "verdict":      "Awaiting market data…",
+                "anomaly_flags": [],
+                "timestamp":    now,
+                "asset_class":  "CRYPTO" if ("/" in s or (len(s) >= 5 and s.endswith("USD"))) else "EQUITY",
+            }
+            for s in self._active_symbols
+        ]
 
     # ------------------------------------------------------------------
     # Background loops
@@ -250,7 +272,7 @@ class ScannerAgent:
             crypto_syms  = [s for s in universe if "/" in s]
             equity_syms  = [s for s in universe if "/" not in s]
             end   = datetime.now(timezone.utc)
-            start = end - timedelta(hours=3)
+            start = end - timedelta(days=2)
             buf   = self._get_buffer()
 
             if buf is None:
@@ -273,10 +295,12 @@ class ScannerAgent:
                             sym_df = bars_df.xs(sym, level=0) if isinstance(bars_df.index, pd.MultiIndex) else bars_df
                             buf.ingest_ohlcv_df(sym, sym_df)
                             logger.info("[SCANNER] Seeded buffer: %s (%d bars)", sym, len(sym_df))
+                    else:
+                        logger.info("[SCANNER] Crypto history seed returned empty DataFrame — market may be closed, will seed from stream")
                 except Exception as e:
                     logger.warning("[SCANNER] Crypto history seed failed: %s", e)
 
-            # Equity bars (market hours only — may return empty outside session)
+            # Equity bars (IEX only returns data during NYSE session; empty outside is expected)
             if equity_syms:
                 try:
                     from alpaca.data.historical import StockHistoricalDataClient
@@ -295,6 +319,8 @@ class ScannerAgent:
                             sym_df = bars_df.xs(sym, level=0) if isinstance(bars_df.index, pd.MultiIndex) else bars_df
                             buf.ingest_ohlcv_df(sym, sym_df)
                             logger.info("[SCANNER] Seeded buffer: %s (%d bars)", sym, len(sym_df))
+                    else:
+                        logger.info("[SCANNER] Equity history seed returned empty DataFrame — market may be closed, will seed from stream")
                 except Exception as e:
                     logger.warning("[SCANNER] Equity history seed failed: %s", e)
 
@@ -312,9 +338,13 @@ class ScannerAgent:
 
     async def _discovery_loop(self):
         """TIER 1 — market research runs every DISCOVERY_INTERVAL seconds."""
+        from strategy.equity_algorithms import _is_market_hours
         # Wait for first TA scan before doing discovery
         await asyncio.sleep(SCAN_INTERVAL + 10)
         while self._running:
+            if not _is_market_hours():
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
             try:
                 await self._discover_symbols()
             except Exception as e:
@@ -517,6 +547,13 @@ class ScannerAgent:
                 scored.append(result)
 
         if not scored:
+            logger.warning(
+                "[SCANNER] All %d symbols returned None from _score_symbol — "
+                "buffer likely has < 20 bars per symbol. "
+                "Crypto seed should populate within ~20 minutes of stream start; "
+                "equity data requires market hours.",
+                len(symbols_to_scan),
+            )
             return
 
         scored.sort(key=lambda x: abs(x["score"]), reverse=True)
@@ -536,6 +573,7 @@ class ScannerAgent:
                 "verdict":       ai_verdicts.get(s["symbol"], s["summary"]),
                 "anomaly_flags": s.get("anomaly_flags", []),
                 "timestamp":     now.isoformat(),
+                "asset_class":   "CRYPTO" if ("/" in s["symbol"] or (len(s["symbol"]) >= 5 and s["symbol"].endswith("USD"))) else "EQUITY",
             }
             for s in scored
         ]
@@ -551,6 +589,13 @@ class ScannerAgent:
             })
 
         await self._persist(self._results)
+
+        # Notify engine of all freshly ranked symbols so new tickers get
+        # WebSocket subscriptions without waiting for the 30-min TIER 1 discovery.
+        if self._on_universe_update and self._results:
+            scan_symbols = [r["symbol"] for r in self._results]
+            self._on_universe_update(scan_symbols)
+
         logger.info("[SCANNER] Scan done — top: %s score=%+.3f",
                     top["symbol"] if top else "?", top["score"] if top else 0)
 
@@ -621,7 +666,7 @@ class ScannerAgent:
                 score -= 0.3
                 signals.append("BB upper zone")
 
-            signal  = "BUY" if score > 1.0 else "SELL" if score < -1.0 else "NEUTRAL"
+            signal  = "BUY" if score >= 2.0 else "SELL" if score <= -2.0 else "NEUTRAL"
             summary = f"${price:,.2f} | " + ", ".join(signals[:3]) if signals else f"${price:,.2f}"
 
             # Anomaly detection — flags price spikes and volume surges
@@ -740,12 +785,15 @@ class ScannerAgent:
             from sqlalchemy import select
 
             async with _get_session_factory()() as session:
+                symbols = [r["symbol"] for r in results]
+                existing_rows = (await session.execute(
+                    select(WatchlistItem).where(WatchlistItem.symbol.in_(symbols))
+                )).scalars().all()
+                existing = {row.symbol: row for row in existing_rows}
                 for r in results:
                     sym = r["symbol"]
                     ac = "CRYPTO" if "/" in sym else "EQUITY"
-                    row = (await session.execute(
-                        select(WatchlistItem).where(WatchlistItem.symbol == sym)
-                    )).scalar_one_or_none()
+                    row = existing.get(sym)
                     if row:
                         row.score        = r["score"]
                         row.signal       = r["signal"]

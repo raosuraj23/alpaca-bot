@@ -24,6 +24,7 @@ interface PositionRow {
   side: string;
   size: number;
   entryPrice: number;
+  markPrice: number;
   unrealizedPnl: number;
 }
 
@@ -49,11 +50,13 @@ function SortIndicator({ sorted }: { sorted: false | 'asc' | 'desc' }) {
 function ExposureBar({ positions }: { positions: PositionRow[] }) {
   if (positions.length === 0) return null;
 
-  const notionals = positions.map(p => ({
-    symbol: p.symbol,
-    notional: Math.abs(p.size * p.entryPrice),
-    side: p.side,
-  }));
+  const notionals = positions
+    .filter(p => Number.isFinite(p.size) && Number.isFinite(p.entryPrice))
+    .map(p => ({
+      symbol: p.symbol,
+      notional: Math.abs(p.size * p.entryPrice),
+      side: p.side,
+    }));
   const total = notionals.reduce((s, n) => s + n.notional, 0);
   if (total === 0) return null;
 
@@ -71,7 +74,11 @@ function ExposureBar({ positions }: { positions: PositionRow[] }) {
   return (
     <div className="px-3 pt-2 pb-1.5 border-b border-[var(--border)] shrink-0">
       <div className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider mb-1 opacity-60">Exposure</div>
-      <div className="flex h-2 rounded-sm overflow-hidden gap-px">
+      <div
+        className="flex h-2 rounded-sm overflow-hidden gap-px"
+        role="img"
+        aria-label={`Portfolio exposure: ${notionals.map(n => `${n.symbol} ${((n.notional / total) * 100).toFixed(0)}%`).join(', ')}`}
+      >
         {notionals.map((n, i) => (
           <div
             key={n.symbol}
@@ -135,7 +142,7 @@ function RiskStatusPanel({ riskStatus, fetchRiskStatus }: {
       {/* Drawdown utilization bar */}
       <div>
         <div className="flex items-center justify-between mb-1">
-          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider">Daily Drawdown</span>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider" title="(start-of-day equity − current equity) / start-of-day equity. Kill switch fires at 2%.">Daily Drawdown</span>
           <span className={`text-xs font-mono tabular-nums font-bold ${ddPct > 0.015 ? 'text-[var(--neon-red)]' : ddPct > 0.01 ? 'text-[var(--warning)]' : 'text-[var(--foreground)]'}`}>
             {(ddPct * 100).toFixed(2)}% / {(maxDdPct * 100).toFixed(0)}%
           </span>
@@ -154,25 +161,25 @@ function RiskStatusPanel({ riskStatus, fetchRiskStatus }: {
       {/* Risk parameters grid */}
       <div className="grid grid-cols-2 gap-x-4 gap-y-2">
         <div>
-          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Max Position</span>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5" title="No single position may exceed this percentage of portfolio equity or this notional USD cap.">Max Position</span>
           <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
             {(riskStatus.max_position_pct * 100).toFixed(0)}% / ${riskStatus.max_position_usd.toLocaleString()}
           </span>
         </div>
         <div>
-          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Kelly Cap</span>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5" title="Maximum Kelly fraction applied to position sizing. Kelly criterion: f* = W − (1−W)/R. This cap limits full-Kelly overfitting.">Kelly Cap</span>
           <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
             {(riskStatus.max_kelly_fraction * 100).toFixed(0)}%
           </span>
         </div>
         <div>
-          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">Min Confidence</span>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5" title="Minimum XGBoost signal probability required to open a new position. Signals below this threshold are rejected.">Min Confidence</span>
           <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
             {(riskStatus.min_confidence_gate * 100).toFixed(0)}%
           </span>
         </div>
         <div>
-          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5">SOD Equity</span>
+          <span className="text-xs text-[var(--muted-foreground)] uppercase tracking-wider block mb-0.5" title="Start-of-Day equity snapshot captured at market open. Used as the denominator for daily drawdown calculation.">SOD Equity</span>
           <span className="text-xs font-mono tabular-nums text-[var(--foreground)]">
             {riskStatus.start_of_day_equity != null
               ? `$${riskStatus.start_of_day_equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -195,13 +202,14 @@ export function PositionsTable() {
   const fetchRiskStatus = useTradingStore(s => s.fetchRiskStatus);
 
   const [todayPl, setTodayPl] = React.useState<number | null>(null);
+  const [acctFetchFailed, setAcctFetchFailed] = React.useState(false);
 
   React.useEffect(() => {
     const load = () =>
       fetch(`${API_BASE}/api/account`, { signal: AbortSignal.timeout(8000) })
         .then(r => r.ok ? r.json() : null)
-        .then(d => { if (d) setTodayPl(Number(d.today_pl ?? 0)); })
-        .catch(() => {});
+        .then(d => { if (d) { setTodayPl(Number(d.today_pl ?? 0)); setAcctFetchFailed(false); } else setAcctFetchFailed(true); })
+        .catch(() => { setAcctFetchFailed(true); });
     load();
     const id = setInterval(load, 30_000);
     return () => clearInterval(id);
@@ -231,25 +239,45 @@ export function PositionsTable() {
       accessorKey: 'size',
       header: 'Size',
       meta: { align: 'right' },
-      cell: ({ getValue }) => (
-        <span className="text-right block font-mono tabular-nums text-[var(--foreground)]">
-          {(getValue() as number).toFixed(4)}
-        </span>
-      ),
+      cell: ({ getValue }) => {
+        const qty = getValue() as number;
+        const display = qty.toFixed(9).replace(/\.?0+$/, '');
+        return (
+          <span className="text-right block font-mono tabular-nums text-[var(--foreground)]">
+            {display}
+          </span>
+        );
+      },
     },
     {
-      accessorKey: 'entryPrice',
-      header: 'Entry Price',
+      accessorKey: 'markPrice',
+      header: 'Price',
       meta: { align: 'right' },
-      cell: ({ getValue }) => (
-        <span className="text-right block font-mono tabular-nums text-[var(--muted-foreground)]">
-          ${(getValue() as number).toFixed(2)}
-        </span>
-      ),
+      cell: ({ getValue }) => {
+        const v = getValue() as number;
+        return (
+          <span className="text-right block font-mono tabular-nums text-[var(--muted-foreground)]">
+            {Number.isFinite(v) ? `$${v.toFixed(4)}` : '—'}
+          </span>
+        );
+      },
+    },
+    {
+      id: 'marketValue',
+      header: 'Mkt Value',
+      meta: { align: 'right' },
+      cell: ({ row }) => {
+        const val = row.original.size * row.original.markPrice;
+        return (
+          <span className="text-right block font-mono tabular-nums text-[var(--foreground)]">
+            {Number.isFinite(val) ? `$${val.toFixed(2)}` : '—'}
+          </span>
+        );
+      },
     },
     {
       accessorKey: 'unrealizedPnl',
-      header: 'Unrealized PnL',
+      header: 'Total P/L',
       meta: { align: 'right' },
       cell: ({ getValue }) => (
         <div className="text-right">
@@ -319,8 +347,8 @@ export function PositionsTable() {
   );
 
   return (
-    <Card className="h-full flex flex-col min-h-[250px]">
-      <CardHeader className="py-2.5 px-3 border-b border-[var(--border)] flex flex-row items-center justify-between">
+    <Card className="h-full flex flex-col min-h-[250px] bg-[var(--panel)]">
+      <CardHeader className="py-2.5 px-3 border-b border-[var(--border)] flex flex-row items-center justify-between bg-[var(--panel)]">
         <div className="flex space-x-4">
           <CardTitle className={tabClass('positions')} onClick={() => setActiveTab('positions')}>
             Positions ({positions.length})
@@ -329,9 +357,11 @@ export function PositionsTable() {
             Risk
           </CardTitle>
         </div>
-        <div className="text-xs font-mono font-bold text-[var(--foreground)]">
+        <div className="text-xs font-mono tabular-nums font-bold text-[var(--foreground)]">
           DAY PNL:{' '}
-          {todayPl != null ? (
+          {acctFetchFailed ? (
+            <span className="text-[var(--warning)] opacity-70">stale</span>
+          ) : todayPl != null ? (
             <span className={todayPl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
               {todayPl >= 0 ? '+' : ''}${todayPl.toFixed(2)}
             </span>
@@ -347,7 +377,7 @@ export function PositionsTable() {
       )}
 
       <CardContent className="flex-1 overflow-y-auto p-0">
-        {activeTab === 'positions' && renderTable(posTable, 'No open positions', 5)}
+        {activeTab === 'positions' && renderTable(posTable, 'No open positions', 6)}
         {activeTab === 'risk'      && (
           <RiskStatusPanel riskStatus={riskStatus} fetchRiskStatus={fetchRiskStatus} />
         )}

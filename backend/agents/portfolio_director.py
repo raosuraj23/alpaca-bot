@@ -95,8 +95,19 @@ PORTFOLIO OPTIMIZATION RULES (run after pending assignments):
 - Always provide a reason and expected impact for each action
 - Maximum 3 commands per cycle (pending assignments count toward this cap)
 - kb_lessons contains recent post-mortem findings with concrete adjustment suggestions.
-  Use these to inform UPDATE_STRATEGY_PARAMS commands — translate natural-language suggestions
-  into registry-valid parameter changes (e.g. "raise confidence threshold" → higher MOMENTUM_THRESHOLD).
+  Translate them into UPDATE_STRATEGY_PARAMS commands using ONLY these valid parameter keys:
+    confidence_threshold, momentum_threshold, rsi_threshold, stop_loss_pct,
+    max_position_pct, min_profit_to_exit_pct, warmup_ticks, MOMENTUM_THRESHOLD,
+    STOP_LOSS_PCT, MIN_PROFIT_TO_EXIT_PCT, alpha_short, alpha_long, rsi_period,
+    rsi_oversold, rsi_overbought, z_threshold, sigma_multiplier, edge_threshold.
+  Example: kb_lesson "Raise confidence threshold from 0.92 to 0.95 for BTC/USD HFT entries" →
+    UPDATE_STRATEGY_PARAMS target_bot="hft-sniper" params={"MOMENTUM_THRESHOLD": 0.95}
+  Example: kb_lesson "Reduce momentum threshold for SOL/USD from 0.92 to 0.85" →
+    UPDATE_STRATEGY_PARAMS target_bot="momentum-alpha" params={"alpha_short": 0.15}
+  Example: kb_lesson "Raise signal confidence threshold from 0.92 to 0.95" →
+    UPDATE_STRATEGY_PARAMS target_bot="momentum-alpha" params={"confidence_threshold": 0.95}
+  Emit one UPDATE_STRATEGY_PARAMS per kb_lesson that names a numeric threshold change.
+  If metrics_trend shows win_rate is declining, prioritise HALT_BOT or ADJUST_ALLOCATION down for worst bots.
 
 ═══════════════════════════════════════════════════════════════
 POSITION COUNT MANAGEMENT (LIQUIDATE_POSITION):
@@ -419,10 +430,13 @@ class CommandDispatcher:
                 return False
             norm = symbol.replace("/", "")
             positions = trading_client.get_all_positions()
-            held_qty = sum(
-                float(p.qty) for p in positions
-                if p.symbol.upper() == norm.upper() or p.symbol.upper() == symbol.upper()
-            )
+            held_qty = 0.0
+            current_price = 0.0
+            for p in positions:
+                if p.symbol.upper() == norm.upper() or p.symbol.upper() == symbol.upper():
+                    held_qty += float(p.qty)
+                    if current_price == 0.0 and p.current_price:
+                        current_price = float(p.current_price)
             if held_qty <= 0:
                 logger.warning("[DIRECTOR] LIQUIDATE_POSITION: no position found for %s", symbol)
                 return False
@@ -434,10 +448,21 @@ class CommandDispatcher:
                 "bot": cmd.target_bot or "director",
                 "strategy": "director-liquidation",
                 "confidence": 1.0,
+                "price": current_price,
                 "meta": {"reason": cmd.params.reason},
             }
-            result = await execution_agent.execute(signal)
+            result = execution_agent.execute(
+                signal,
+                signal_price=current_price if current_price > 0 else None,
+            )
             success = result is not None and getattr(result, "status", None) not in ("FAILED", None)
+            if success and result:
+                await self._write_director_closed_trade(
+                    bot_id=signal["bot"],
+                    symbol=symbol,
+                    exit_price=result.fill_price,
+                    qty=result.qty,
+                )
             logger.info(
                 "[DIRECTOR] LIQUIDATE_POSITION %s qty=%.4f success=%s",
                 symbol, held_qty, success,
@@ -446,6 +471,47 @@ class CommandDispatcher:
         except Exception as exc:
             logger.error("[DIRECTOR] LIQUIDATE_POSITION failed for %s: %s", symbol, exc)
             return False
+
+    async def _write_director_closed_trade(
+        self, bot_id: str, symbol: str, exit_price: float, qty: float
+    ) -> None:
+        """Write a ClosedTrade record for a director-initiated SELL by looking up the prior BUY."""
+        try:
+            import re as _re
+            _CRYPTO_RE = _re.compile(r'^[A-Z]{2,6}(USD[TC]?|BTC|ETH)$')
+            asset_class = "CRYPTO" if ("/" in symbol or bool(_CRYPTO_RE.match(symbol))) else "EQUITY"
+            from db.models import ExecutionRecord, SignalRecord, ClosedTrade
+            from sqlalchemy import select, desc
+            from datetime import datetime, timezone
+            async with self._db_factory()() as session:
+                buy_stmt = (
+                    select(ExecutionRecord.fill_price, ExecutionRecord.timestamp)
+                    .join(SignalRecord, ExecutionRecord.signal_id == SignalRecord.id)
+                    .where(SignalRecord.strategy == bot_id)
+                    .where(SignalRecord.symbol == symbol)
+                    .where(SignalRecord.action == "BUY")
+                    .where(ExecutionRecord.status == "FILLED")
+                    .where(ExecutionRecord.fill_price > 0)
+                    .order_by(desc(ExecutionRecord.timestamp))
+                    .limit(1)
+                )
+                buy_row = (await session.execute(buy_stmt)).first()
+                entry_price = float(buy_row.fill_price) if buy_row else exit_price
+                entry_time = buy_row.timestamp if buy_row else None
+                pnl = (exit_price - entry_price) * qty
+                session.add(ClosedTrade(
+                    bot_id=bot_id, symbol=symbol, qty=qty,
+                    avg_entry_price=entry_price, avg_exit_price=exit_price,
+                    realized_pnl=pnl, net_pnl=pnl, win=pnl > 0,
+                    entry_time=entry_time,
+                    exit_time=datetime.now(timezone.utc).replace(tzinfo=None),
+                    asset_class=asset_class,
+                    confidence=1.0,
+                ))
+                await session.commit()
+                logger.info("[DIRECTOR] ClosedTrade written for %s %s pnl=%.4f", bot_id, symbol, pnl)
+        except Exception as ct_err:
+            logger.warning("[DIRECTOR] ClosedTrade write failed for %s: %s", symbol, ct_err)
 
     async def _persist_symbol_assignment(
         self, symbol: str, bot_id: str, algo_type: str, engine, cmd: "DirectorCommand"
@@ -568,23 +634,41 @@ class AutonomousPortfolioDirector:
         """Inject the research agent getter so director can read the latest brief."""
         self._get_research = fn
 
-    def _load_kb_context(self, n: int = 10) -> list[dict]:
-        """Read the last n entries from failure_log.jsonl for injection into Director context."""
+    def _load_kb_context(self, n: int = 20) -> list[dict]:
+        """Read the last n entries from failure_log.jsonl + metrics_log trend for Director context."""
         from collections import deque
         kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
-        if not kb_path.exists():
-            return []
-        try:
-            tail = deque(kb_path.open(encoding="utf-8"), maxlen=n)
-            entries = []
-            for line in tail:
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-            return entries
-        except OSError:
-            return []
+        entries = []
+        if kb_path.exists():
+            try:
+                tail = deque(kb_path.open(encoding="utf-8"), maxlen=n)
+                for line in tail:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            except OSError:
+                pass
+
+        # Append daily metrics trend so Director knows if performance is improving or declining
+        metrics_path = kb_path.parent / "metrics_log.jsonl"
+        if metrics_path.exists():
+            try:
+                tail = deque(metrics_path.open(encoding="utf-8"), maxlen=7)
+                daily = [json.loads(l) for l in tail if l.strip()]
+                if len(daily) >= 2:
+                    trend = "improving" if daily[-1].get("win_rate", 0) > daily[0].get("win_rate", 0) else "declining"
+                    entries.append({
+                        "source": "metrics_trend",
+                        "trend": trend,
+                        "latest_win_rate": daily[-1].get("win_rate"),
+                        "latest_sharpe": daily[-1].get("sharpe"),
+                        "days_tracked": len(daily),
+                    })
+            except Exception:
+                pass
+
+        return entries
 
     def _ensure_structured_llm(self):
         """Lazy-build the structured-output runnable on first use."""
@@ -610,10 +694,14 @@ class AutonomousPortfolioDirector:
 
     async def run(self) -> None:
         """Main background loop — warmup then cycle every INTERVAL seconds."""
+        from strategy.equity_algorithms import _is_market_hours
         self._running = True
         await asyncio.sleep(WARMUP)
         logger.info("[DIRECTOR] Autonomous Portfolio Director started (interval=%ds)", INTERVAL)
         while self._running:
+            if not _is_market_hours():
+                await asyncio.sleep(60)
+                continue
             try:
                 await self._review_and_act()
             except Exception as exc:
@@ -900,7 +988,7 @@ class AutonomousPortfolioDirector:
                 "reason":     cmd.params.reason,
                 "impact":     cmd.params.impact,
                 "success":    success,
-                "timestamp":  int(datetime.now(timezone.utc).timestamp() * 1000),
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
             })
         except Exception as exc:
             logger.warning("[DIRECTOR] SSE push failed: %s", exc)

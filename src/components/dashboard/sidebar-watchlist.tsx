@@ -10,6 +10,12 @@ import { isCryptoSymbol } from '@/lib/utils';
 import type { WatchlistTA } from '@/lib/types';
 import { Sparkles } from 'lucide-react';
 
+const ASSET_TEXT: Record<string, string> = {
+  EQUITY:  'text-[var(--neon-green)]',
+  OPTIONS: 'text-[var(--agent-learning)]',
+  CRYPTO:  'text-[var(--kraken-light)]',
+};
+
 function RsiBar({ rsi }: { rsi: number | null }) {
   if (rsi == null) return null;
   const pct = Math.max(0, Math.min(100, rsi));
@@ -45,7 +51,7 @@ export function SidebarWatchlist() {
         const existing = new Set(currentWl.map(t => t.symbol));
         const newEntries = results
           .filter(r => !existing.has(r.symbol))
-          .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0 }));
+          .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0, asset_class: r.asset_class }));
         if (newEntries.length > 0) {
           useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
         }
@@ -59,9 +65,10 @@ export function SidebarWatchlist() {
 
   const visibleTickers = React.useMemo(() =>
     watchlist.filter(w => {
-      if (assetClass === 'CRYPTO') return isCryptoSymbol(w.symbol);
-      if (assetClass === 'EQUITY') return !isCryptoSymbol(w.symbol);
-      return true;
+      if (assetClass === 'CRYPTO')  return isCryptoSymbol(w.symbol);
+      if (assetClass === 'OPTIONS') return w.asset_class === 'OPTIONS';
+      // EQUITY: non-crypto symbols that are not explicitly tagged OPTIONS
+      return !isCryptoSymbol(w.symbol) && w.asset_class !== 'OPTIONS';
     }),
     [watchlist, assetClass],
   );
@@ -69,9 +76,9 @@ export function SidebarWatchlist() {
   const scanSymbols = React.useMemo(() => new Set(scanResults.map(r => r.symbol)), [scanResults]);
   const visibleScanResults = React.useMemo(() =>
     scanResults.filter(r => {
-      if (assetClass === 'CRYPTO') return isCryptoSymbol(r.symbol);
-      if (assetClass === 'EQUITY') return !isCryptoSymbol(r.symbol);
-      return true;
+      if (assetClass === 'CRYPTO')  return isCryptoSymbol(r.symbol);
+      if (assetClass === 'OPTIONS') return r.asset_class === 'OPTIONS';
+      return !isCryptoSymbol(r.symbol) && r.asset_class !== 'OPTIONS';
     }),
     [scanResults, assetClass],
   );
@@ -97,7 +104,7 @@ export function SidebarWatchlist() {
             <button
               key={ac}
               onClick={() => setAssetClass(ac)}
-              className={`flex-1 py-0.5 text-xs font-bold rounded-sm tracking-wider transition-colors ${assetClass === ac ? 'bg-[var(--panel-muted)] text-[var(--kraken-light)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-white'}`}
+              className={`flex-1 py-0.5 text-xs font-bold rounded-sm tracking-wider transition-colors ${assetClass === ac ? `bg-[var(--panel-muted)] ${ASSET_TEXT[ac]} shadow-sm` : 'text-[var(--muted-foreground)] hover:text-white'}`}
             >
               {ac}
             </button>

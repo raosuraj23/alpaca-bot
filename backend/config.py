@@ -32,17 +32,26 @@ class Settings(BaseSettings):
 
     # Risk thresholds (all overridable via env without code changes)
     max_daily_drawdown_pct: float = 2.0     # 2% SOD equity → halt all signals
-    max_concurrent_positions: int = 30      # hard cap on open positions
+    max_concurrent_positions: int = 10      # hard cap on open positions (security-and-risk.md §2.5)
     max_kelly_fraction: float = 0.25        # fractional Kelly floor; scales up to 0.5 via calibration
-    slippage_abort_pct: float = 0.02        # abort if pre-execution mid-quote drift > 2%
-    min_signal_confidence: float = 0.30     # reject signals below this confidence
-    min_edge: float = 0.04                  # model_prob - market_implied_prob must exceed 4%
+    slippage_abort_pct: float = 0.005       # abort if pre-execution mid-quote drift > 0.5%
+    min_signal_confidence: float = 0.55     # reject signals below this confidence (aligned with xgboost gate)
+    min_edge: float = 0.06                  # model_prob - market_implied_prob must exceed 6% (covers ~50bps costs)
     xgboost_min_confidence: float = 0.55    # XGBoost P(win) gate — reject signals below this
 
     # Risk parameters for exposure manager
     var_daily_pct: float = 0.01             # 1% daily VaR limit (95th percentile)
     var_confidence: float = 0.95            # VaR confidence level
     reward_risk_ratio: float = 2.0          # assumed R:R ratio for Kelly sizing
+
+    # Options-specific risk constraints (security-and-risk.md §2.7)
+    max_net_delta: float = 0.30             # net portfolio delta as fraction of NAV
+    max_gamma_exposure: float = 0.05        # gamma exposure as fraction of NAV
+    min_days_to_expiry: int = 5             # never hold options within 5 DTE
+
+    # Kill-switch intraday recovery (non-manual triggers only)
+    recovery_window_secs: int = 5400        # 90-min window to recover after drawdown halt
+    recovery_threshold_pct: float = 0.5    # resume when equity within 0.5% of SOD equity
 
     # Infrastructure
     frontend_url: str = "http://localhost:3000"
@@ -55,21 +64,20 @@ settings = Settings()
 # LLM model identifiers — single source of truth for all agent files
 #
 # Tier strategy (all confirmed free-tier per ai.google.dev/gemini-api/docs/pricing):
-#   GEMINI_FREE_MODEL     — gemini-2.5-flash-lite     (stable, free, fastest)
-#   GEMINI_FALLBACK_MODEL — gemini-3.1-flash-lite-preview (free preview, smarter)
+#   GEMINI_FREE_MODEL     — gemini-3.1-flash-lite-preview (500 RPD free, higher than 2.5-flash)
+#   GEMINI_FALLBACK_MODEL — same
 #
 # Note: preview models are free but may become paid or renamed on GA.
 # Monitor https://ai.google.dev/gemini-api/docs/deprecations for changes.
 # ---------------------------------------------------------------------------
-GEMINI_FREE_MODEL        = "gemini-3.1-flash-lite-preview"         # primary — strict 20 RPD on 2.5, using 3.1 for 500 RPD
-GEMINI_FALLBACK_MODEL    = "gemini-3.1-flash-lite-preview"  # fallback — free preview, more capable
+GEMINI_FREE_MODEL     = "gemini-3.1-flash-lite-preview"
+GEMINI_FALLBACK_MODEL = GEMINI_FREE_MODEL
 
-# Legacy aliases kept so existing agent imports don't break immediately;
-# all map to free-tier primary.
-GEMINI_3_FLASH_MODEL        = GEMINI_FALLBACK_MODEL  # old smart-tier → free preview
-GEMINI_3_1_FLASH_LITE_MODEL = GEMINI_FALLBACK_MODEL  # old preview ref → same
-GEMINI_2_5_FLASH_LITE_MODEL = GEMINI_FREE_MODEL      # unchanged
-GEMINI_FLASH_MODEL          = GEMINI_FALLBACK_MODEL  # scanner/research → free preview
+# Legacy aliases — all resolve to free-tier primary.
+GEMINI_3_FLASH_MODEL        = GEMINI_FALLBACK_MODEL
+GEMINI_3_1_FLASH_LITE_MODEL = GEMINI_FALLBACK_MODEL
+GEMINI_2_5_FLASH_LITE_MODEL = GEMINI_FREE_MODEL
+GEMINI_FLASH_MODEL          = GEMINI_FALLBACK_MODEL
 
 # Anthropic models (unused in free-tier mode — kept for reference)
 CLAUDE_HAIKU_MODEL  = "claude-haiku-4-5-20251001"
@@ -79,8 +87,8 @@ CLAUDE_OPUS_MODEL   = "claude-opus-4-6"
 # ---------------------------------------------------------------------------
 # LLM pricing — $/M tokens (used for cost logging in all agent files)
 # ---------------------------------------------------------------------------
-GEMINI_COST_IN  = 0.0     # gemini-2.5-flash-lite — free tier
-GEMINI_COST_OUT = 0.0     # gemini-2.5-flash-lite — free tier
+GEMINI_COST_IN  = 0.0     # gemini-3.1-flash-lite-preview — free during preview
+GEMINI_COST_OUT = 0.0     # gemini-3.1-flash-lite-preview — free during preview
 GEMINI_FLASH_COST_IN  = 0.0   # gemini-3.1-flash-lite-preview — free during preview
 GEMINI_FLASH_COST_OUT = 0.0   # gemini-3.1-flash-lite-preview — free during preview
 

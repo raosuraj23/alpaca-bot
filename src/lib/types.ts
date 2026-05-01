@@ -34,6 +34,8 @@ export interface TickerData {
   ask?: number;
   /** Optional: timestamp of last update (ms since epoch) */
   lastUpdated?: number;
+  /** Asset class — used to filter the watchlist sidebar tabs */
+  asset_class?: AssetClass;
 }
 
 export interface TradeLog {

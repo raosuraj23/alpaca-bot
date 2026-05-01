@@ -29,10 +29,12 @@ export function MiniKPIStrip() {
         ) : <span className="opacity-40">—</span>}
       </KPISlot>
 
-      <KPISlot label="Drawdown">
-        <span className={drawdownPct >= 1.5 ? 'text-[var(--neon-red)]' : drawdownPct >= 0.5 ? 'text-[var(--agent-learning)]' : 'text-[var(--foreground)]'}>
-          {drawdownPct.toFixed(2)}%
-        </span>
+      <KPISlot label="Drawdown" title="Daily drawdown: (start-of-day equity − current equity) / start-of-day equity. Kill switch fires at the 2% limit.">
+        {riskStatus != null ? (
+          <span className={drawdownPct >= 1.5 ? 'text-[var(--neon-red)]' : drawdownPct >= 0.5 ? 'text-[var(--agent-learning)]' : 'text-[var(--foreground)]'}>
+            {drawdownPct.toFixed(2)}%
+          </span>
+        ) : <span className="opacity-40">—</span>}
       </KPISlot>
 
       {killActive && (
@@ -45,9 +47,9 @@ export function MiniKPIStrip() {
   );
 }
 
-function KPISlot({ label, children }: { label: string; children: React.ReactNode }) {
+function KPISlot({ label, children, title }: { label: string; children: React.ReactNode; title?: string }) {
   return (
-    <div className="flex flex-col items-end leading-none gap-0.5">
+    <div className="flex flex-col items-end leading-none gap-0.5" title={title}>
       <span className="text-[var(--muted-foreground)] uppercase tracking-widest text-xs">{label}</span>
       <span className="text-[var(--foreground)] font-bold">{children}</span>
     </div>

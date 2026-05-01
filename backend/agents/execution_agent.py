@@ -11,6 +11,27 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+
+def _is_crypto(symbol: str) -> bool:
+    """
+    Crypto detection that handles both 'LINK/USD' and 'LINKUSD' formats.
+    Checks '/' first, then looks up CRYPTO_STREAM_SYMBOLS (dynamically maintained
+    by the scanner), then falls back to a length+suffix heuristic.
+    """
+    if "/" in symbol:
+        return True
+    try:
+        from core.state import CRYPTO_STREAM_SYMBOLS
+        norm = symbol.upper()
+        for cs in CRYPTO_STREAM_SYMBOLS:
+            if cs.upper().replace("/", "") == norm:
+                return True
+    except Exception:
+        pass
+    # Heuristic: Alpaca crypto USD pairs are 5-9 char all-alpha strings ending in USD/USDT/USDC
+    return len(symbol) >= 5 and symbol.upper().endswith(("USD", "USDT", "USDC")) and symbol.isalpha()
+
+
 # Pre-execution guard thresholds sourced from validated config (pydantic-settings)
 from config import settings as _cfg
 _SLIPPAGE_ABORT_PCT = _cfg.slippage_abort_pct
@@ -57,6 +78,9 @@ class ExecutionAgent:
       4. Returns ExecutionResult with slippage data
     """
 
+    def __init__(self):
+        self.last_error: str | None = None  # set whenever execute() returns None
+
     def execute(self, approved_signal: dict, signal_price: float | None = None) -> ExecutionResult | None:
         """
         Execute an approved signal.
@@ -72,7 +96,16 @@ class ExecutionAgent:
         bot_id  = approved_signal.get("bot", "unknown")
         s_price = signal_price or float(approved_signal.get("price", 0.0))
 
+        # Reject equity BUY orders outside market hours — crypto symbols contain "/"
+        if action == "BUY" and "/" not in symbol:
+            from strategy.equity_algorithms import _is_market_hours
+            if not _is_market_hours():
+                self.last_error = f"equity market closed for {symbol}"
+                logger.warning("[EXECUTION AGENT] Rejected equity BUY outside market hours: %s", symbol)
+                return None
+
         if qty <= 0:
+            self.last_error = "zero quantity"
             logger.error("[EXECUTION AGENT] Zero qty — aborting submission for %s %s", action, symbol)
             self._persist_async(
                 bot_id=bot_id,
@@ -90,6 +123,7 @@ class ExecutionAgent:
         trading_client = _get_trading_client()
 
         if not trading_client:
+            self.last_error = "Alpaca trading_client unavailable — check ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in .env"
             logger.warning("[EXECUTION AGENT] trading_client unavailable — skipping live submission.")
             self._persist_async(
                 bot_id=bot_id,
@@ -166,19 +200,29 @@ class ExecutionAgent:
                     mid = (_bid_at_submit + _ask_at_submit) / 2
                     pre_slip_pct = abs(mid - s_price) / s_price
                     if pre_slip_pct > _SLIPPAGE_ABORT_PCT:
+                        resized_qty = round(qty * (s_price / mid), 8) if mid > 0 else 0.0
+                        if resized_qty <= 1e-8:
+                            logger.warning(
+                                "[EXECUTION AGENT] Pre-execution slippage abort: %.2f%% > %.0f%% limit "
+                                "for %s (signal=$%.4f mid=$%.4f) — resized qty negligible",
+                                pre_slip_pct * 100, _SLIPPAGE_ABORT_PCT * 100, symbol, s_price, mid,
+                            )
+                            self._persist_async(
+                                bot_id=bot_id, symbol=symbol, action=action,
+                                confidence=approved_signal.get("confidence", 0.0),
+                                order_id=None, fill_price=0.0, slippage=pre_slip_pct * s_price,
+                                status="FAILED",
+                                failure_reason=f"pre-execution slippage {pre_slip_pct:.2%} > {_SLIPPAGE_ABORT_PCT:.0%} limit — resized qty negligible",
+                            )
+                            return None
                         logger.warning(
-                            "[EXECUTION AGENT] Pre-execution slippage abort: %.2f%% > %.0f%% limit "
-                            "for %s (signal=$%.4f mid=$%.4f)",
-                            pre_slip_pct * 100, _SLIPPAGE_ABORT_PCT * 100, symbol, s_price, mid,
+                            "[EXECUTION AGENT] Pre-execution slippage %.2f%% > %.0f%% — resizing qty "
+                            "%.6f → %.6f for %s (signal=$%.4f mid=$%.4f)",
+                            pre_slip_pct * 100, _SLIPPAGE_ABORT_PCT * 100, qty, resized_qty,
+                            symbol, s_price, mid,
                         )
-                        self._persist_async(
-                            bot_id=bot_id, symbol=symbol, action=action,
-                            confidence=approved_signal.get("confidence", 0.0),
-                            order_id=None, fill_price=0.0, slippage=pre_slip_pct * s_price,
-                            status="FAILED",
-                            failure_reason=f"pre-execution slippage {pre_slip_pct:.2%} > {_SLIPPAGE_ABORT_PCT:.0%} limit",
-                        )
-                        return None
+                        qty = resized_qty
+                        s_price = mid
             except Exception as _qe:
                 logger.debug("[EXECUTION AGENT] Quote slippage check failed: %s — proceeding", _qe)
 
@@ -198,6 +242,7 @@ class ExecutionAgent:
                     if p.symbol.replace("/", "") == norm
                 )
                 if held_qty <= 0:
+                    self.last_error = f"no open position found for {symbol} — cannot SELL"
                     logger.warning(
                         "[EXECUTION AGENT] SELL guard: no open position in %s — aborting naked SELL",
                         symbol,
@@ -220,24 +265,62 @@ class ExecutionAgent:
                 )
 
         try:
-            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
             from alpaca.trading.enums import OrderSide, TimeInForce
 
             side  = OrderSide.BUY if action == "BUY" else OrderSide.SELL
-            # Alpaca requires DAY for fractional equity orders (error 42210000 with GTC)
-            is_crypto    = "/" in symbol
+            is_crypto    = _is_crypto(symbol)
             is_fractional = (qty % 1) != 0
-            tif = TimeInForce.DAY if (not is_crypto and is_fractional) else TimeInForce.GTC
-            order = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                time_in_force=tif,
-            )
+
+            # Prefer limit orders to cap slippage; fall back to market if no valid quote.
+            limit_price: float | None = None
+            if _bid_at_submit > 0 and _ask_at_submit > 0:
+                if action == "BUY":
+                    limit_price = round(_ask_at_submit * 1.0005, 8)
+                else:
+                    limit_price = round(_bid_at_submit * 0.9995, 8)
+
+            if limit_price and limit_price > 0:
+                # IOC for crypto (no stale resting orders); DAY for fractional equity; GTC otherwise
+                tif = TimeInForce.IOC if is_crypto else (TimeInForce.DAY if is_fractional else TimeInForce.GTC)
+                order = LimitOrderRequest(
+                    symbol=symbol, qty=qty, side=side, time_in_force=tif, limit_price=limit_price,
+                )
+                logger.info("[EXECUTION AGENT] LIMIT order %s %s qty=%.6f @ $%.4f (5bps buffer)",
+                            action, symbol, qty, limit_price)
+            else:
+                # Alpaca requires DAY for fractional equity orders (error 42210000 with GTC)
+                tif = TimeInForce.DAY if (not is_crypto and is_fractional) else TimeInForce.GTC
+                order = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=tif)
+                logger.warning("[EXECUTION AGENT] No quote available — falling back to MARKET order for %s", symbol)
 
             result = trading_client.submit_order(order_data=order)
-            order_id   = str(result.id)
-            fill_price = float(result.filled_avg_price) if result.filled_avg_price else s_price
+            order_id = str(result.id)
+
+            # IOC limit orders that don't fill return canceled/expired — treat as not executed.
+            if limit_price and str(getattr(result, "status", "")).lower() in ("canceled", "expired"):
+                logger.warning(
+                    "[EXECUTION AGENT] IOC limit order %s %s unfilled (status=%s) — aborting",
+                    action, symbol, result.status,
+                )
+                self._persist_async(
+                    bot_id=bot_id, symbol=symbol, action=action,
+                    confidence=approved_signal.get("confidence", 0.0),
+                    order_id=order_id, fill_price=0.0, slippage=0.0,
+                    status="FAILED",
+                    failure_reason=f"IOC limit order unfilled: status={result.status}",
+                )
+                return None
+
+            filled_avg   = result.filled_avg_price
+            # Limit/market orders on paper may return pending_new before fill — one re-fetch gets the real price.
+            if not filled_avg:
+                try:
+                    filled_order = trading_client.get_order_by_id(order_id)
+                    filled_avg   = filled_order.filled_avg_price
+                except Exception as _fe:
+                    logger.debug("[EXECUTION AGENT] Order re-fetch failed for %s: %s", order_id, _fe)
+            fill_price = float(filled_avg) if filled_avg else s_price
             slippage   = abs(fill_price - s_price)
             slip_pct   = (slippage / s_price * 100) if s_price > 0 else 0.0
 
@@ -288,6 +371,7 @@ class ExecutionAgent:
 
         except Exception as e:
             failure_reason = str(e)
+            self.last_error = failure_reason
             logger.error("[EXECUTION AGENT] Submission failed for %s %s: %s", action, symbol, failure_reason)
             self._persist_async(
                 bot_id=bot_id,
@@ -455,6 +539,10 @@ class ExecutionAgent:
                 mispricing_z_score=approved_signal.get("mispricing_z_score"),
                 xgboost_prob=approved_signal.get("xgboost_prob"),
                 signal_features=approved_signal.get("signal_features"),
+                contract_symbol=contract_symbol,
+                option_type=option_type,
+                strike_price=strike,
+                expiry_days=expiry_days,
             )
 
             return ExecutionResult(
@@ -504,6 +592,10 @@ class ExecutionAgent:
         signal_features: list | None = None,
         bid_price: float = 0.0,
         ask_price: float = 0.0,
+        contract_symbol: str | None = None,
+        option_type: str | None = None,
+        strike_price: float | None = None,
+        expiry_days: int | None = None,
     ):
         """
         Spawns a background coroutine to write SignalRecord + ExecutionRecord.
@@ -533,6 +625,10 @@ class ExecutionAgent:
                     signal_features=signal_features,
                     bid_price=bid_price,
                     ask_price=ask_price,
+                    contract_symbol=contract_symbol,
+                    option_type=option_type,
+                    strike_price=strike_price,
+                    expiry_days=expiry_days,
                 ))
         except RuntimeError:
             # No running event loop (e.g. in tests) — skip persistence
@@ -559,13 +655,31 @@ class ExecutionAgent:
         signal_features: list | None = None,
         bid_price: float = 0.0,
         ask_price: float = 0.0,
+        contract_symbol: str | None = None,
+        option_type: str | None = None,
+        strike_price: float | None = None,
+        expiry_days: int | None = None,
     ):
         """Writes SignalRecord, ExecutionRecord, and MarketConditionSnapshot to SQLite."""
         try:
             from db.database import _get_session_factory
             from db.models import SignalRecord, ExecutionRecord, MarketConditionSnapshot
 
-            asset_class = "CRYPTO" if "/" in symbol else "EQUITY"
+            import re as _re
+            _CRYPTO_RE = _re.compile(r'^[A-Z]{2,6}(USD[TC]?|BTC|ETH)$')
+            _OPT_ACTIONS = {"BUY_CALL", "SELL_CALL", "BUY_PUT", "SELL_PUT"}
+            if action.upper() in _OPT_ACTIONS:
+                asset_class = "OPTIONS"
+            elif "/" in symbol or bool(_CRYPTO_RE.match(symbol)):
+                asset_class = "CRYPTO"
+            else:
+                asset_class = "EQUITY"
+
+            # Derive ISO expiry date from expiry_days offset if provided
+            expiry_date: str | None = None
+            if expiry_days is not None:
+                from datetime import date, timedelta
+                expiry_date = (date.today() + timedelta(days=expiry_days)).isoformat()
 
             async with _get_session_factory()() as session:
                 sig = SignalRecord(
@@ -597,6 +711,10 @@ class ExecutionAgent:
                     asset_class=asset_class,
                     bid_price=bid_price if bid_price > 0 else None,
                     ask_price=ask_price if ask_price > 0 else None,
+                    contract_symbol=contract_symbol,
+                    option_type=option_type,
+                    strike_price=strike_price,
+                    expiry_date=expiry_date,
                 )
                 session.add(exe)
                 await session.flush()  # populate exe.id

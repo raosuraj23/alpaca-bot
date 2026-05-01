@@ -423,6 +423,17 @@ async def equity_stream_manager(write_closed_trade_fn=None):
                         _push_log(
                             f"[RISK AGENT] ✓ Approved {approved['action']} {symbol} qty={approved['qty']:.6f} notional=${approved.get('notional', 0):.2f}"
                         )
+                        _push_reflection({
+                            "type":          "decision",
+                            "strategy":      signal["bot"],
+                            "action":        approved["action"],
+                            "symbol":        symbol,
+                            "confidence":    signal["confidence"],
+                            "qty":           approved["qty"],
+                            "kelly_fraction": approved.get("kelly_fraction", 0),
+                            "meta":          signal.get("meta", {}),
+                            "timestamp":     bar.timestamp.isoformat(),
+                        })
                         if trading_client:
                             exec_result = execution_agent.execute(approved, signal_price=signal_price)
                             if exec_result:

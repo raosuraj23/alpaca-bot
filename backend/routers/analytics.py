@@ -1,4 +1,6 @@
 import logging
+import re
+from datetime import timezone as _utc
 from fastapi import APIRouter
 from deps import get_trading_client, trading_client
 from core.state import _entry_prices, _entry_times
@@ -6,11 +8,45 @@ from core.state import _entry_prices, _entry_times
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
+_PERIOD_DAYS = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180, "ALL": 36500}
 
-def _infer_asset_class(symbol: str | None, stored: str | None = None) -> str:
+# Matches Alpaca crypto order symbols: e.g. BTCUSD, LTCUSD, DOGEUSDT, MATICUSD
+_CRYPTO_SYMBOL_RE = re.compile(r'^[A-Z]{2,6}(USD[TC]?|BTC|ETH)$')
+
+
+def _avg(vals):
+    filtered = [v for v in vals if v is not None]
+    return round(sum(filtered) / len(filtered), 4) if filtered else None
+
+
+def _fmt_ts(ts) -> str | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=_utc.utc)
+    return ts.isoformat().replace("+00:00", "Z")
+
+
+def _is_crypto_symbol(symbol: str | None) -> bool:
+    if not symbol:
+        return False
+    return "/" in symbol or bool(_CRYPTO_SYMBOL_RE.match(symbol))
+
+
+_OPTIONS_ACTIONS = frozenset({"BUY_CALL", "SELL_CALL", "BUY_PUT", "SELL_PUT"})
+
+
+def _infer_asset_class(symbol: str | None, stored: str | None = None, action: str | None = None) -> str:
+    if action and action.upper() in _OPTIONS_ACTIONS:
+        return "OPTIONS"
+    if stored == "OPTIONS":
+        return "OPTIONS"
+    # Re-detect from symbol to correct legacy records stored as EQUITY for crypto pairs
+    if _is_crypto_symbol(symbol):
+        return "CRYPTO"
     if stored:
         return stored
-    return "CRYPTO" if symbol and "/" in symbol else "EQUITY"
+    return "EQUITY"
 
 @router.get("/ledger")
 async def get_ledger(limit: int = 50):
@@ -51,14 +87,214 @@ async def get_ledger(limit: int = 50):
                 "slippage": r.slippage,
                 "slippage_bps": round(r.slippage / r.fill_price * 10000, 2) if r.fill_price else None,
                 "confidence": r.confidence,
-                "asset_class": _infer_asset_class(r.symbol, r.asset_class),
-                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "asset_class": _infer_asset_class(r.symbol, r.asset_class, action=r.action),
+                "timestamp": _fmt_ts(r.timestamp),
             }
             for r in rows
         ]
     except Exception as e:
         logger.error("[LEDGER] %s", e)
         return []
+
+
+@router.post("/backfill-fill-prices")
+async def backfill_fill_prices():
+    """
+    Two-phase repair:
+
+    Phase 1 — Fix fill_price = 0 ExecutionRecords by fetching filled_avg_price
+    from Alpaca using the stored alpaca_order_id. Recalculates ClosedTrade exit
+    metrics for any linked exit leg.
+
+    Phase 2 — Reconcile stale _entry_prices entries. For every (bot, symbol) the
+    bot believes is still open, check against Alpaca's actual positions. If the
+    position is gone, find the closing SELL order in Alpaca's history, write or
+    patch the ClosedTrade record, and purge the stale entry from memory + disk.
+    """
+    import asyncio
+    from decimal import Decimal
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from db.database import _get_session_factory
+    from db.models import ExecutionRecord, ClosedTrade
+
+    client = get_trading_client()
+    if not client:
+        return {"error": "trading client unavailable", "updated": 0, "skipped": 0, "reconciled": 0}
+
+    factory  = _get_session_factory()
+    updated  = 0
+    skipped  = 0
+
+    # ------------------------------------------------------------------
+    # Phase 1: fix fill_price = 0 on FILLED ExecutionRecords
+    # ------------------------------------------------------------------
+    async with factory() as session:
+        stmt = select(ExecutionRecord).where(
+            ExecutionRecord.fill_price == Decimal("0"),
+            ExecutionRecord.alpaca_order_id.isnot(None),
+            ExecutionRecord.status == "FILLED",
+        )
+        zero_records = (await session.execute(stmt)).scalars().all()
+
+    for rec in zero_records:
+        try:
+            order = await asyncio.to_thread(client.get_order_by_id, rec.alpaca_order_id)
+            raw = order.filled_avg_price
+        except Exception as e:
+            logger.warning("[BACKFILL P1] Alpaca fetch failed for %s: %s", rec.alpaca_order_id[:8], e)
+            skipped += 1
+            continue
+
+        if not raw:
+            skipped += 1
+            continue
+
+        actual = Decimal(str(raw))
+        async with factory() as session:
+            row = await session.get(ExecutionRecord, rec.id)
+            if row is None:
+                skipped += 1
+                continue
+            row.fill_price = actual
+            row.slippage   = Decimal("0")
+
+            ct_stmt = select(ClosedTrade).where(ClosedTrade.exit_execution_id == rec.id)
+            ct = (await session.execute(ct_stmt)).scalar_one_or_none()
+            if ct is not None:
+                entry = Decimal(str(ct.avg_entry_price or 0))
+                qty   = Decimal(str(ct.qty or 0))
+                pnl   = (actual - entry) * qty
+                ct.avg_exit_price = actual
+                ct.realized_pnl   = pnl
+                ct.net_pnl        = pnl
+                ct.win            = pnl > 0
+
+            await session.commit()
+            updated += 1
+            logger.info("[BACKFILL P1] Fixed id=%d %s → %s", rec.id, rec.alpaca_order_id[:8], actual)
+
+    # ------------------------------------------------------------------
+    # Phase 2: reconcile stale _entry_prices against live Alpaca positions
+    # ------------------------------------------------------------------
+    from core.state import _entry_prices, _entry_times, persist_entry_prices
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+
+    # Build set of symbols currently open in Alpaca (normalised, no slash)
+    live_norm: set[str] = set()
+    try:
+        for p in await asyncio.to_thread(client.get_all_positions):
+            live_norm.add(str(p.symbol).upper().replace("/", ""))
+    except Exception as e:
+        logger.warning("[BACKFILL P2] Could not fetch live positions: %s", e)
+        return {"updated": updated, "skipped": skipped, "reconciled": 0}
+
+    # Fetch closed SELL orders from Alpaca (up to 500) for exit price lookup
+    sell_orders: dict[str, list] = {}   # norm_symbol → [order, ...]
+    try:
+        orders = await asyncio.to_thread(
+            client.get_orders,
+            filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500),
+        )
+        for o in orders:
+            if o.filled_avg_price is None:
+                continue
+            if str(o.side).split(".")[-1].upper() != "SELL":
+                continue
+            norm = str(o.symbol).upper().replace("/", "")
+            sell_orders.setdefault(norm, []).append(o)
+    except Exception as e:
+        logger.warning("[BACKFILL P2] Could not fetch closed orders: %s", e)
+
+    reconciled = 0
+    stale_keys: list[tuple] = []
+
+    for (bot, sym), entry_price in list(_entry_prices.items()):
+        norm = sym.upper().replace("/", "")
+        if norm in live_norm:
+            continue    # still open — leave it alone
+
+        stale_keys.append((bot, sym))
+
+        # Parse entry time for chronological matching
+        entry_time: datetime | None = None
+        entry_time_str = _entry_times.get((bot, sym))
+        if entry_time_str:
+            try:
+                entry_time = datetime.fromisoformat(entry_time_str)
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+
+        # Find best matching SELL order: filled after entry_time, earliest first
+        candidates = sell_orders.get(norm, [])
+        if entry_time:
+            candidates = [o for o in candidates if o.filled_at and o.filled_at >= entry_time]
+        candidates = sorted(candidates, key=lambda o: o.filled_at or datetime.min.replace(tzinfo=timezone.utc))
+        sell = candidates[0] if candidates else None
+
+        exit_price = float(sell.filled_avg_price) if sell else float(entry_price)
+        exit_time  = sell.filled_at if sell else None
+        qty_val    = float(sell.filled_qty or 0) if sell else 0.0
+        pnl        = (exit_price - float(entry_price)) * qty_val
+
+        async with factory() as session:
+            # Find existing ClosedTrade for this bot+symbol with no exit recorded
+            ct_stmt = select(ClosedTrade).where(
+                ClosedTrade.bot_id == bot,
+                ClosedTrade.symbol == sym,
+            ).order_by(ClosedTrade.id.desc()).limit(1)
+            ct = (await session.execute(ct_stmt)).scalar_one_or_none()
+
+            if ct and (ct.avg_exit_price is None or float(ct.avg_exit_price or 0) == 0):
+                ct.avg_exit_price = Decimal(str(exit_price))
+                ct.exit_time      = exit_time
+                ct.realized_pnl   = Decimal(str(round(pnl, 8)))
+                ct.net_pnl        = Decimal(str(round(pnl, 8)))
+                ct.win            = pnl > 0
+                if qty_val > 0:
+                    ct.qty = Decimal(str(qty_val))
+            elif not ct:
+                ct_entry = None
+                if entry_time_str:
+                    try:
+                        ct_entry = datetime.fromisoformat(entry_time_str)
+                        if ct_entry.tzinfo is None:
+                            ct_entry = ct_entry.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                session.add(ClosedTrade(
+                    bot_id          = bot,
+                    symbol          = sym,
+                    qty             = Decimal(str(qty_val)),
+                    avg_entry_price = Decimal(str(entry_price)),
+                    avg_exit_price  = Decimal(str(exit_price)),
+                    entry_time      = ct_entry,
+                    exit_time       = exit_time,
+                    realized_pnl    = Decimal(str(round(pnl, 8))),
+                    net_pnl         = Decimal(str(round(pnl, 8))),
+                    win             = pnl > 0,
+                    asset_class     = "CRYPTO" if _is_crypto_symbol(sym) else "EQUITY",
+                ))
+            else:
+                # ClosedTrade already has a valid exit — just purge the stale key
+                pass
+
+            await session.commit()
+            reconciled += 1
+            logger.info("[BACKFILL P2] Reconciled %s/%s exit=%.4f pnl=%.4f", bot, sym, exit_price, pnl)
+
+    # Purge stale keys from memory and persist to disk
+    for key in stale_keys:
+        _entry_prices.pop(key, None)
+        _entry_times.pop(key, None)
+    if stale_keys:
+        persist_entry_prices(_entry_prices, _entry_times)
+        logger.info("[BACKFILL P2] Purged %d stale entries from _entry_prices", len(stale_keys))
+
+    return {"updated": updated, "skipped": skipped, "reconciled": reconciled}
 
 
 @router.get("/reflections")
@@ -197,14 +433,16 @@ async def get_performance(period: str = "1M"):
         realized_trades = []
         formula_metrics = {}
         total_trades = 0
+        brier_score = None
         try:
             from db.database import _get_session_factory as _gsf
-            from db.models import ClosedTrade as _CT
+            from db.models import ClosedTrade as _CT, CalibrationRecord as _CR
             from sqlalchemy import select as _sel, func as _func
 
             async with _gsf()() as _s:
                 _ct_rows = (await _s.execute(_sel(_CT).order_by(_CT.exit_time))).scalars().all()
                 total_trades = (await _s.execute(_sel(_func.count()).select_from(_CT))).scalar() or 0
+                _cal_rows = (await _s.execute(_sel(_CR))).scalars().all()
 
             for _r in _ct_rows:
                 realized_trades.append({
@@ -215,34 +453,19 @@ async def get_performance(period: str = "1M"):
                 })
 
             if _ct_rows:
-                def _avg(vals):
-                    filtered = [v for v in vals if v is not None]
-                    return round(sum(filtered) / len(filtered), 4) if filtered else None
-
                 formula_metrics = {
                     "avg_ev": _avg([float(r.entry_ev) for r in _ct_rows if r.entry_ev is not None]),
                     "avg_kelly": _avg([float(r.entry_kelly) for r in _ct_rows if r.entry_kelly is not None]),
                     "avg_market_edge": _avg([float(r.entry_edge) for r in _ct_rows if r.entry_edge is not None]),
                     "avg_brier": _avg([float(r.brier_contribution) for r in _ct_rows if r.brier_contribution is not None]),
                 }
-        except Exception as _rt_exc:
-            logger.debug("[PERFORMANCE] ClosedTrade fetch failed: %s", _rt_exc)
-
-        brier_score = None
-        try:
-            from db.database import _get_session_factory as _gsf
-            from db.models import CalibrationRecord as _CR
-            from sqlalchemy import select as _sel2
-
-            async with _gsf()() as _s:
-                _cal_rows = (await _s.execute(_sel2(_CR))).scalars().all()
 
             if _cal_rows:
                 brier_score = round(
                     sum(float(r.brier_contribution or 0) for r in _cal_rows) / len(_cal_rows), 4
                 )
-        except Exception as _be:
-            logger.debug("[PERFORMANCE] brier_score fetch failed: %s", _be)
+        except Exception as _rt_exc:
+            logger.debug("[PERFORMANCE] DB fetch failed: %s", _rt_exc)
 
         return {
             "history": curve,
@@ -322,15 +545,27 @@ async def get_signals_analytics(period: str = "1D"):
     from db.models import SignalRecord, CalibrationRecord
     from sqlalchemy import select as _sel
 
-    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180, "ALL": 36500}
-    days = period_days.get(period.upper(), 1)
+    days = _PERIOD_DAYS.get(period.upper(), 1)
     cutoff = _dt.now(_tz.utc) - timedelta(days=days)
 
     try:
+        from db.models import ClosedTrade
+        from sqlalchemy import func as _func
         async with _get_session_factory()() as session:
             sig_rows = (await session.execute(
                 _sel(SignalRecord).where(SignalRecord.timestamp >= cutoff)
             )).scalars().all()
+            cal_rows = (await session.execute(
+                _sel(CalibrationRecord).where(CalibrationRecord.timestamp >= cutoff)
+            )).scalars().all()
+            pnl_rows = (await session.execute(
+                _sel(
+                    ClosedTrade.bot_id,
+                    ClosedTrade.win,
+                    _func.sum(ClosedTrade.net_pnl).label("total_pnl"),
+                    _func.avg(ClosedTrade.net_pnl).label("avg_pnl"),
+                ).where(ClosedTrade.exit_time >= cutoff).group_by(ClosedTrade.bot_id, ClosedTrade.win)
+            )).all()
 
         edges, mispricings, bayes_updates, arb_flags = [], [], [], []
         for r in sig_rows:
@@ -344,27 +579,7 @@ async def get_signals_analytics(period: str = "1D"):
                 bayes_updates.append(xp / mp)
                 arb_flags.append(1 if xp > mp else 0)
 
-        def _avg(vals):
-            return round(sum(vals) / len(vals), 4) if vals else None
-
         arb_score = round(sum(arb_flags) / len(arb_flags), 4) if arb_flags else None
-
-        async with _get_session_factory()() as session:
-            cal_rows = (await session.execute(
-                _sel(CalibrationRecord).where(CalibrationRecord.timestamp >= cutoff)
-            )).scalars().all()
-
-        from db.models import ClosedTrade
-        from sqlalchemy import func as _func
-        async with _get_session_factory()() as session:
-            pnl_rows = (await session.execute(
-                _sel(
-                    ClosedTrade.bot_id,
-                    ClosedTrade.win,
-                    _func.sum(ClosedTrade.net_pnl).label("total_pnl"),
-                    _func.avg(ClosedTrade.net_pnl).label("avg_pnl"),
-                ).where(ClosedTrade.exit_time >= cutoff).group_by(ClosedTrade.bot_id, ClosedTrade.win)
-            )).all()
 
         pnl_by_bot: dict = {}
         avg_win_pnl: dict = {}
@@ -447,8 +662,7 @@ async def get_signals_analytics(period: str = "1D"):
 async def get_llm_cost(period: str = "1M"):
     from datetime import datetime, timedelta, timezone
 
-    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180}
-    days_back = period_days.get(period.upper(), 30)
+    days_back = _PERIOD_DAYS.get(period.upper(), 30)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
 
     alpaca_period_map = {
@@ -549,8 +763,7 @@ async def get_llm_cost(period: str = "1M"):
 async def get_llm_breakdown(period: str = "1M"):
     from datetime import datetime, timedelta, timezone
 
-    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180}
-    days_back = period_days.get(period.upper(), 30)
+    days_back = _PERIOD_DAYS.get(period.upper(), 30)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
 
     try:
@@ -695,10 +908,16 @@ async def get_realized_pnl():
             except Exception:
                 pass
 
+        alpaca_ok = bool(live_positions)  # True when get_all_positions() succeeded
+
         open_positions = []
         for (bot, sym), price in _entry_prices.items():
             entry_time = _entry_times.get((bot, sym))
             qty = live_positions.get(sym)
+
+            if alpaca_ok and qty is None:
+                logger.info("[OPEN_POSITIONS] Skipping stale entry (%s, %s) — not in Alpaca live positions", bot, sym)
+                continue
 
             open_positions.append({
                 "strategy": bot,
@@ -802,8 +1021,7 @@ async def get_signals_by_asset_class(period: str = "1D"):
     from db.models import SignalRecord, ClosedTrade
     from sqlalchemy import select as _sel, func as _func
 
-    period_days = {"1D": 1, "1W": 7, "1M": 30, "YTD": 180, "ALL": 36500}
-    days = period_days.get(period.upper(), 1)
+    days = _PERIOD_DAYS.get(period.upper(), 1)
     cutoff = _dt.now(_tz.utc) - timedelta(days=days)
 
     try:

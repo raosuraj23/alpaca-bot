@@ -122,7 +122,6 @@ async def _portfolio_snapshot_loop():
             total_equity = cash_balance = unrealized_pnl = realized_pnl_day = 0.0
             if trading_client:
                 try:
-                    import asyncio
                     acc = await asyncio.to_thread(trading_client.get_account)
                     total_equity = float(getattr(acc, "equity", None) or 0.0)
                     cash_balance = float(getattr(acc, "cash", None) or 0.0)
@@ -191,7 +190,9 @@ async def _write_closed_trade(
     realized_pnl = (exit_price - entry_price) * qty if direction == "LONG" else (entry_price - exit_price) * qty
     win = realized_pnl > 0
 
-    asset_class      = "CRYPTO" if "/" in symbol else "EQUITY"
+    import re as _re2
+    _CRYPTO_RE2 = _re2.compile(r'^[A-Z]{2,6}(USD[TC]?|BTC|ETH)$')
+    asset_class      = "CRYPTO" if ("/" in symbol or bool(_CRYPTO_RE2.match(symbol))) else "EQUITY"
     entry_confidence: float | None = None
 
     entry_ev = entry_kelly = entry_edge = brier_contrib = None
@@ -229,6 +230,12 @@ async def _write_closed_trade(
             await _s.commit()
     except Exception as e:
         logger.warning("[CLOSED TRADE] Failed to persist: %s", e)
+        return
+
+    global _xgb_trade_counter
+    _xgb_trade_counter += 1
+    if _xgb_trade_counter % 25 == 0:
+        asyncio.create_task(_retrain_xgboost_if_ready())
 
 
 # ==========================================
@@ -240,6 +247,21 @@ _stock_stream_task: Optional[asyncio.Task] = None
 _ai_reflection_task: Optional[asyncio.Task] = None
 _scanner_task: Optional[asyncio.Task] = None
 _research_task: Optional[asyncio.Task] = None
+
+# Counter for XGBoost auto-retrain trigger (every 25 closed trades)
+_xgb_trade_counter: int = 0
+
+
+async def _retrain_xgboost_if_ready() -> None:
+    try:
+        from predict.xgboost_classifier import xgb_classifier
+        trained = await asyncio.to_thread(xgb_classifier.train)
+        if trained:
+            logger.info("[XGBOOST] Auto-retrain complete")
+        else:
+            logger.debug("[XGBOOST] Auto-retrain skipped (insufficient data)")
+    except Exception as _xe:
+        logger.debug("[XGBOOST] Auto-retrain error: %s", _xe)
 
 
 @app.on_event("startup")
@@ -318,11 +340,12 @@ async def startup_event():
 
     from quant.data_buffer import market_buffer as _mb
 
-    def _scanner_push(data: dict) -> None:
-        _push_reflection(data)
-        if data.get("type") != "discover":
-            return
-        symbols: list[str] = data.get("symbols", [])
+    def _scanner_push_symbols(symbols: list) -> None:
+        """Subscribe the engine and live WebSocket streams to a list of symbols.
+
+        Called by both the TIER 1 'discover' event and the TIER 2 on_universe_update
+        callback so every scan cycle can expand coverage without a restart.
+        """
         if not symbols:
             return
         crypto_syms = {s for s in symbols if s.endswith("/USD")}
@@ -367,6 +390,12 @@ async def startup_event():
                         logger.warning("[SCANNER→EQUITY STREAM] Subscribe failed: %s", _e)
             logger.info("[SCANNER→ENGINE] Equity symbols updated: %s", equity_syms)
 
+    def _scanner_push(data: dict) -> None:
+        _push_reflection(data)
+        if data.get("type") != "discover":
+            return
+        _scanner_push_symbols(data.get("symbols", []))
+
     # Research Agent
     from agents.research_agent import ResearchAgent
     _research_agent = ResearchAgent(
@@ -385,6 +414,7 @@ async def startup_event():
         get_buffer_fn=lambda: _mb,
         get_research_fn=lambda: _research_agent,
         set_equity_symbols_fn=lambda syms: master_engine.set_active_equity_symbols(set(syms)),
+        on_universe_update=_scanner_push_symbols,
     )
     _core_state.scanner_agent = _scanner_agent   # exposes to /api/watchlist and /api/watchlist/scan
     _scanner_task = asyncio.create_task(_scanner_agent.run())
@@ -443,6 +473,76 @@ async def startup_event():
             logger.info("[PREDICT] XGBoost startup training skipped: %s", _xgb_err)
 
     asyncio.create_task(_xgb_startup_train())
+
+    # Stop-loss monitor — fires SELL when any position loses > 1.5% from entry
+    _STOP_LOSS_PCT = 0.015
+
+    async def _stop_loss_monitor_task():
+        await asyncio.sleep(30)
+        while True:
+            await asyncio.sleep(60)
+            try:
+                from core.state import _entry_prices
+                if not _entry_prices or not trading_client:
+                    continue
+                positions = await asyncio.to_thread(trading_client.get_all_positions)
+                pos_by_symbol = {p.symbol.replace("/", ""): p for p in positions}
+                checked: set[str] = set()
+                for (bot_id, symbol), entry in list(_entry_prices.items()):
+                    if not entry or entry <= 0:
+                        continue
+                    norm = symbol.replace("/", "")
+                    if norm in checked:
+                        continue
+                    pos = pos_by_symbol.get(norm)
+                    if pos is None:
+                        continue
+                    current = float(pos.current_price)
+                    loss_pct = (entry - current) / entry
+                    if loss_pct >= _STOP_LOSS_PCT:
+                        checked.add(norm)
+                        logger.warning(
+                            "[STOP-LOSS] %s entry=%.4f current=%.4f loss=%.2f%% — submitting market SELL",
+                            symbol, entry, current, loss_pct * 100,
+                        )
+                        try:
+                            from alpaca.trading.requests import MarketOrderRequest
+                            from alpaca.trading.enums import OrderSide, TimeInForce
+                            req = MarketOrderRequest(
+                                symbol=pos.symbol,
+                                qty=float(pos.qty),
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.DAY,
+                            )
+                            await asyncio.to_thread(trading_client.submit_order, req)
+                            logger.info("[STOP-LOSS] Market SELL submitted for %s qty=%s", symbol, pos.qty)
+                        except Exception as _sell_err:
+                            logger.warning("[STOP-LOSS] SELL submit failed for %s: %s", symbol, _sell_err)
+            except Exception as _mon_err:
+                logger.debug("[STOP-LOSS] Monitor error: %s", _mon_err)
+
+    asyncio.create_task(_stop_loss_monitor_task())
+    logger.info("[STOP-LOSS] Stop-loss monitor started (1.5%% threshold, 60s cadence)")
+
+    # Market lifecycle — auto-halt equity bots at close, resume at open
+    async def _market_lifecycle_task():
+        from strategy.equity_algorithms import _is_market_hours
+        last_state: bool | None = None
+        while True:
+            await asyncio.sleep(60)
+            now_open = _is_market_hours()
+            if now_open == last_state:
+                continue
+            last_state = now_open
+            if now_open:
+                logger.info("[LIFECYCLE] Market open — resuming equity bots")
+                master_engine.resume_all_equity_bots()
+            else:
+                logger.info("[LIFECYCLE] Market closed — halting equity bots")
+                master_engine.halt_all_equity_bots()
+
+    asyncio.create_task(_market_lifecycle_task())
+    logger.info("[LIFECYCLE] Market lifecycle task started")
 
 
 @app.get("/")

@@ -17,7 +17,7 @@ Never hardcode API keys. All credentials come from `.env` via pydantic-settings.
 
 ## 17. Gemini Model Version
 
-The canonical Gemini model is `gemini-2.5-flash` everywhere. Never use `gemini-2.0-flash` in any agent, factory, or cost-log string. This applies to all tiers: discovery, fast, signal, director, and standard fallback. Update all references whenever touching `agents/factory.py` or any file that logs a model name.
+The canonical Gemini model is `gemini-3.1-flash-lite-preview` everywhere (500 RPD free tier — higher than `gemini-2.5-flash`'s 20 RPD). Never use `gemini-2.0-flash` or `gemini-2.5-flash` in any agent, factory, or cost-log string. Update all references whenever touching `agents/factory.py` or any file that logs a model name.
 
 ---
 

@@ -49,6 +49,11 @@ class ExecutionRecord(Base):
     asset_class = Column(String(10), nullable=True)  # CRYPTO | EQUITY | OPTIONS
     bid_price = Column(Numeric(18, 8), nullable=True)   # best bid at submission time
     ask_price = Column(Numeric(18, 8), nullable=True)   # best ask at submission time
+    # Options-specific metadata (null for equity/crypto)
+    contract_symbol = Column(String(50), nullable=True)  # resolved OCC symbol e.g. AAPL230217C00160000
+    option_type     = Column(String(4),  nullable=True)  # "call" | "put"
+    strike_price    = Column(Numeric(18, 8), nullable=True)
+    expiry_date     = Column(String(20), nullable=True)  # ISO date from resolved contract
 
 # ---------------------------------------------------------
 # PNL & PORTFOLIO LAYER (NEW - FIXES THE BUG)
@@ -78,6 +83,10 @@ class ClosedTrade(Base):
     brier_contribution = Column(Numeric(8, 6), nullable=True)   # (confidence - outcome)^2
     asset_class        = Column(String(10), nullable=True)      # CRYPTO | EQUITY | OPTIONS
     confidence         = Column(Numeric(5, 4), nullable=True)   # signal confidence at entry
+    # Options-specific metadata (null for equity/crypto)
+    option_type  = Column(String(4),  nullable=True)  # "call" | "put"
+    strike_price = Column(Numeric(18, 8), nullable=True)
+    expiry_date  = Column(String(20), nullable=True)
 
 class PortfolioSnapshot(Base):
     """Time-series equity curve for fast UI rendering (bypasses Alpaca API limits)."""

@@ -104,6 +104,19 @@ class ExposureManager:
                 rejection_reason="Invalid equity or price"
             )
 
+        # SELL signals reduce exposure — skip Kelly sizing, use the signal's actual qty
+        if signal.get("action", "").upper() == "SELL":
+            sell_qty = float(signal.get("qty", 0.0))
+            logger.info("[EXPOSURE] SELL %s qty=%.9f (exit order — Kelly sizing skipped)", symbol, sell_qty)
+            return SizingResult(
+                kelly_fraction=0.0,
+                recommended_notional=round(sell_qty * price, 2),
+                recommended_qty=sell_qty,
+                var_check_passed=True,
+                var_limit=0.0,
+                rejection_reason=None,
+            )
+
         # --- Dynamic Kelly Fraction via calibration scalar ---
         # calibration_scalar returns [0.25, 0.50] based on rolling Brier Score.
         # Well-calibrated strategies earn higher position sizes; poor ones are capped at quarter-Kelly.
@@ -123,8 +136,9 @@ class ExposureManager:
         # --- Notional Calculation ---
         notional = account_equity * capped_kelly
 
-        # Apply hard caps
-        max_notional = min(account_equity * self.max_position_pct, self.max_position_usd)
+        # Apply hard caps — use bot's allocation_pct if present, else fall back to config max_position_pct
+        alloc_pct = signal.get("allocation_pct", self.max_position_pct) if isinstance(signal, dict) else self.max_position_pct
+        max_notional = min(account_equity * alloc_pct, self.max_position_usd)
         notional = min(notional, max_notional)
 
         # --- VaR Gate ---

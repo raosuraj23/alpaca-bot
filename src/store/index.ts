@@ -206,14 +206,16 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     }
 
     if (Array.isArray(posData)) {
+      const safeParse = (v: string | null | undefined, fallback = 0) =>
+        v != null ? (parseFloat(v) || fallback) : fallback;
       const mapped: PositionData[] = posData.map(p => ({
         id:            p.symbol,
         symbol:        p.symbol,
         side:          p.side.toUpperCase() as 'LONG' | 'SHORT',
-        size:          parseFloat(p.size),
-        entryPrice:    parseFloat(p.avg_entry_price ?? p.current_price),
-        markPrice:     parseFloat(p.current_price),
-        unrealizedPnl: parseFloat(p.unrealized_pnl),
+        size:          safeParse(p.size),
+        entryPrice:    safeParse(p.avg_entry_price ?? p.current_price),
+        markPrice:     p.current_price != null ? parseFloat(p.current_price) : NaN,
+        unrealizedPnl: safeParse(p.unrealized_pnl),
         realizedPnl:   0,
       }));
       set({ positions: mapped });
@@ -316,15 +318,17 @@ export const useTradingStore = create<TradingStore>((set, get) => ({
     }
 
     if (Array.isArray(posData)) {
+      const safeParse = (v: string | null | undefined, fallback = 0) =>
+        v != null ? (parseFloat(v) || fallback) : fallback;
       const mapped: PositionData[] = posData.map(p => ({
-        id:           p.symbol,
-        symbol:       p.symbol,
-        side:         p.side.toUpperCase() as 'LONG' | 'SHORT',
-        size:         parseFloat(p.size),
-        entryPrice:   parseFloat(p.avg_entry_price ?? p.current_price),
-        markPrice:    parseFloat(p.current_price),
-        unrealizedPnl: parseFloat(p.unrealized_pnl),
-        realizedPnl:  0,
+        id:            p.symbol,
+        symbol:        p.symbol,
+        side:          p.side.toUpperCase() as 'LONG' | 'SHORT',
+        size:          safeParse(p.size),
+        entryPrice:    safeParse(p.avg_entry_price ?? p.current_price),
+        markPrice:     p.current_price != null ? parseFloat(p.current_price) : NaN,
+        unrealizedPnl: safeParse(p.unrealized_pnl),
+        realizedPnl:   0,
       }));
       set({ positions: mapped });
     }
@@ -498,9 +502,13 @@ export function useTradingEngine() {
 
         // All reflection types go to learningHistory (observe, calculate, decision, learning)
         if (data.type) {
-          useTradingStore.setState(s => ({
-            learningHistory: [data, ...s.learningHistory].slice(0, 100)
-          }));
+          useTradingStore.setState(s => {
+            const top = s.learningHistory[0];
+            const key = `${data.timestamp}|${data.strategy}|${data.type}`;
+            const topKey = top ? `${top.timestamp}|${top.strategy}|${top.type}` : null;
+            if (key === topKey) return {};
+            return { learningHistory: [data, ...s.learningHistory].slice(0, 100) };
+          });
         }
         // Update strategy states from observe events
         if (data.type === 'observe' && data.state) {
@@ -548,8 +556,7 @@ export function useTradingEngine() {
     // Continuous polling — keep positions, orders, and ledger fresh
     const pollPositions = setInterval(() => {
       useTradingStore.getState().fetchPositions();
-      useTradingStore.getState().fetchStrategyStates();
-    }, 30_000); // 30s — positions + orders + account + strategy states
+    }, 30_000); // 30s — strategy states arrive via SSE observe events
 
     const pollLedger = setInterval(() => {
       useTradingStore.getState().fetchLedger();
@@ -570,12 +577,17 @@ export function useTradingEngine() {
       useTradingStore.setState({ scannerResults: d });
       const currentWl = useTradingStore.getState().watchlist;
       const existing = new Set(currentWl.map(t => t.symbol));
+      // Update asset_class on entries whose class changed (equity promoted to OPTIONS)
+      const updated = currentWl.map(t => {
+        const scan = d.find((r: any) => r?.symbol === t.symbol);
+        return scan?.asset_class && scan.asset_class !== t.asset_class
+          ? { ...t, asset_class: scan.asset_class }
+          : t;
+      });
       const newEntries = d
-        .filter(r => r?.symbol && !existing.has(r.symbol))
-        .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0 }));
-      if (newEntries.length > 0) {
-        useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
-      }
+        .filter((r: any) => r?.symbol && !existing.has(r.symbol))
+        .map((r: any) => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0, asset_class: r.asset_class }));
+      useTradingStore.setState({ watchlist: newEntries.length > 0 ? [...updated, ...newEntries] : updated });
     };
 
     // Poll watchlist scanner results every 5 min (matches backend scan cadence)

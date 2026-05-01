@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone, timedelta
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from config import (
     GEMINI_3_FLASH_MODEL, GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_2_5_FLASH_LITE_MODEL,
@@ -69,6 +70,12 @@ HISTORY_WINDOW = 6   # = 3 full turns
 # (matches quant.signals.MIN_BARS)
 _SIGNAL_MIN_BARS = 201
 
+# User message keywords that trigger a live Alpaca positions+account fetch
+_LIVE_FETCH_KEYWORDS: frozenset[str] = frozenset({
+    "position", "positions", "holding", "holdings", "balance",
+    "equity", "account", "sell", "buy", "liquidate", "close", "order",
+})
+
 
 class OrchestratorEngine:
     def __init__(self):
@@ -94,16 +101,16 @@ class OrchestratorEngine:
             )
 
         self._history.append(HumanMessage(content=user_text))
-        messages = [self.system_prompt] + self._history[-HISTORY_WINDOW:]
+        ctx = await self._build_context_message(user_text)
+        messages = [self.system_prompt, ctx] + self._history[-HISTORY_WINDOW:]
 
         try:
+            # --- Round 1: initial LLM response + command dispatch ---
             response = await self.model.ainvoke(messages)
             reply = response.content
-            self._history.append(AIMessage(content=reply))
             await _log_llm_cost(response, GEMINI_3_1_FLASH_LITE_MODEL,
                                 "orchestrator_chat", GEMINI_COST_IN, GEMINI_COST_OUT)
 
-            # Parse and execute any embedded commands; collect results
             commands = self._extract_commands(reply)
             results = []
             for cmd in commands:
@@ -111,11 +118,47 @@ class OrchestratorEngine:
                 if result:
                     results.append(result)
 
-            # Append execution results to the chat reply so the UI shows them
+            # --- Round 2: feed tool results back so LLM can act on them ---
             if results:
-                result_lines = "\n".join(f"→ {r}" for r in results)
-                reply = reply + f"\n\n**Execution Results:**\n{result_lines}"
+                result_text = "\n".join(f"→ {r}" for r in results)
+                followup_messages = (
+                    [self.system_prompt, ctx]
+                    + self._history[-HISTORY_WINDOW:]
+                    + [
+                        AIMessage(content=reply),
+                        HumanMessage(
+                            content=(
+                                f"[TOOL RESULTS]\n{result_text}\n\n"
+                                "Based on the above results, complete your response to the user. "
+                                "Follow the Trade Confirmation Protocol if applicable."
+                            )
+                        ),
+                    ]
+                )
+                followup_response = await self.model.ainvoke(followup_messages)
+                await _log_llm_cost(
+                    followup_response, GEMINI_3_1_FLASH_LITE_MODEL,
+                    "orchestrator_chat_followup", GEMINI_COST_IN, GEMINI_COST_OUT,
+                )
+                followup_reply = followup_response.content
 
+                followup_commands = self._extract_commands(followup_reply)
+                followup_results = []
+                for cmd in followup_commands:
+                    r = self._dispatch_command(cmd)
+                    if r:
+                        followup_results.append(r)
+
+                final_reply = followup_reply
+                if followup_results:
+                    lines = "\n".join(f"→ {r}" for r in followup_results)
+                    final_reply += f"\n\n**Execution Results:**\n{lines}"
+
+                self._history.append(AIMessage(content=final_reply))
+                return final_reply
+
+            # No command results — return round-1 reply as-is
+            self._history.append(AIMessage(content=reply))
             return reply
 
         except Exception as e:
@@ -126,6 +169,62 @@ class OrchestratorEngine:
         """Resets the conversation context window."""
         self._history = []
         logger.info("[ORCHESTRATOR] Conversation history cleared.")
+
+    async def _build_context_message(self, user_text: str) -> SystemMessage:
+        """Build a grounded context block injected before LLM inference.
+
+        Always includes cached bot/risk state. Fetches live Alpaca positions
+        and account only when user_text contains a trigger keyword.
+        """
+        from strategy.engine import master_engine
+        from agents.risk_agent import risk_agent
+        from agents.execution_agent import _get_trading_client
+
+        lines: list[str] = ["[LIVE CONTEXT — use this as ground truth, do not invent data]"]
+
+        try:
+            bot_states = master_engine.get_bot_states()
+            bot_summary = " | ".join(
+                f"{b['id']} {b['status']} {b['allocationPct']:.0f}%"
+                for b in bot_states[:8]
+            )
+            lines.append(f"Bot states: {bot_summary}")
+        except Exception:
+            lines.append("Bot states: unavailable")
+
+        try:
+            risk = risk_agent.get_risk_status()
+            lines.append(
+                f"Risk: kill_switch={risk.get('kill_switch_active', 'unknown')}  "
+                f"drawdown={risk.get('daily_drawdown_pct', 0):.2%}"
+            )
+        except Exception:
+            lines.append("Risk: unavailable")
+
+        lower = user_text.lower()
+        if any(kw in lower for kw in _LIVE_FETCH_KEYWORDS):
+            try:
+                tc = _get_trading_client()
+                if tc:
+                    positions = tc.get_all_positions()
+                    account = tc.get_account()
+                    pos_parts = [
+                        f"{p.symbol} qty={p.qty} price=${float(p.current_price or 0):.2f} "
+                        f"unreal_pl={float(p.unrealized_pl or 0):+.2f}"
+                        for p in positions
+                    ] or ["none"]
+                    lines.append(f"Positions (live): {' | '.join(pos_parts)}")
+                    lines.append(
+                        f"Account equity: ${float(account.equity):,.2f}  "
+                        f"buying_power: ${float(account.buying_power):,.2f}"
+                    )
+                else:
+                    lines.append("[Alpaca unavailable — do not fabricate position data]")
+            except Exception as exc:
+                logger.warning("[ORCHESTRATOR] Live fetch failed: %s", exc)
+                lines.append("[Alpaca unavailable — do not fabricate position data]")
+
+        return SystemMessage(content="\n".join(lines))
 
     # ------------------------------------------------------------------
     # Quant Signal Handoff — LLM Supervisor Node
@@ -212,10 +311,19 @@ class OrchestratorEngine:
             if kb_path.exists():
                 strategy = signal_event.get('bot', 'unknown')
                 lessons = []
+                _kb_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
                 with open(kb_path, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
                             item = json.loads(line)
+                            ts_str = item.get("timestamp", "")
+                            if ts_str:
+                                try:
+                                    item_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                    if item_ts < _kb_cutoff:
+                                        continue
+                                except ValueError:
+                                    pass
                             if item.get("strategy") == strategy and item.get("symbol") == asset:
                                 entry = item.get("knowledge_entry")
                                 if entry:
@@ -322,22 +430,15 @@ class OrchestratorEngine:
             gemini_decision, gemini_rationale = gemini_result
             secondary_decision, secondary_rationale = secondary_result
 
-            # AND logic: both must APPROVE; disagreement → REJECT
-            if gemini_decision == "APPROVED" and secondary_decision == "APPROVED":
+            # Primary-decisive: Gemini is authoritative; secondary vote is advisory only.
+            if gemini_decision == "APPROVED":
                 final_decision  = "APPROVED"
-                final_rationale = f"Primary: {gemini_rationale} | Secondary: {secondary_rationale}"
+                final_rationale = f"Primary approved | Secondary: {secondary_decision} ({secondary_rationale[:80]})"
+                if secondary_decision != "APPROVED":
+                    logger.info("[ORCHESTRATOR] Secondary dissent on %s (advisory only): %s", asset, secondary_rationale[:80])
             else:
-                final_decision = "REJECTED"
-                if gemini_decision != secondary_decision:
-                    final_rationale = (
-                        f"[VOTER DISAGREEMENT] Primary={gemini_decision} ({gemini_rationale}) | "
-                        f"Secondary={secondary_decision} ({secondary_rationale})"
-                    )
-                    logger.warning("[ORCHESTRATOR] Voter disagreement on %s: %s", asset, final_rationale)
-                else:
-                    final_rationale = (
-                        f"Both rejected — Primary: {gemini_rationale} | Secondary: {secondary_rationale}"
-                    )
+                final_decision  = "REJECTED"
+                final_rationale = f"Primary rejected: {gemini_rationale} | Secondary: {secondary_decision}"
 
             logger.info("[ORCHESTRATOR] Signal %s %s → ensemble: %s | %s",
                         asset, signal_ts, final_decision, final_rationale[:120])
@@ -500,7 +601,6 @@ class OrchestratorEngine:
         # Fetch equity early so we can parse percentage quantities
         equity = 0.0
         try:
-            from agents.execution_agent import _get_trading_client
             tc = _get_trading_client()
             if tc:
                 equity = float(tc.get_account().equity)
@@ -516,10 +616,22 @@ class OrchestratorEngine:
         # Get last known tick price for slippage calculation
         price = master_engine.get_last_price(symbol) or 0.0
 
+        # For SELL orders, fall back to Alpaca position's current_price when cache is cold
+        if price <= 0.0 and side == "SELL" and tc:
+            try:
+                norm = symbol.replace("/", "")
+                for p in tc.get_all_positions():
+                    if p.symbol.replace("/", "") == norm:
+                        price = float(p.current_price or 0.0)
+                        break
+            except Exception:
+                pass
+
         synthetic_signal = {
             "action":     side,
             "symbol":     symbol,
             "price":      price,
+            "qty":        qty,   # lets risk_agent SELL fast-path read the user-specified qty
             "confidence": 1.0,   # Manual orders always pass the confidence gate
             "bot":        "orchestrator",
             "meta":       {"reason": reason, "source": "manual"},
@@ -536,8 +648,9 @@ class OrchestratorEngine:
 
         exec_result = execution_agent.execute(approved, signal_price=price)
         if not exec_result:
-            logger.error("[ORCHESTRATOR] PLACE_ORDER execution failed — %s %s qty=%s", side, symbol, qty)
-            return {"error": "Execution failed — check trading_client and API keys."}
+            reason = getattr(execution_agent, "last_error", None) or "unknown error — check server logs"
+            logger.error("[ORCHESTRATOR] PLACE_ORDER execution failed — %s %s qty=%s: %s", side, symbol, qty, reason)
+            return {"error": f"Execution failed: {reason}"}
 
         logger.info(
             "[ORCHESTRATOR] PLACE_ORDER filled — order_id=%s %s %s qty=%.6f fill=%.2f slip=%.4f",

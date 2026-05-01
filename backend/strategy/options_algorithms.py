@@ -81,15 +81,15 @@ class CoveredCallStrategy(BaseStrategy):
 
     def __init__(self, bot_id="covered-call", name="Covered Call Writer", allocation=5, **kwargs):
         super().__init__(bot_id, name, allocation, "Covered Call", **kwargs)
-        self._ema_short:   dict[str, float] = {}
-        self._ema_long:    dict[str, float] = {}
-        self._prices:      dict[str, deque] = {}
-        self._avg_gain:    dict[str, float] = {}
-        self._avg_loss:    dict[str, float] = {}
-        self._rsi:         dict[str, float] = {}
-        self._rsi_init:    dict[str, bool]  = {}
-        self._cooldown:    dict[str, int]   = {}
-        self._call_open:   dict[str, bool]  = {}
+        self._ema_short:      dict[str, float] = {}
+        self._ema_long:       dict[str, float] = {}
+        self._rsi_prev_price: dict[str, float] = {}
+        self._rsi_ticks:      dict[str, int]   = {}
+        self._avg_gain:       dict[str, float] = {}
+        self._avg_loss:       dict[str, float] = {}
+        self._rsi:            dict[str, float] = {}
+        self._cooldown:       dict[str, int]   = {}
+        self._call_open:      dict[str, bool]  = {}
 
     def _update_ema(self, symbol: str, price: float):
         if symbol not in self._ema_short:
@@ -101,26 +101,34 @@ class CoveredCallStrategy(BaseStrategy):
         self._ema_long[symbol]  = price * a_l + self._ema_long[symbol]  * (1 - a_l)
 
     def _update_rsi(self, symbol: str, price: float):
-        if symbol not in self._prices:
-            self._prices[symbol]   = deque(maxlen=self.RSI_PERIOD + 1)
-            self._rsi_init[symbol] = False
-        self._prices[symbol].append(price)
-        if len(self._prices[symbol]) < self.RSI_PERIOD + 1:
+        """O(1) Wilder's smoothing — no deque, no list() conversion."""
+        if symbol not in self._rsi_prev_price:
+            self._rsi_prev_price[symbol] = price
+            self._avg_gain[symbol]       = 0.0
+            self._avg_loss[symbol]       = 0.0
+            self._rsi_ticks[symbol]      = 1
             return
-        if not self._rsi_init[symbol]:
-            changes = [self._prices[symbol][i+1] - self._prices[symbol][i]
-                       for i in range(self.RSI_PERIOD)]
-            self._avg_gain[symbol] = sum(c for c in changes if c > 0) / self.RSI_PERIOD
-            self._avg_loss[symbol] = sum(abs(c) for c in changes if c < 0) / self.RSI_PERIOD
-            self._rsi_init[symbol] = True
-        else:
-            pl = list(self._prices[symbol])
-            change = pl[-1] - pl[-2]
-            a = 1.0 / self.RSI_PERIOD
-            self._avg_gain[symbol] = self._avg_gain[symbol] * (1 - a) + max(0.0, change) * a
-            self._avg_loss[symbol] = self._avg_loss[symbol] * (1 - a) + max(0.0, -change) * a
-        loss = self._avg_loss[symbol]
-        self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
+
+        self._rsi_ticks[symbol] += 1
+        change = price - self._rsi_prev_price[symbol]
+        self._rsi_prev_price[symbol] = price
+
+        gain = max(0.0, change)
+        loss = max(0.0, -change)
+
+        if self._rsi_ticks[symbol] <= self.RSI_PERIOD:
+            self._avg_gain[symbol] += gain
+            self._avg_loss[symbol] += loss
+            if self._rsi_ticks[symbol] == self.RSI_PERIOD:
+                self._avg_gain[symbol] /= self.RSI_PERIOD
+                self._avg_loss[symbol] /= self.RSI_PERIOD
+            return
+
+        alpha = 1.0 / self.RSI_PERIOD
+        self._avg_gain[symbol] = self._avg_gain[symbol] * (1 - alpha) + gain * alpha
+        self._avg_loss[symbol] = self._avg_loss[symbol] * (1 - alpha) + loss * alpha
+        loss_val = self._avg_loss[symbol]
+        self._rsi[symbol] = 100.0 if loss_val == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss_val)
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():
@@ -209,15 +217,15 @@ class ProtectivePutStrategy(BaseStrategy):
 
     def __init__(self, bot_id="protective-put", name="Protective Put", allocation=3, **kwargs):
         super().__init__(bot_id, name, allocation, "Protective Put", **kwargs)
-        self._returns:    dict[str, deque] = {}
-        self._last_price: dict[str, float] = {}
-        self._rsi_prices: dict[str, deque] = {}
-        self._avg_gain:   dict[str, float] = {}
-        self._avg_loss:   dict[str, float] = {}
-        self._rsi:        dict[str, float] = {}
-        self._rsi_init:   dict[str, bool]  = {}
-        self._cooldown:   dict[str, int]   = {}
-        self._put_open:   dict[str, bool]  = {}
+        self._returns:        dict[str, deque] = {}
+        self._last_price:     dict[str, float] = {}
+        self._rsi_prev_price: dict[str, float] = {}
+        self._rsi_ticks:      dict[str, int]   = {}
+        self._avg_gain:       dict[str, float] = {}
+        self._avg_loss:       dict[str, float] = {}
+        self._rsi:            dict[str, float] = {}
+        self._cooldown:       dict[str, int]   = {}
+        self._put_open:       dict[str, bool]  = {}
         # Welford sliding-window state for returns variance
         self._w_mean: dict[str, float] = {}
         self._w_M2:   dict[str, float] = {}
@@ -262,26 +270,34 @@ class ProtectivePutStrategy(BaseStrategy):
         return (max(0.0, var) ** 0.5) * self.ANNUALISE_FACTOR
 
     def _update_rsi(self, symbol: str, price: float):
-        if symbol not in self._rsi_prices:
-            self._rsi_prices[symbol] = deque(maxlen=self.RSI_PERIOD + 1)
-            self._rsi_init[symbol]   = False
-        self._rsi_prices[symbol].append(price)
-        if len(self._rsi_prices[symbol]) < self.RSI_PERIOD + 1:
+        """O(1) Wilder's smoothing — no deque, no list() conversion."""
+        if symbol not in self._rsi_prev_price:
+            self._rsi_prev_price[symbol] = price
+            self._avg_gain[symbol]       = 0.0
+            self._avg_loss[symbol]       = 0.0
+            self._rsi_ticks[symbol]      = 1
             return
-        if not self._rsi_init[symbol]:
-            changes = [self._rsi_prices[symbol][i+1] - self._rsi_prices[symbol][i]
-                       for i in range(self.RSI_PERIOD)]
-            self._avg_gain[symbol] = sum(c for c in changes if c > 0) / self.RSI_PERIOD
-            self._avg_loss[symbol] = sum(abs(c) for c in changes if c < 0) / self.RSI_PERIOD
-            self._rsi_init[symbol] = True
-        else:
-            pl     = list(self._rsi_prices[symbol])
-            change = pl[-1] - pl[-2]
-            a      = 1.0 / self.RSI_PERIOD
-            self._avg_gain[symbol] = self._avg_gain[symbol] * (1 - a) + max(0.0, change) * a
-            self._avg_loss[symbol] = self._avg_loss[symbol] * (1 - a) + max(0.0, -change) * a
-        loss = self._avg_loss[symbol]
-        self._rsi[symbol] = 100.0 if loss == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss)
+
+        self._rsi_ticks[symbol] += 1
+        change = price - self._rsi_prev_price[symbol]
+        self._rsi_prev_price[symbol] = price
+
+        gain = max(0.0, change)
+        loss = max(0.0, -change)
+
+        if self._rsi_ticks[symbol] <= self.RSI_PERIOD:
+            self._avg_gain[symbol] += gain
+            self._avg_loss[symbol] += loss
+            if self._rsi_ticks[symbol] == self.RSI_PERIOD:
+                self._avg_gain[symbol] /= self.RSI_PERIOD
+                self._avg_loss[symbol] /= self.RSI_PERIOD
+            return
+
+        alpha = 1.0 / self.RSI_PERIOD
+        self._avg_gain[symbol] = self._avg_gain[symbol] * (1 - alpha) + gain * alpha
+        self._avg_loss[symbol] = self._avg_loss[symbol] * (1 - alpha) + loss * alpha
+        loss_val = self._avg_loss[symbol]
+        self._rsi[symbol] = 100.0 if loss_val == 0 else 100 - 100 / (1 + self._avg_gain[symbol] / loss_val)
 
     async def aanalyze(self, symbol: str, price: float) -> dict | None:
         if not _is_market_hours():

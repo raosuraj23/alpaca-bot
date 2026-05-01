@@ -12,8 +12,11 @@ reaching the ExecutionAgent. The RiskAgent enforces:
 import logging
 from dataclasses import dataclass
 
+from config import settings
 from risk.kill_switch import global_kill_switch
 from risk.exposure import exposure_manager, SizingResult
+
+_OPTIONS_ACTIONS = frozenset({"BUY_CALL", "SELL_CALL", "BUY_PUT", "SELL_PUT"})
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +73,15 @@ class RiskAgent:
                 var_check_passed=False, var_limit=0.0,
             )
 
-        # --- 2. Signal-level confidence + manual halt gate ---
+        # --- 2. Signal-level gate (confidence + asset-class halt checks) ---
         if not global_kill_switch.evaluate_signal(signal):
-            reason = f"Signal confidence {signal.get('confidence', 0):.2f} below minimum threshold"
+            ks = global_kill_switch.get_status()
+            symbol = signal.get("symbol", "")
+            is_crypto = "/" in symbol
+            if ks.get("triggered") or (not is_crypto and ks.get("triggered_equity")) or (is_crypto and ks.get("triggered_crypto")):
+                reason = ks.get("reason") or "Kill switch active"
+            else:
+                reason = f"Signal confidence {signal.get('confidence', 0):.2f} below minimum threshold"
             logger.warning("[RISK AGENT] Signal gate blocked — %s", reason)
             return RiskCheckResult(
                 passed=False, reason=reason,
@@ -92,7 +101,35 @@ class RiskAgent:
                 var_check_passed=False, var_limit=0.0,
             )
 
-        # --- 4. Position sizing ---
+        # --- 4. Options DTE gate (must precede sizing) ---
+        action = signal.get("action", "")
+        if action in _OPTIONS_ACTIONS:
+            meta = signal.get("meta") or {}
+            dte = int(meta.get("expiry_days", 999))
+            if dte < settings.min_days_to_expiry:
+                reason = f"Options DTE {dte} < minimum {settings.min_days_to_expiry}"
+                logger.warning("[RISK AGENT] %s %s blocked — %s", action, signal.get("symbol"), reason)
+                return RiskCheckResult(
+                    passed=False, reason=reason,
+                    kelly_fraction=0.0, recommended_notional=0.0, recommended_qty=0.0,
+                    var_check_passed=False, var_limit=0.0,
+                )
+
+        # --- 4b. Paper trading: options not supported by Alpaca paper environment ---
+        if settings.paper_trading and action in _OPTIONS_ACTIONS:
+            reason = (
+                f"Options signals are disabled in paper trading mode "
+                f"(action={action}, symbol={signal.get('symbol')}). "
+                "Switch to live trading or assign an equity strategy to this symbol."
+            )
+            logger.info("[RISK AGENT] Paper trading: blocked %s %s", action, signal.get("symbol"))
+            return RiskCheckResult(
+                passed=False, reason=reason,
+                kelly_fraction=0.0, recommended_notional=0.0, recommended_qty=0.0,
+                var_check_passed=False, var_limit=0.0,
+            )
+
+        # --- 5. Position sizing (Kelly sizing for BUY; ExposureManager returns signal qty for SELL) ---
         sizing: SizingResult = exposure_manager.size(signal, account_equity)
 
         if sizing.recommended_qty <= 0:

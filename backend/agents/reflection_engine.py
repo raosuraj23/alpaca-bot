@@ -16,10 +16,31 @@ import asyncio
 import json
 import logging
 import pathlib
+import re as _re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Optional
 from config import GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT
+
+# Patterns extracted from observed failure_log.jsonl adjustment strings
+_PARAM_PATTERNS = [
+    (r"confidence[_ ]threshold[^\d]+([\d.]+)", "confidence_threshold"),
+    (r"momentum[_ ]threshold[^\d]+([\d.]+)", "momentum_threshold"),
+    (r"rsi[_ ](?:threshold|level|oversold|overbought)[^\d]+([\d.]+)", "rsi_threshold"),
+    (r"stop[_\s]loss[^\d]+([\d.]+)", "stop_loss_pct"),
+    (r"position[_ ]size[^\d]+([\d.]+)", "max_position_pct"),
+    (r"min[_ ]profit[^\d]+([\d.]+)", "min_profit_to_exit_pct"),
+]
+
+
+def _parse_adjustment_string(text: str) -> dict | None:
+    """Parse natural-language adjustment suggestion into a parameter dict."""
+    result = {}
+    for pattern, key in _PARAM_PATTERNS:
+        m = _re.search(pattern, text, _re.IGNORECASE)
+        if m:
+            result[key] = float(m.group(1))
+    return result if result else None
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +95,7 @@ class ReflectionEngine:
         self._get_states = get_states_fn
         self._get_positions = get_positions_fn
         self._running = False
+        self._loss_counts: dict[str, int] = {}
 
     async def run(self):
         """Main background loop — runs both observation cadences concurrently."""
@@ -444,16 +466,27 @@ class ReflectionEngine:
                 if pm_result.get("knowledge_entry"):
                     self._append_knowledge(pm_result, execution_data, effective_cls)
                 
-                # Immediate Parameter Adjustment
                 adjustment = pm_result.get("adjustment")
-                if adjustment and isinstance(adjustment, dict):
-                    try:
-                        from strategy.engine import master_engine
-                        logger.info("[REFLECTION] Immediate parameter update for %s: %s", strategy, adjustment)
-                        master_engine.update_strategy_params(strategy, adjustment)
-                        asyncio.create_task(self._persist_bot_parameters(strategy, adjustment, "post_mortem"))
-                    except Exception as e:
-                        logger.warning("[REFLECTION] Failed to apply immediate parameter update: %s", e)
+                if adjustment:
+                    # LLM may return a plain string — parse it into a param dict
+                    if isinstance(adjustment, str):
+                        adjustment = _parse_adjustment_string(adjustment)
+                    if adjustment and isinstance(adjustment, dict):
+                        loss_key = f"{strategy}:{effective_cls}"
+                        self._loss_counts[loss_key] = self._loss_counts.get(loss_key, 0) + 1
+                        if self._loss_counts[loss_key] >= 3:
+                            try:
+                                from strategy.engine import master_engine
+                                logger.info("[REFLECTION] Applying param update for %s after %d losses: %s",
+                                            strategy, self._loss_counts[loss_key], adjustment)
+                                master_engine.update_strategy_params(strategy, adjustment)
+                                asyncio.create_task(self._persist_bot_parameters(strategy, adjustment, "post_mortem"))
+                                self._loss_counts[loss_key] = 0
+                            except Exception as e:
+                                logger.warning("[REFLECTION] Failed to apply parameter update: %s", e)
+                        else:
+                            logger.info("[REFLECTION] Deferring param update for %s (%d/3 losses)",
+                                        strategy, self._loss_counts[loss_key])
 
         # Push to SSE stream
         self._push({

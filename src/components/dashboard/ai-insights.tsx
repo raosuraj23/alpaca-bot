@@ -126,7 +126,7 @@ function NewsRow({ item }: { item: NewsItem }) {
     : null;
 
   return (
-    <div className="py-2 border-b border-[var(--border)]/40 last:border-b-0 group">
+    <div className="py-2 border-b border-[var(--border)]/30 last:border-b-0 group">
       <div className="flex items-start gap-2">
         <SentimentDot sentiment={item.sentiment ?? null} />
         <div className="flex-1 min-w-0">
@@ -164,8 +164,8 @@ function NewsRow({ item }: { item: NewsItem }) {
 // ---------------------------------------------------------------------------
 
 const URGENCY_COLOR: Record<string, string> = {
-  HIGH:   'var(--neon-red, #ff4d4d)',
-  MEDIUM: 'var(--neon-amber, #f59e0b)',
+  HIGH:   'var(--neon-red)',
+  MEDIUM: 'var(--warning)',
   LOW:    'var(--neon-green)',
 };
 
@@ -180,7 +180,7 @@ const TYPE_LABEL: Record<string, string> = {
 function ActionItemCard({ item }: { item: ActionItem }) {
   const urgencyColor = URGENCY_COLOR[item.urgency] ?? 'var(--muted-foreground)';
   return (
-    <div className="py-2.5 border-b border-[var(--border)]/40 last:border-b-0">
+    <div className="py-2.5 border-b border-[var(--border)]/30 last:border-b-0">
       <div className="flex items-start gap-2">
         <span
           className="inline-block w-1.5 h-1.5 rounded-sm shrink-0 mt-1"
@@ -199,6 +199,7 @@ function ActionItemCard({ item }: { item: ActionItem }) {
             <span
               className="text-xs font-mono tabular-nums ml-auto"
               style={{ color: urgencyColor, opacity: 0.7 }}
+              title="HIGH = immediate action required; MEDIUM = monitor closely; LOW = informational."
             >
               {item.urgency}
             </span>
@@ -308,14 +309,6 @@ export function AiInsights() {
     return () => clearInterval(interval);
   }, [fetchActionItems]);
 
-  const ageMinutes = commentary
-    ? Math.floor((Date.now() / 1000 - commentary.generated_at) / 60)
-    : null;
-
-  const actionsAgeMinutes = actionsTs > 0
-    ? Math.floor((Date.now() / 1000 - actionsTs) / 60)
-    : null;
-
   const handleRefresh = () => {
     if (activeSection === 'news') fetchNews();
     else if (activeSection === 'commentary') fetchCommentary(true);
@@ -328,6 +321,14 @@ export function AiInsights() {
     actionsLoading;
 
   if (!mounted) return null;
+
+  const ageMinutes = commentary
+    ? Math.floor((Date.now() / 1000 - commentary.generated_at) / 60)
+    : null;
+
+  const actionsAgeMinutes = actionsTs > 0
+    ? Math.floor((Date.now() / 1000 - actionsTs) / 60)
+    : null;
 
   return (
     <Card className="flex flex-col h-full">
@@ -364,7 +365,7 @@ export function AiInsights() {
             <Zap className="w-3 h-3" /> Actions
             {actionItems.length > 0 && (
               <span
-                className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-sm text-[10px] font-mono tabular-nums font-bold"
+                className="inline-flex items-center justify-center w-4 h-4 rounded-sm text-xs font-mono tabular-nums font-bold"
                 style={{ background: 'var(--kraken-purple)', color: 'var(--background)' }}
               >
                 {actionItems.length}

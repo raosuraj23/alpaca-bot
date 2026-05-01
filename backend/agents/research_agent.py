@@ -14,6 +14,7 @@ Responsibilities:
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import urllib.request
@@ -101,7 +102,7 @@ _RESEARCH_SYSTEM_PROMPT = (
 
 class ResearchAgent:
     RESEARCH_INTERVAL    = 1800   # 30 min between deep research cycles
-    BRIEF_TTL            = 2100   # 35 min — brief is 'fresh' for scanner injection
+    BRIEF_TTL            = 1680   # 28 min — expires before next 30-min cycle, no stale window
     WARMUP_DELAY         = 20     # seconds before first cycle
     BREAKING_THRESHOLD   = 0.75   # min confidence to forward as signal
 
@@ -134,6 +135,16 @@ class ResearchAgent:
             if ss.edge == 0.0 and ss.model_probability != 0.5:
                 ss.edge = ResearchAgent.compute_edge(ss.model_probability, ss.market_implied_probability)
 
+    @staticmethod
+    def _backfill_market_implied(brief: "ResearchBrief", mip_map: dict) -> None:
+        """Replace default 0.5 market_implied_probability with sigmoid(momentum_z) values.
+
+        mip_map: {symbol: market_implied_prob} computed from actual price data.
+        """
+        for ss in brief.sentiment_by_symbol:
+            if ss.symbol in mip_map:
+                ss.market_implied_probability = mip_map[ss.symbol]
+
     def get_latest_brief(self) -> Optional[ResearchBrief]:
         """Returns the most recent brief if it is still within TTL, else None."""
         if self._latest_brief is None or self._brief_ts is None:
@@ -143,10 +154,14 @@ class ResearchAgent:
 
     async def run(self) -> None:
         """Main 30-minute research loop."""
+        from strategy.equity_algorithms import _is_market_hours
         self._running = True
         await asyncio.sleep(self.WARMUP_DELAY)
         logger.info("[RESEARCH] Agent started — Gemini 2.5 Flash, 30-min cadence")
         while self._running:
+            if not _is_market_hours():
+                await asyncio.sleep(300)
+                continue
             try:
                 await self._run_research_cycle()
             except Exception as exc:
@@ -203,6 +218,23 @@ class ResearchAgent:
                         "confidence": confidence,
                         **self._compute_ta_fields(symbol),
                     }
+                    # XGBoost gate: breaking news must pass the same probability gate
+                    # as regular TA signals before reaching the orchestrator.
+                    try:
+                        from predict.feature_extractor import extract_features, compute_market_implied_prob
+                        from predict.xgboost_classifier import xgb_classifier
+                        _feats = extract_features(event)
+                        _mkt_p = compute_market_implied_prob(_feats)
+                        _gate  = xgb_classifier.gate(_feats, _mkt_p)
+                        if not _gate["approved"]:
+                            logger.info(
+                                "[RESEARCH] Breaking news %s rejected by XGBoost "
+                                "(p=%.3f edge=%.3f reason=%s)",
+                                symbol, _gate["xgboost_prob"], _gate["edge"], _gate["reason"],
+                            )
+                            continue
+                    except Exception as _xgb_exc:
+                        logger.debug("[RESEARCH] Breaking news XGBoost gate skipped: %s", _xgb_exc)
                     asyncio.create_task(self._signal_callback(event))
                     logger.info("[RESEARCH] Breaking signal: %s %.0f%% %s",
                                 symbol, confidence * 100, sig.get("sentiment"))
@@ -232,15 +264,22 @@ class ResearchAgent:
                 break
 
         buffer = self._get_buffer()
-        ta_summary = self._build_ta_summary(buffer)
+        ta_summary, mip_map = self._build_ta_summary(buffer)
         trade_perf = await self._fetch_recent_performance()
 
         brief = await self._gemini_deep_research(news_items, ta_summary, trade_perf)
         if brief is None:
             logger.debug("[RESEARCH] Cycle produced no brief (LLM unavailable)")
+            self._push({
+                "type":      "research",
+                "symbol":    "SYSTEM",
+                "text":      "[RESEARCH] Research cycle skipped — LLM unavailable or budget exhausted",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             return
 
         brief.generated_at = datetime.now(timezone.utc).isoformat()
+        self._backfill_market_implied(brief, mip_map)
         self._backfill_edge(brief)
         self._latest_brief = brief
         self._brief_ts     = datetime.now(timezone.utc)
@@ -317,6 +356,12 @@ class ResearchAgent:
 
         except Exception as exc:
             logger.warning("[RESEARCH] Gemini deep research failed: %s", exc)
+            self._push({
+                "type":      "research",
+                "symbol":    "SYSTEM",
+                "text":      f"[RESEARCH] Gemini API error — research paused: {type(exc).__name__}: {exc}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             return None
 
     async def _fetch_news_items(self) -> list[dict]:
@@ -384,10 +429,7 @@ class ResearchAgent:
                     if any(sym in combined for sym in bare):
                         items.append({"headline": title, "source": feed_name, "url": link})
 
-                logger.debug("[RESEARCH] RSS %s: %d relevant items", feed_name, sum(
-                    1 for _ in raw_items[:20]
-                    if any(sym in (_.findtext("title") or "").upper() for sym in bare)
-                ))
+                logger.debug("[RESEARCH] RSS %s: %d relevant items", feed_name, len(items))
             except Exception as exc:
                 logger.debug("[RESEARCH] RSS feed %s failed: %s", feed_name, exc)
 
@@ -434,11 +476,17 @@ class ResearchAgent:
         except Exception:
             return {}
 
-    def _build_ta_summary(self, buffer) -> str:
-        """Compact per-symbol price/ema snapshot for the research prompt."""
+    def _build_ta_summary(self, buffer) -> tuple:
+        """Compact per-symbol price/ema/momentum snapshot for the research prompt.
+
+        Returns:
+            (summary_str, mip_map) where mip_map = {symbol: market_implied_prob}
+            computed as sigmoid(momentum_z * 0.5) — dampened to avoid extreme values.
+        """
         if buffer is None:
-            return "Buffer unavailable."
+            return "Buffer unavailable.", {}
         lines = []
+        mip_map: dict = {}
         for symbol in get_universe():
             try:
                 df = buffer.get_candles(symbol, "1Min")
@@ -447,12 +495,20 @@ class ResearchAgent:
                     continue
                 closes = df["close"].tolist()
                 price  = closes[-1]
-                ema20  = sum(closes[-20:]) / 20
-                trend  = "above" if price > ema20 else "below"
-                lines.append(f"{symbol}: ${price:,.2f} {trend} EMA20 (${ema20:,.2f})")
+                window = closes[-20:]
+                ema20  = sum(window) / 20
+                std20  = (sum((c - ema20) ** 2 for c in window) / 20) ** 0.5
+                momentum_z = max(-4.0, min(4.0, (price - ema20) / std20)) if std20 > 0 else 0.0
+                mip = round(1.0 / (1.0 + math.exp(-momentum_z)), 4)
+                mip_map[symbol] = mip
+                trend = "above" if price > ema20 else "below"
+                lines.append(
+                    f"{symbol}: ${price:,.2f} {trend} EMA20 (${ema20:,.2f}) "
+                    f"mom_z={momentum_z:.2f} mip={mip:.3f}"
+                )
             except Exception:
                 lines.append(f"{symbol}: error")
-        return "\n".join(lines)
+        return "\n".join(lines), mip_map
 
     async def _fetch_recent_performance(self) -> str:
         """Last 10 trade-learning reflection entries (excludes research_brief rows)."""

@@ -152,13 +152,7 @@ class SwarmFactory:
     def build_model(self, model_level: str = "standard", max_tokens: int | None = None):
         """Returns the Gemini model best suited for the task.
 
-        Two-tier strategy (both confirmed free-tier):
-          FREE PRIMARY  (gemini-2.5-flash-lite) — stable, fastest, all standard calls:
-            chat, fast, signal, director, discovery, standard
-
-          FREE FALLBACK (gemini-3.1-flash-lite-preview) — smarter, free during preview:
-            smart, research
-
+        All tiers use gemini-3.1-flash-lite-preview (500 RPD free, higher limit than 2.5-flash).
         When the daily free-tier budget runs out, build_model() returns None
         and callers gracefully degrade (template fallback / skip).
         """
@@ -203,7 +197,7 @@ class SwarmFactory:
             temperature=temp,
             max_output_tokens=budget,
             google_api_key=gemini_key,
-            max_retries=15,  # Handle free tier 15 RPM limits with exponential backoff
+            max_retries=3,
         )
 
     def get_system_prompt(self, agent_name: str) -> SystemMessage:

@@ -183,10 +183,46 @@ async def get_ohlcv(symbol: str = "BTC/USD", period: str = "1H"):
 
 
 @router.get("/watchlist")
-def get_watchlist():
-    if core_state.scanner_agent is None:
-        return []
-    return core_state.scanner_agent.get_last_results()
+async def get_watchlist():
+    results = list(core_state.scanner_agent.get_last_results()) if core_state.scanner_agent else []
+
+    # Merge in symbols currently assigned to options strategies, tagged as OPTIONS.
+    # This populates the OPTIONS tab in the watchlist sidebar.
+    try:
+        from sqlalchemy import select
+        from db.database import _get_session_factory
+        from db.models import SymbolStrategyAssignment
+
+        _OPTIONS_ALGOS = {"covered-call", "protective-put"}
+        async with _get_session_factory()() as session:
+            rows = (await session.execute(
+                select(SymbolStrategyAssignment.symbol, SymbolStrategyAssignment.algorithm_type)
+                .where(
+                    SymbolStrategyAssignment.algorithm_type.in_(_OPTIONS_ALGOS),
+                    SymbolStrategyAssignment.active == True,  # noqa: E712
+                )
+            )).all()
+
+        existing_symbols = {r["symbol"] for r in results}
+        for row in rows:
+            if row.symbol not in existing_symbols:
+                results.append({
+                    "symbol":      row.symbol,
+                    "score":       0.0,
+                    "signal":      "NEUTRAL",
+                    "price":       0,
+                    "asset_class": "OPTIONS",
+                    "verdict":     f"Underlying for {row.algorithm_type}",
+                })
+            else:
+                # Override asset_class for symbols already in scanner results
+                for r in results:
+                    if r["symbol"] == row.symbol:
+                        r["asset_class"] = "OPTIONS"
+    except Exception as _e:
+        logger.debug("[WATCHLIST] Options strategy merge failed: %s", _e)
+
+    return results
 
 
 @router.get("/market/pulse")
@@ -251,9 +287,6 @@ def get_market_pulse():
     FX_NAMES = {"UUP": "USD Index", "FXE": "EUR/USD", "FXB": "GBP/USD"}
     if ALPACA_API_KEY and FX_SYMBOLS:
         try:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockSnapshotRequest
-            stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
             snap_req = StockSnapshotRequest(symbol_or_symbols=FX_SYMBOLS)
             snaps = stock_client.get_stock_snapshot(snap_req)
             for sym in FX_SYMBOLS:
@@ -490,6 +523,36 @@ async def get_action_items(force: bool = False):
             logger.info("[ACTION-ITEMS] Persisted %d items to BotAmend (status=pending)", len(validated))
         except Exception as _persist_err:
             logger.warning("[ACTION-ITEMS] BotAmend persist failed: %s", _persist_err)
+
+        # Execute HIGH urgency items immediately — don't wait for Director cycle
+        for item in validated:
+            if item.get("urgency") != "HIGH":
+                continue
+            action_type = item.get("type", "")
+            target = item.get("strategy") or item.get("symbol") or ""
+            if action_type == "HALT" and target:
+                master_engine.halt_bot(target)
+                logger.info("[ACTION-ITEMS] AUTO-EXECUTED HALT for %s", target)
+            elif action_type == "LIQUIDATE" and item.get("symbol") and client:
+                try:
+                    from alpaca.trading.requests import MarketOrderRequest
+                    from alpaca.trading.enums import OrderSide, TimeInForce
+                    import asyncio as _asyncio
+                    sym = item["symbol"]
+                    raw_pos = await _asyncio.to_thread(client.get_all_positions)
+                    pos_qty = next(
+                        (float(p.qty) for p in raw_pos if p.symbol.replace("/", "") == sym.replace("/", "")),
+                        None,
+                    )
+                    if pos_qty and pos_qty > 0:
+                        req = MarketOrderRequest(
+                            symbol=sym, qty=pos_qty,
+                            side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+                        )
+                        await _asyncio.to_thread(client.submit_order, req)
+                        logger.info("[ACTION-ITEMS] AUTO-EXECUTED LIQUIDATE for %s qty=%s", sym, pos_qty)
+                except Exception as _liq_err:
+                    logger.warning("[ACTION-ITEMS] LIQUIDATE execution failed for %s: %s", item["symbol"], _liq_err)
 
         return {"items": validated, "generated_at": now, "cached": False}
     except Exception as e:

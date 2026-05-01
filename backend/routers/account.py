@@ -37,15 +37,19 @@ def get_account():
 @router.get("/positions")
 def get_positions():
     client = get_trading_client()
+
+    def _str(v):
+        return str(v) if v is not None else None
+
     try:
         pos = client.get_all_positions()
         return [{
             "symbol": p.symbol,
             "side": p.side.value if hasattr(p.side, 'value') else str(p.side).split('.')[-1],
-            "size": str(p.qty),
-            "avg_entry_price": str(p.avg_entry_price),
-            "current_price": str(p.current_price),
-            "unrealized_pnl": str(p.unrealized_pl),
+            "size": _str(p.qty),
+            "avg_entry_price": _str(p.avg_entry_price),
+            "current_price": _str(p.current_price),
+            "unrealized_pnl": _str(p.unrealized_pl),
         } for p in pos]
     except Exception as e:
         logger.error("[POSITIONS] %s", e)
