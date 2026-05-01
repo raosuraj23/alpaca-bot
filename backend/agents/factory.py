@@ -1,5 +1,8 @@
+import asyncio
 import logging
 import os
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
@@ -111,10 +114,58 @@ class GeminiDailyBudget:
         return self._hard_exhausted
 
 
+# ---------------------------------------------------------------------------
+# Gemini per-minute rate limiter — enforces free-tier 15 RPM cap
+# ---------------------------------------------------------------------------
+
+class GeminiRpmThrottle:
+    """Sliding-window async rate limiter. Enforces at most rpm_limit calls per 60s."""
+
+    def __init__(self, rpm_limit: int = 12):  # conservative buffer below the 15 RPM cap
+        self._limit = rpm_limit
+        self._timestamps: deque = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] > 60.0:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._limit:
+                    self._timestamps.append(now)
+                    return
+                wait = 60.0 - (now - self._timestamps[0]) + 0.1
+            await asyncio.sleep(wait)
 
 
 
 _gemini_budget = GeminiDailyBudget()
+_gemini_rpm_throttle = GeminiRpmThrottle()
+
+
+async def gemini_ainvoke(runnable, messages, tier: str = "fast"):
+    """
+    Throttled wrapper for any Gemini runnable.ainvoke().
+    Enforces the RPM sliding-window limit and calls the appropriate budget
+    hook when ResourceExhausted fires so callers degrade gracefully.
+    Works with plain models and with_structured_output() variants alike.
+    """
+    try:
+        from google.api_core.exceptions import ResourceExhausted as _RE
+    except ImportError:
+        _RE = type("_NeverRaised", (Exception,), {})  # safe no-op if package absent
+
+    await _gemini_rpm_throttle.acquire()
+    try:
+        return await runnable.ainvoke(messages)
+    except _RE as exc:
+        msg = str(exc).lower()
+        if "perday" in msg or "requests_per_day" in msg or "daily" in msg:
+            _gemini_budget.mark_daily_exhausted()
+        else:
+            _gemini_budget.mark_rpm_hit(tier)
+        raise
 
 
 class AgentDef(BaseModel):
@@ -189,6 +240,9 @@ class SwarmFactory:
                 budget = max_tokens or 400
             elif model_level == "fast":
                 budget = max_tokens or 150
+            elif model_level == "debate":
+                temp   = 0.0
+                budget = max_tokens or 200
             else:
                 budget = max_tokens or 2048
 

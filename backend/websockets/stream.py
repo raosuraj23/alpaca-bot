@@ -476,6 +476,11 @@ async def equity_stream_manager(write_closed_trade_fn=None):
                                         _refl_eq["realized_pnl"] = realized_pnl
                                         _refl_eq["entry_price"] = entry
                                     asyncio.create_task(state.reflection_engine.learn_from_execution(_refl_eq))
+                            else:
+                                _push_log(
+                                    f"[EXECUTION] ✗ FAILED {approved['action']} {symbol}"
+                                    f" — {execution_agent.last_error or 'order rejected (Alpaca error)'}"
+                                )
                     else:
                         _push_log(f"[RISK AGENT] ✗ Blocked {signal['action']} {symbol} — risk gate rejected.")
 

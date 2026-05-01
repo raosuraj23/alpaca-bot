@@ -7,6 +7,7 @@ from deps import ALPACA_API_KEY, ALPACA_API_SECRET, PAPER_TRADING, get_trading_c
 from strategy.engine import master_engine
 from agents.risk_agent import risk_agent
 from agents.execution_agent import execution_agent
+from agents.factory import swarm_factory, gemini_ainvoke
 from core import state as core_state
 from core.state import _push_log
 from state import action_items as _ai_state
@@ -91,6 +92,68 @@ def run_backtest_endpoint(payload: dict):
     except Exception as e:
         logger.error("[BACKTEST] %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/positions/flatten")
+def flatten_all_positions():
+    """
+    Cancel all open orders and close all open positions.
+    Unlike /api/reset, this does NOT truncate any database tables —
+    it only liquidates the live portfolio (safe panic button).
+    """
+    client = get_trading_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Alpaca trading client unavailable.")
+
+    steps: list[str] = []
+    try:
+        client.cancel_orders()
+        steps.append("orders_cancelled")
+    except Exception as exc:
+        steps.append(f"cancel_orders_failed: {exc}")
+        logger.warning("[FLATTEN ALL] cancel_orders failed: %s", exc)
+
+    try:
+        client.close_all_positions(cancel_orders=True)
+        steps.append("positions_closed")
+    except Exception as exc:
+        steps.append(f"close_positions_failed: {exc}")
+        logger.warning("[FLATTEN ALL] close_all_positions failed: %s", exc)
+
+    # Halt all active bots so they don't immediately re-enter
+    from strategy.engine import master_engine
+    from risk.kill_switch import global_kill_switch
+    halted = []
+    for bot_id in list(master_engine.bots.keys()):
+        master_engine.halt_bot(bot_id, reason="Flatten All — operator panic button")
+        halted.append(bot_id)
+    global_kill_switch.manual_halt("Flatten All — operator initiated liquidation")
+    steps.append(f"bots_halted: {len(halted)}")
+
+    _push_log(f"[FLATTEN ALL] Liquidated all positions — steps: {', '.join(steps)}")
+    logger.info("[FLATTEN ALL] Complete — %s", steps)
+    return {"status": "ok", "steps": steps, "halted_bots": len(halted)}
+
+
+@router.post("/positions/{symbol}/close")
+def close_single_position(symbol: str):
+    """
+    Close (liquidate) a single open position by symbol.
+    Submits a market SELL order for the full held quantity.
+    """
+    client = get_trading_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Alpaca trading client unavailable.")
+
+    try:
+        # Alpaca accepts both "BTCUSD" and "BTC/USD" for equities and crypto
+        resp = client.close_position(symbol.replace("/", ""))
+        _push_log(f"[CLOSE POSITION] {symbol} — order {getattr(resp, 'id', 'n/a')}")
+        logger.info("[CLOSE POSITION] %s — resp=%s", symbol, resp)
+        return {"status": "ok", "symbol": symbol, "order_id": str(getattr(resp, "id", ""))}
+    except Exception as exc:
+        logger.error("[CLOSE POSITION] %s failed: %s", symbol, exc)
+        raise HTTPException(status_code=502, detail=f"Failed to close {symbol}: {exc}")
 
 
 @router.get("/market/history")
@@ -362,10 +425,6 @@ async def get_market_commentary(force: bool = False):
     if not force and _commentary_cache["text"] and (now - _commentary_cache["generated_at"]) < _COMMENTARY_TTL:
         return {"text": _commentary_cache["text"], "generated_at": _commentary_cache["generated_at"], "cached": True}
 
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        return {"text": None, "error": "GEMINI_API_KEY not set"}
-
     try:
         bot_states = master_engine.get_bot_states()
         bot_summary = ", ".join(
@@ -397,10 +456,10 @@ async def get_market_commentary(force: bool = False):
             f"Avoid generic disclaimers. Write for a quantitative trader."
         )
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from config import GEMINI_3_1_FLASH_LITE_MODEL
-        model = ChatGoogleGenerativeAI(model=GEMINI_3_1_FLASH_LITE_MODEL, max_output_tokens=512, google_api_key=GEMINI_API_KEY)
-        msg = await model.ainvoke(prompt)
+        model = swarm_factory.build_model("chat")
+        if not model:
+            return {"text": None, "error": "Gemini budget exhausted"}
+        msg = await gemini_ainvoke(model, prompt, tier="chat")
         text = msg.content
         _commentary_cache["generated_at"] = now
         _commentary_cache["text"] = text
@@ -418,10 +477,6 @@ async def get_action_items(force: bool = False):
     cached_items = _ai_state.get_items()
     if not force and cached_items and (now - _ai_state.get_generated_at()) < _ACTION_ITEMS_TTL:
         return {"items": cached_items, "generated_at": _ai_state.get_generated_at(), "cached": True}
-
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        return {"items": [], "error": "GEMINI_API_KEY not set"}
 
     try:
         bot_states = master_engine.get_bot_states()
@@ -461,8 +516,6 @@ async def get_action_items(force: bool = False):
         )
         user_prompt = f"Active bots:\n{bot_ctx}\n\nOpen positions:\n{pos_ctx}\n\nGenerate portfolio action items now."
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from config import GEMINI_3_1_FLASH_LITE_MODEL
         from pydantic import BaseModel, field_validator, model_validator
         from typing import Literal
 
@@ -480,17 +533,23 @@ async def get_action_items(force: bool = False):
                     target = self.symbol or self.strategy or "Portfolio"
                     self.title = f"{self.type}: {target}"
                 return self
-            
+
         class ActionItemsOutput(BaseModel):
             items: list[ActionItem]
-            
-        model = ChatGoogleGenerativeAI(model=GEMINI_3_1_FLASH_LITE_MODEL, max_output_tokens=1024, google_api_key=GEMINI_API_KEY, temperature=0.1)
+
+        model = swarm_factory.build_model("chat")
+        if not model:
+            return {"items": [], "error": "Gemini budget exhausted"}
         structured_model = model.with_structured_output(ActionItemsOutput)
 
-        response = await structured_model.ainvoke([
+        response = await gemini_ainvoke(structured_model, [
             ("system", system_prompt),
             ("user", user_prompt)
-        ])
+        ], tier="chat")
+
+        if response is None or not hasattr(response, "items"):
+            logger.warning("[ACTION-ITEMS] Gemini returned no structured output (response=%r)", response)
+            return {"items": [], "error": "Gemini returned empty or malformed structured output"}
 
         validated = [item.model_dump() for item in response.items]
 

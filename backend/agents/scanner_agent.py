@@ -459,7 +459,8 @@ class ScannerAgent:
             knowledge_ctx = _load_knowledge_context(20)
             knowledge_section = f"\n\n{knowledge_ctx}" if knowledge_ctx else ""
 
-            response = await model.ainvoke([
+            from agents.factory import gemini_ainvoke
+            response = await gemini_ainvoke(model, [
                 SystemMessage(content=(
                     "You are a quantitative multi-asset portfolio manager covering crypto and US equities. "
                     "Select the best symbols to actively monitor and trade from the scored universe.\n"
@@ -473,7 +474,7 @@ class ScannerAgent:
                     "Example: BTC/USD, AAPL, ETH/USD, SPY"
                 )),
                 HumanMessage(content=f"Universe TA scores:\n{universe_str}{research_context}{knowledge_section}"),
-            ])
+            ], tier="discovery")
 
             # Parse comma-separated symbol list from response
             raw = response.content.strip()
@@ -722,17 +723,15 @@ class ScannerAgent:
                 f"- {s['symbol']}: score={s['score']:+.2f}, signal={s['signal']}, {s['summary']}"
                 for s in scored
             )
-            response = await model.ainvoke(
-                [
-                    SystemMessage(content=(
-                        "You are a crypto quant screener. For each symbol, write ONE phrase "
-                        "(max 8 words) describing the trade opportunity or risk in USD terms. "
-                        "No markdown. Respond as: SYMBOL: verdict"
-                    )),
-                    HumanMessage(content=f"Rank these signals:\n{lines}"),
-                ],
-                max_tokens=150,
-            )
+            from agents.factory import gemini_ainvoke
+            response = await gemini_ainvoke(model, [
+                SystemMessage(content=(
+                    "You are a crypto quant screener. For each symbol, write ONE phrase "
+                    "(max 8 words) describing the trade opportunity or risk in USD terms. "
+                    "No markdown. Respond as: SYMBOL: verdict"
+                )),
+                HumanMessage(content=f"Rank these signals:\n{lines}"),
+            ], tier="fast")
             for line in response.content.strip().split("\n"):
                 if ":" not in line:
                     continue

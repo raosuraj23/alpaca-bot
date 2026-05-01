@@ -21,7 +21,8 @@ Guardrails:
 """
 
 import logging
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timezone, timedelta
 from config import settings as _cfg
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 MAX_DAILY_DRAWDOWN_PCT      = 2.0   # Hard threshold: block all signals at 2% daily loss
 MAX_CUMULATIVE_DRAWDOWN_PCT = 8.0   # Soft halt: peak-to-trough drawdown > 8% across all time
 MIN_SIGNAL_CONFIDENCE       = 0.30  # Any signal below this is rejected
+
+# SEC Pattern Day Trader rule: ≥4 day trades in a rolling 5-trading-day window
+# triggers a hard block if account equity < $25,000.
+PDT_EQUITY_THRESHOLD    = 25_000.0  # PDT rules apply below this equity level
+PDT_MAX_DAY_TRADES      = 3         # max day trades per 5-trading-day rolling window
 
 
 class KillSwitch:
@@ -49,6 +55,9 @@ class KillSwitch:
         self._peak_equity: float = 0.0        # Running all-time high for cumulative MDD
         self._cumulative_mdd_pct: float = 0.0
         self._trigger_time: datetime | None = None  # When drawdown halt fired
+        # PDT tracking — keyed by (normalized_symbol, date_str)
+        # Stores timestamps of open→close round-trips within the rolling 5-day window
+        self._day_trade_log: deque = deque()   # deque of (symbol, datetime) tuples
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -165,11 +174,16 @@ class KillSwitch:
     # Signal-Level Gate
     # ------------------------------------------------------------------
 
-    def evaluate_signal(self, signal: dict) -> bool:
+    def evaluate_signal(self, signal: dict, account_equity: float = 0.0) -> bool:
         """
         Per-signal gate. Called before every order submission.
         Returns True if the signal may proceed to the execution agent.
         Asset-class aware: equity drawdown only blocks equity signals; crypto runs 24/7.
+
+        Args:
+            signal:         Signal dict.
+            account_equity: Current account equity — used for PDT threshold check.
+                            Defaults to 0 (worst-case: PDT rules apply) when unavailable.
         """
         if self.triggered:
             logger.warning("[KILL SWITCH] Blocking signal — global circuit breaker active: %s", self.triggered_reason)
@@ -190,7 +204,81 @@ class KillSwitch:
                            confidence, MIN_SIGNAL_CONFIDENCE, signal.get("bot", "unknown"))
             return False
 
+        if not self.evaluate_pdt(signal, account_equity):
+            return False
+
         return True
+
+    # ------------------------------------------------------------------
+    # PDT (Pattern Day Trader) Enforcement
+    # ------------------------------------------------------------------
+
+    def record_day_trade(self, symbol: str):
+        """
+        Register a completed day trade (same-day open+close) for PDT tracking.
+        Call this from the execution agent whenever a SELL fills against a same-day
+        BUY on an equity symbol.
+
+        Only equity symbols are subject to PDT rules — crypto is 24/7.
+        """
+        if "/" in symbol:
+            return  # crypto — PDT does not apply
+        now = datetime.now(timezone.utc)
+        self._day_trade_log.append((symbol.upper(), now))
+        logger.info("[PDT] Recorded day trade: %s — rolling count now %d",
+                    symbol, self._count_day_trades())
+
+    def _count_day_trades(self) -> int:
+        """Count day trades in the rolling 5-trading-day window (≈ 7 calendar days)."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        while self._day_trade_log and self._day_trade_log[0][1] < cutoff:
+            self._day_trade_log.popleft()
+        return len(self._day_trade_log)
+
+    def evaluate_pdt(self, signal: dict, account_equity: float) -> bool:
+        """
+        Returns True if the trade may proceed, False if it would violate PDT rules.
+
+        PDT rules apply only when:
+          - account_equity < $25,000 (institutional accounts are exempt)
+          - asset is an equity (not crypto)
+          - action is BUY (new position) AND rolling day-trade count ≥ 3
+            (the 4th day trade that day would trigger the PDT flag)
+
+        Args:
+            signal: The signal dict with 'symbol' and 'action'.
+            account_equity: Current account equity in USD.
+        """
+        symbol = signal.get("symbol", "")
+        action = signal.get("action", "").upper()
+
+        if "/" in symbol:
+            return True  # crypto — no PDT restriction
+
+        if action != "BUY":
+            return True  # SELL closes a position — always allow
+
+        if account_equity >= PDT_EQUITY_THRESHOLD:
+            return True  # PDT rules don't apply to well-capitalised accounts
+
+        count = self._count_day_trades()
+        if count >= PDT_MAX_DAY_TRADES:
+            logger.warning(
+                "[PDT] BLOCKING %s BUY — %d day trades in rolling 5-day window "
+                "(limit=%d, equity=$%.0f < $%.0f threshold)",
+                symbol, count, PDT_MAX_DAY_TRADES, account_equity, PDT_EQUITY_THRESHOLD,
+            )
+            return False
+
+        return True
+
+    def get_pdt_status(self) -> dict:
+        """Returns PDT state for the /api/risk/status endpoint."""
+        return {
+            "day_trade_count":    self._count_day_trades(),
+            "day_trade_limit":    PDT_MAX_DAY_TRADES,
+            "pdt_equity_threshold": PDT_EQUITY_THRESHOLD,
+        }
 
     # ------------------------------------------------------------------
     # Manual Override Controls
@@ -234,6 +322,7 @@ class KillSwitch:
             "peak_equity":                self._peak_equity,
             "start_of_day_equity":        self.start_of_day_equity,
             "min_confidence_gate":        MIN_SIGNAL_CONFIDENCE,
+            **self.get_pdt_status(),
         }
 
 
