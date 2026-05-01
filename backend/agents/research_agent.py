@@ -194,10 +194,11 @@ class ResearchAgent:
                 f"- {n.get('headline', '')} ({n.get('source', '')})"
                 for n in news_items[:10]
             )
-            response = await model.ainvoke([
+            from agents.factory import gemini_ainvoke
+            response = await gemini_ainvoke(model, [
                 SystemMessage(content=system),
                 HumanMessage(content=news_str),
-            ])
+            ], tier="fast")
             raw = response.content.strip()
             match = re.search(r'\[.*?\]', raw, re.DOTALL)
             if not match:
@@ -343,10 +344,11 @@ class ResearchAgent:
                 if knowledge_ctx else _RESEARCH_SYSTEM_PROMPT
             )
 
-            result: ResearchBrief = await structured.ainvoke([
+            from agents.factory import gemini_ainvoke
+            result: ResearchBrief = await gemini_ainvoke(structured, [
                 SystemMessage(content=system_content),
                 HumanMessage(content=user_payload),
-            ])
+            ], tier="research")
 
             # TODO: structured LLM (with_structured_output) returns a Pydantic model,
             # not a raw AIMessage — usage_metadata is not accessible here.

@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { useTradingEngine, useTradingStore } from '@/store';
-import { Activity, LayoutDashboard, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
+import { Activity, LayoutDashboard, LineChart, Cpu, History, BrainCircuit, BookOpen, RotateCcw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // Views
@@ -15,6 +15,9 @@ import { OrchestratorChat } from '@/components/dashboard/orchestrator-chat';
 import { TradeLedger } from '@/components/dashboard/trade-ledger';
 import { CommandPalette } from '@/components/ui/command-palette';
 import { MiniKPIStrip } from '@/components/ui/mini-kpi-strip';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { API_BASE } from '@/lib/api';
+import { toast } from 'sonner';
 
 function SystemClock() {
   const [mounted, setMounted] = React.useState(false);
@@ -83,10 +86,31 @@ type TabView = 'DESK' | 'PERFORMANCE' | 'STRATEGIES' | 'BACKTEST' | 'LEDGER' | '
 
 export default function AppShell() {
   const [activeTab, setActiveTab] = React.useState<TabView>('DESK');
-  const { activeSymbol } = useTradingStore();
+  const [resetOpen, setResetOpen] = React.useState(false);
+  const [resetLoading, setResetLoading] = React.useState(false);
+  const { activeSymbol, fetchAPIIntegrations } = useTradingStore();
 
   // Mount the simulation WebSocket engine globally
   useTradingEngine();
+
+  const handleReset = async () => {
+    setResetLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/reset`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        toast.success('Reset complete — all positions closed, database wiped');
+        setResetOpen(false);
+        await fetchAPIIntegrations();
+      } else {
+        toast.error(`Reset had errors: ${data.errors?.join(', ') || 'unknown'}`);
+      }
+    } catch (e) {
+      toast.error('Reset failed — backend unreachable');
+    } finally {
+      setResetLoading(false);
+    }
+  };
 
   const renderView = () => {
     switch(activeTab) {
@@ -130,6 +154,14 @@ export default function AppShell() {
 
           <WsStatusDot />
           <MiniKPIStrip />
+          <button
+            onClick={() => setResetOpen(true)}
+            title="Liquidate all & reset database"
+            className="flex items-center gap-1.5 px-2.5 py-1 border border-red-800/60 text-red-400 hover:bg-red-900/20 hover:border-red-600 rounded-sm transition-colors"
+          >
+            <RotateCcw className="w-3 h-3" strokeWidth={2.5} />
+            <span className="text-xs font-bold tracking-widest uppercase hidden lg:inline">Reset</span>
+          </button>
           <SystemClock />
         </div>
       </header>
@@ -153,6 +185,16 @@ export default function AppShell() {
       <OrchestratorChat />
 
       <CommandPalette />
+
+      <ConfirmDialog
+        open={resetOpen}
+        title="Liquidate All & Reset"
+        message="This will cancel all open orders, close every position at market price, and wipe all database tables. This cannot be undone."
+        confirmLabel="LIQUIDATE & RESET"
+        onConfirm={handleReset}
+        onCancel={() => setResetOpen(false)}
+        loading={resetLoading}
+      />
     </div>
   );
 }

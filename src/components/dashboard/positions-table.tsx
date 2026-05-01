@@ -15,6 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { useTradingStore, RiskStatus } from '@/store';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { parseUtc } from '@/lib/utils';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 
 type Tab = 'positions' | 'risk';
 
@@ -204,6 +205,31 @@ export function PositionsTable() {
   const [todayPl, setTodayPl] = React.useState<number | null>(null);
   const [acctFetchFailed, setAcctFetchFailed] = React.useState(false);
 
+  // Flatten All / Close Single state
+  const [flattenOpen, setFlattenOpen]     = React.useState(false);
+  const [closeSymbol, setCloseSymbol]     = React.useState<string | null>(null);
+  const [actionLoading, setActionLoading] = React.useState(false);
+
+  const handleFlattenAll = React.useCallback(async () => {
+    setActionLoading(true);
+    try {
+      await fetch(`${API_BASE}/api/positions/flatten`, { method: 'POST' });
+    } finally {
+      setActionLoading(false);
+      setFlattenOpen(false);
+    }
+  }, []);
+
+  const handleClosePosition = React.useCallback(async (symbol: string) => {
+    setActionLoading(true);
+    try {
+      await fetch(`${API_BASE}/api/positions/${encodeURIComponent(symbol)}/close`, { method: 'POST' });
+    } finally {
+      setActionLoading(false);
+      setCloseSymbol(null);
+    }
+  }, []);
+
   React.useEffect(() => {
     const load = () =>
       fetch(`${API_BASE}/api/account`, { signal: AbortSignal.timeout(8000) })
@@ -285,6 +311,21 @@ export function PositionsTable() {
         </div>
       ),
     },
+    {
+      id: 'close',
+      header: '',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <div className="flex justify-end pr-1">
+          <button
+            onClick={() => setCloseSymbol(row.original.symbol)}
+            className="px-2 py-0.5 text-xs font-mono font-bold border border-[var(--neon-red)]/40 text-[var(--neon-red)] hover:bg-[var(--neon-red)]/10 rounded-sm transition-colors"
+          >
+            Close
+          </button>
+        </div>
+      ),
+    },
   ], []);
 
   // ── Table instances ────────────────────────────────────────────────────────
@@ -347,6 +388,25 @@ export function PositionsTable() {
   );
 
   return (
+    <>
+    <ConfirmDialog
+      open={flattenOpen}
+      title="Flatten All Positions"
+      message={`This will close all ${positions.length} open position${positions.length !== 1 ? 's' : ''} and halt all bots. This cannot be undone.`}
+      confirmLabel="FLATTEN ALL"
+      loading={actionLoading}
+      onConfirm={handleFlattenAll}
+      onCancel={() => setFlattenOpen(false)}
+    />
+    <ConfirmDialog
+      open={closeSymbol !== null}
+      title={`Close ${closeSymbol ?? ''}`}
+      message={`Submit a market SELL order to close the entire ${closeSymbol ?? ''} position.`}
+      confirmLabel="CLOSE POSITION"
+      loading={actionLoading}
+      onConfirm={() => closeSymbol && handleClosePosition(closeSymbol)}
+      onCancel={() => setCloseSymbol(null)}
+    />
     <Card className="h-full flex flex-col min-h-[250px] bg-[var(--panel)]">
       <CardHeader className="py-2.5 px-3 border-b border-[var(--border)] flex flex-row items-center justify-between bg-[var(--panel)]">
         <div className="flex space-x-4">
@@ -357,17 +417,27 @@ export function PositionsTable() {
             Risk
           </CardTitle>
         </div>
-        <div className="text-xs font-mono tabular-nums font-bold text-[var(--foreground)]">
-          DAY PNL:{' '}
-          {acctFetchFailed ? (
-            <span className="text-[var(--warning)] opacity-70">stale</span>
-          ) : todayPl != null ? (
-            <span className={todayPl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
-              {todayPl >= 0 ? '+' : ''}${todayPl.toFixed(2)}
-            </span>
-          ) : (
-            <span className="text-[var(--muted-foreground)] opacity-40">—</span>
+        <div className="flex items-center gap-3">
+          {positions.length > 0 && (
+            <button
+              onClick={() => setFlattenOpen(true)}
+              className="px-2.5 py-1 text-xs font-mono font-bold border border-[var(--neon-red)]/50 text-[var(--neon-red)] hover:bg-[var(--neon-red)]/10 rounded-sm transition-colors uppercase tracking-wider"
+            >
+              Flatten All
+            </button>
           )}
+          <div className="text-xs font-mono tabular-nums font-bold text-[var(--foreground)]">
+            DAY PNL:{' '}
+            {acctFetchFailed ? (
+              <span className="text-[var(--warning)] opacity-70">stale</span>
+            ) : todayPl != null ? (
+              <span className={todayPl >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
+                {todayPl >= 0 ? '+' : ''}${todayPl.toFixed(2)}
+              </span>
+            ) : (
+              <span className="text-[var(--muted-foreground)] opacity-40">—</span>
+            )}
+          </div>
         </div>
       </CardHeader>
 
@@ -377,11 +447,12 @@ export function PositionsTable() {
       )}
 
       <CardContent className="flex-1 overflow-y-auto p-0">
-        {activeTab === 'positions' && renderTable(posTable, 'No open positions', 6)}
+        {activeTab === 'positions' && renderTable(posTable, 'No open positions', 7)}
         {activeTab === 'risk'      && (
           <RiskStatusPanel riskStatus={riskStatus} fetchRiskStatus={fetchRiskStatus} />
         )}
       </CardContent>
     </Card>
+    </>
   );
 }

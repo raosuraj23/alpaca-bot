@@ -37,6 +37,17 @@ from config import settings as _cfg
 _SLIPPAGE_ABORT_PCT = _cfg.slippage_abort_pct
 _MAX_CONCURRENT_POS = _cfg.max_concurrent_positions
 
+# Data client for pre-submission quote fetching (separate from TradingClient)
+_data_client = None
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    _data_client = StockHistoricalDataClient(
+        api_key=_cfg.alpaca_api_key_id,
+        secret_key=_cfg.alpaca_api_secret_key,
+    )
+except Exception as _dce:
+    logger.warning("[EXECUTION AGENT] StockHistoricalDataClient init failed: %s — limit orders disabled", _dce)
+
 # Lazy imports for DB to avoid circular imports at module load time
 
 
@@ -143,6 +154,7 @@ class ExecutionAgent:
             try:
                 all_positions = trading_client.get_all_positions()
                 if len(all_positions) >= _MAX_CONCURRENT_POS:
+                    self.last_error = f"position limit {_MAX_CONCURRENT_POS} reached ({len(all_positions)} open)"
                     logger.warning(
                         "[EXECUTION AGENT] Position count limit reached (%d/%d) — aborting BUY %s",
                         len(all_positions), _MAX_CONCURRENT_POS, symbol,
@@ -152,7 +164,7 @@ class ExecutionAgent:
                         confidence=approved_signal.get("confidence", 0.0),
                         order_id=None, fill_price=0.0, slippage=0.0,
                         status="FAILED",
-                        failure_reason=f"position limit {_MAX_CONCURRENT_POS} reached",
+                        failure_reason=self.last_error,
                     )
                     return None
             except Exception as _pe:
@@ -165,6 +177,7 @@ class ExecutionAgent:
                 buying_power = float(account.buying_power)
                 max_affordable_qty = buying_power / s_price
                 if max_affordable_qty <= 0:
+                    self.last_error = f"insufficient buying power ${buying_power:.2f}"
                     logger.warning(
                         "[EXECUTION AGENT] Insufficient buying power ($%.2f) for %s @ $%.2f — aborting",
                         buying_power, symbol, s_price,
@@ -174,7 +187,7 @@ class ExecutionAgent:
                         confidence=approved_signal.get("confidence", 0.0),
                         order_id=None, fill_price=0.0, slippage=0.0,
                         status="FAILED",
-                        failure_reason=f"insufficient buying power ${buying_power:.2f}",
+                        failure_reason=self.last_error,
                     )
                     return None
                 if qty > max_affordable_qty:
@@ -193,7 +206,14 @@ class ExecutionAgent:
         _ask_at_submit = 0.0
         if s_price > 0:
             try:
-                quote = trading_client.get_latest_quote(symbol)
+                if _data_client and not _is_crypto(symbol):
+                    from alpaca.data.requests import StockLatestQuoteRequest
+                    resp = _data_client.get_stock_latest_quote(
+                        StockLatestQuoteRequest(symbol_or_symbols=symbol)
+                    )
+                    quote = resp.get(symbol)
+                else:
+                    quote = None
                 _bid_at_submit = float(getattr(quote, "bid_price", 0) or 0)
                 _ask_at_submit = float(getattr(quote, "ask_price", 0) or 0)
                 if _bid_at_submit > 0 and _ask_at_submit > 0:
@@ -263,6 +283,24 @@ class ExecutionAgent:
                 logger.warning(
                     "[EXECUTION AGENT] Position check failed (%s) — proceeding cautiously", pos_err
                 )
+
+        # --- Pre-execution guard: minimum notional ($1.00) ---
+        _effective_price = s_price or float(approved_signal.get("price", 0.0)) or 1.0
+        _notional = qty * _effective_price
+        if _notional < 1.00:
+            self.last_error = f"notional ${_notional:.4f} < $1.00 minimum"
+            logger.warning(
+                "[EXECUTION AGENT] Notional guard: %.9f × $%.4f = $%.4f < $1.00 — aborting %s %s",
+                qty, _effective_price, _notional, action, symbol,
+            )
+            self._persist_async(
+                bot_id=bot_id, symbol=symbol, action=action,
+                confidence=approved_signal.get("confidence", 0.0),
+                order_id=None, fill_price=0.0, slippage=0.0,
+                status="FAILED",
+                failure_reason=self.last_error,
+            )
+            return None
 
         try:
             from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest

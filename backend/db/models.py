@@ -39,20 +39,20 @@ class ExecutionRecord(Base):
     signal_id = Column(Integer, ForeignKey("signals.id"))
     alpaca_order_id = Column(String(50), unique=True, index=True) # CRITICAL: Indexed for Webhooks
     side = Column(String(10)) # BUY / SELL
-    fill_price = Column(Numeric(18, 8), default=Decimal('0.0'))   # Precision for Crypto/Equities
-    qty = Column(Numeric(18, 8), default=Decimal('0.0'))          
+    fill_price = Column(Numeric(20, 9), default=Decimal('0.0'))   # Precision for Crypto/Equities
+    qty = Column(Numeric(20, 9), default=Decimal('0.0'))
     commission = Column(Numeric(10, 4), default=Decimal('0.0'))   # Must track fees for Net PnL
-    slippage = Column(Numeric(18, 8), default=Decimal('0.0'))
+    slippage = Column(Numeric(20, 9), default=Decimal('0.0'))
     status = Column(String(20), default="FILLED")
     failure_reason = Column(String(500), nullable=True)
     timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
     asset_class = Column(String(10), nullable=True)  # CRYPTO | EQUITY | OPTIONS
-    bid_price = Column(Numeric(18, 8), nullable=True)   # best bid at submission time
-    ask_price = Column(Numeric(18, 8), nullable=True)   # best ask at submission time
+    bid_price = Column(Numeric(20, 9), nullable=True)   # best bid at submission time
+    ask_price = Column(Numeric(20, 9), nullable=True)   # best ask at submission time
     # Options-specific metadata (null for equity/crypto)
     contract_symbol = Column(String(50), nullable=True)  # resolved OCC symbol e.g. AAPL230217C00160000
     option_type     = Column(String(4),  nullable=True)  # "call" | "put"
-    strike_price    = Column(Numeric(18, 8), nullable=True)
+    strike_price    = Column(Numeric(20, 9), nullable=True)
     expiry_date     = Column(String(20), nullable=True)  # ISO date from resolved contract
 
 # ---------------------------------------------------------
@@ -70,9 +70,9 @@ class ClosedTrade(Base):
     exit_time = Column(DateTime(timezone=True), index=True)
     entry_execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
     exit_execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
-    qty = Column(Numeric(18, 8))
-    avg_entry_price = Column(Numeric(18, 8))
-    avg_exit_price = Column(Numeric(18, 8))
+    qty = Column(Numeric(20, 9))
+    avg_entry_price = Column(Numeric(20, 9))
+    avg_exit_price = Column(Numeric(20, 9))
     realized_pnl = Column(Numeric(18, 4))        # Gross PnL
     net_pnl = Column(Numeric(18, 4))             # Realized PnL minus commissions
     win = Column(Boolean)                        # Fast querying for win-rate
@@ -85,7 +85,7 @@ class ClosedTrade(Base):
     confidence         = Column(Numeric(5, 4), nullable=True)   # signal confidence at entry
     # Options-specific metadata (null for equity/crypto)
     option_type  = Column(String(4),  nullable=True)  # "call" | "put"
-    strike_price = Column(Numeric(18, 8), nullable=True)
+    strike_price = Column(Numeric(20, 9), nullable=True)
     expiry_date  = Column(String(20), nullable=True)
 
 class PortfolioSnapshot(Base):
@@ -109,8 +109,8 @@ class MarketConditionSnapshot(Base):
     execution_id = Column(Integer, ForeignKey("executions.id"), nullable=True)
     symbol = Column(String(20), index=True)
     timestamp = Column(DateTime(timezone=True), default=_utcnow, index=True)
-    bid_price = Column(Numeric(18, 8))
-    ask_price = Column(Numeric(18, 8))
+    bid_price = Column(Numeric(20, 9))
+    ask_price = Column(Numeric(20, 9))
     spread = Column(Numeric(10, 6), nullable=True)
     volume_profile = Column(JSON, nullable=True)
 
@@ -174,8 +174,8 @@ class ReflectionLog(Base):
     failure_class      = Column(String(30), nullable=True)      # BAD_PREDICTION | TIMING | EXECUTION | MARKET_SHOCK
     brier_contribution = Column(Numeric(8, 6), nullable=True)   # (forecast - outcome)^2 for this trade
     # Rich trade context (populated for all SELL fills)
-    entry_price        = Column(Numeric(18, 8), nullable=True)  # avg entry price for the round-trip
-    exit_price         = Column(Numeric(18, 8), nullable=True)  # fill price on exit
+    entry_price        = Column(Numeric(20, 9), nullable=True)  # avg entry price for the round-trip
+    exit_price         = Column(Numeric(20, 9), nullable=True)  # fill price on exit
     hold_duration_min  = Column(Integer, nullable=True)         # minutes between entry and exit
     market_conditions  = Column(String(500), nullable=True)     # JSON: {rsi, ema_spread, volume_ratio}
     timestamp          = Column(DateTime(timezone=True), default=_utcnow)

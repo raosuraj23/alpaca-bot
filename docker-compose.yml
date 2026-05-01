@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alpaca
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: alpacabot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alpaca -d alpacabot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://alpaca:${POSTGRES_PASSWORD}@db:5432/alpacabot
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/app/chroma_db
+      - ./backend/knowledge:/app/knowledge
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://backend:8000
+      NEXT_PUBLIC_WS_BASE: ws://backend:8000
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  chroma_data:

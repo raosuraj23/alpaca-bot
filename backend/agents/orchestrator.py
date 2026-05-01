@@ -33,7 +33,9 @@ import json
 import logging
 import re
 from datetime import datetime, timezone, timedelta
+from typing import Literal
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from pydantic import BaseModel, Field as PydanticField
 from config import (
     GEMINI_3_FLASH_MODEL, GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_2_5_FLASH_LITE_MODEL,
     GEMINI_COST_IN, GEMINI_COST_OUT
@@ -42,6 +44,50 @@ from config import (
 from agents.factory import swarm_factory
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Structured-output schemas for the dialectical debate pipeline
+# ---------------------------------------------------------------------------
+
+class DebateResult(BaseModel):
+    """Call 1 — Dual-perspective researcher: bull + bear in one structured call."""
+    bull_case: str = PydanticField(
+        description="Bull argument citing scanner_score, xgboost_prob, EMA, RSI, vol_ratio."
+    )
+    bear_case: str = PydanticField(
+        description="Bear argument citing failure_log lessons, risk metrics, or counter-signals."
+    )
+    bull_evidence: list[str] = PydanticField(
+        default_factory=list,
+        description="Exact numeric evidence strings copied from the signal fields (e.g. 'xgboost_prob=0.72').",
+    )
+    bear_evidence: list[str] = PydanticField(
+        default_factory=list,
+        description="Exact evidence strings from KB lessons or risk context (e.g. 'kb: HFT false reversal').",
+    )
+
+class AnalystSynthesis(BaseModel):
+    """Call 2 — Senior analyst: weigh the debate and produce a structured verdict."""
+    synthesis: str = PydanticField(
+        description="1-2 sentence synthesis weighing bull vs bear evidence quality."
+    )
+    net_conviction: Literal["STRONG_BUY", "MODERATE_BUY", "NEUTRAL", "MODERATE_SELL", "STRONG_SELL"]
+    key_evidence: list[str] = PydanticField(
+        description="Up to 3 evidence strings (from bull_evidence or bear_evidence) that most influenced the synthesis."
+    )
+    risk_flags: list[str] = PydanticField(
+        default_factory=list,
+        description="Hard risk observations (e.g. 'drawdown near 2% limit', 'kill_switch: active').",
+    )
+
+class TraderDecision(BaseModel):
+    """Call 3 — Final trader: binary decision with a verifiable provenance chain."""
+    decision: Literal["APPROVED", "REJECTED"]
+    rationale: str = PydanticField(description="One sentence rationale.")
+    cited_evidence: list[str] = PydanticField(
+        description="Evidence strings copied only from AnalystSynthesis.key_evidence or risk_flags."
+    )
 
 
 async def _log_llm_cost(response, model_name: str, purpose: str,
@@ -79,12 +125,10 @@ _LIVE_FETCH_KEYWORDS: frozenset[str] = frozenset({
 
 class OrchestratorEngine:
     def __init__(self):
-        # chat tier — Claude Haiku with prompt caching for command parsing (300t)
+        # chat tier — conversational command parsing (300t)
         self.model = swarm_factory.build_model(model_level="chat")
-        # signal tier — Gemini 2.5 Flash Lite primary voter (150t)
+        # signal tier — Trader Decision call in dialectical debate (150t, temp=0.0)
         self.signal_model = swarm_factory.build_model(model_level="signal")
-        # second voter — Gemini 3.1 Flash Lite independent signal approval (150t)
-        self.secondary_voter = swarm_factory.build_model(model_level="fast", max_tokens=150)
         raw_prompt = swarm_factory.get_system_prompt("orchestrator-agent")
         self.system_prompt = SystemMessage(content=raw_prompt.content)
         self._history: list = []   # rolling in-memory conversation buffer
@@ -105,8 +149,9 @@ class OrchestratorEngine:
         messages = [self.system_prompt, ctx] + self._history[-HISTORY_WINDOW:]
 
         try:
+            from agents.factory import gemini_ainvoke
             # --- Round 1: initial LLM response + command dispatch ---
-            response = await self.model.ainvoke(messages)
+            response = await gemini_ainvoke(self.model, messages, tier="chat")
             reply = response.content
             await _log_llm_cost(response, GEMINI_3_1_FLASH_LITE_MODEL,
                                 "orchestrator_chat", GEMINI_COST_IN, GEMINI_COST_OUT)
@@ -135,7 +180,7 @@ class OrchestratorEngine:
                         ),
                     ]
                 )
-                followup_response = await self.model.ainvoke(followup_messages)
+                followup_response = await gemini_ainvoke(self.model, followup_messages, tier="chat")
                 await _log_llm_cost(
                     followup_response, GEMINI_3_1_FLASH_LITE_MODEL,
                     "orchestrator_chat_followup", GEMINI_COST_IN, GEMINI_COST_OUT,
@@ -252,7 +297,7 @@ class OrchestratorEngine:
                 "signal_event": dict,   # original signal passed through
             }
         """
-        if not self.signal_model and not self.secondary_voter and not self.model:
+        if not self.signal_model and not self.model:
             logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s",
                            signal_event.get("asset"))
             return {
@@ -303,159 +348,243 @@ class OrchestratorEngine:
         def _fmt(v: float) -> str:
             return f"{v:.2f}" if v else "N/A"
 
-        # Fetch recent lessons for this asset and strategy from the knowledge base
+        # Fetch semantically similar past failures + wins from ChromaDB vector store
+        # Falls back to JSONL knowledge base if ChromaDB is unavailable (cold start).
         recent_lessons = ""
+        _strategy = signal_event.get('bot', 'unknown')
         try:
-            import pathlib
-            kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
-            if kb_path.exists():
-                strategy = signal_event.get('bot', 'unknown')
-                lessons = []
-                _kb_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
-                with open(kb_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            item = json.loads(line)
-                            ts_str = item.get("timestamp", "")
-                            if ts_str:
-                                try:
-                                    item_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                                    if item_ts < _kb_cutoff:
-                                        continue
-                                except ValueError:
-                                    pass
-                            if item.get("strategy") == strategy and item.get("symbol") == asset:
-                                entry = item.get("knowledge_entry")
-                                if entry:
-                                    lessons.append(entry)
-                        except json.JSONDecodeError:
-                            pass
-                if lessons:
-                    lessons_text = "\n".join(f"- {l}" for l in lessons[-3:])
-                    recent_lessons = f"\nRecent Lessons (Historical Failures for this setup):\n{lessons_text}\n"
-                    recent_lessons += "CRITICAL: If the current context matches these failure patterns, you MUST REJECT this signal."
-        except Exception as kb_err:
-            logger.debug("[ORCHESTRATOR] KB read failed: %s", kb_err)
+            from memory.vector_store import query_similar_failures, query_similar_wins
+            failures = query_similar_failures(asset, _strategy, n_results=4)
+            wins     = query_similar_wins(asset, _strategy, n_results=2)
+            if failures:
+                recent_lessons += "\nPast Failures (RAG — matched by semantic similarity):\n"
+                recent_lessons += "\n".join(f"- {l}" for l in failures)
+                recent_lessons += "\nCRITICAL: If the current context matches these failure patterns, you MUST REJECT this signal."
+            if wins:
+                recent_lessons += "\nPast Wins (context):\n"
+                recent_lessons += "\n".join(f"+ {w}" for w in wins)
+        except Exception as _vs_err:
+            logger.debug("[ORCHESTRATOR] Vector store query failed: %s — falling back to JSONL KB", _vs_err)
 
-        supervisor_prompt = (
-            f"IMPORTANT: Output ONLY the JSON code block below. "
-            f"No markdown headers, no preamble, no analysis text — nothing before or after the block.\n\n"
-            f"Asset: {asset}\n"
-            f"Signal timestamp: {signal_ts}\n"
-            f"Strategy: {signal_event.get('bot', 'unknown')}\n"
-            f"Conditions: golden_cross={cond.get('golden_cross')}, "
-            f"rsi_gate={cond.get('rsi_gate')}, volume_surge={cond.get('volume_surge')}\n"
-            f"EMA-50={_fmt(ema50)}, EMA-200={_fmt(ema200)}, RSI={_fmt(rsi_val)}, vol_ratio={_fmt(vsr)}×\n"
-            f"Note: N/A indicators are not tracked by this strategy — treat them as neutral.\n\n"
-            f"Your role: sentiment/context validation only (the TA math is already confirmed).\n"
-            f"Decision: APPROVED if macro context supports the move, REJECTED if it does not.\n"
-            f"{recent_lessons}\n\n"
-            f"Respond with ONLY this block — nothing before or after it:\n"
-            f"```json\n"
-            f"{{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
-            f"```"
-        )
-
-        def _parse_voter_reply(reply: str) -> tuple[str, str]:
-            """Extract decision and rationale from a voter's response."""
-            decision  = "ERROR"
-            rationale = "Could not parse LLM response."
-
-            # Strategy 1: JSON inside a ```json ... ``` or ```json ... <eof> fence
-            for fence_pat in (r"```json\s*(\{.*?\})\s*(?:```|$)", r"```\s*(\{.*?\})\s*(?:```|$)"):
-                for match in re.finditer(fence_pat, reply, re.DOTALL):
-                    try:
-                        parsed = json.loads(match.group(1))
-                        if "llm_decision" in parsed:
-                            decision  = parsed["llm_decision"].upper()
-                            rationale = parsed.get("rationale", rationale)
-                            break
-                    except json.JSONDecodeError:
-                        pass
-                if decision in ("APPROVED", "REJECTED"):
-                    break
-
-            # Strategy 2: any bare JSON object with llm_decision (no fence required)
-            if decision not in ("APPROVED", "REJECTED"):
-                for match in re.finditer(r"\{[^{}]*\}", reply, re.DOTALL):
-                    try:
-                        parsed = json.loads(match.group(0))
-                        if "llm_decision" in parsed:
-                            decision  = parsed["llm_decision"].upper()
-                            rationale = parsed.get("rationale", rationale)
-                            break
-                    except json.JSONDecodeError:
-                        pass
-
-            # Strategy 3: keyword scan when no JSON found at all
-            if decision not in ("APPROVED", "REJECTED"):
-                upper = reply.upper()
-                if "APPROVED" in upper and "REJECTED" not in upper:
-                    decision  = "APPROVED"
-                    rationale = "[keyword fallback] " + reply[:200].strip()
-                elif "REJECTED" in upper:
-                    decision  = "REJECTED"
-                    rationale = "[keyword fallback] " + reply[:200].strip()
-                else:
-                    decision  = "REJECTED"
-                    rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
-            return decision, rationale
-
-        async def _call_voter(model, model_name: str, price_in: float, price_out: float):
-            """Invoke one voter and return (decision, rationale), or ('ERROR', reason)."""
-            if not model:
-                return "ERROR", f"{model_name} unavailable"
+        # JSONL KB fallback for when vector store is empty or unavailable
+        if not recent_lessons:
             try:
-                response = await model.ainvoke(
-                    [self.system_prompt, HumanMessage(content=supervisor_prompt)]
-                )
-                await _log_llm_cost(response, model_name,
-                                    "Validation", price_in, price_out)
-                return _parse_voter_reply(response.content)
-            except Exception as exc:
-                logger.error("[ORCHESTRATOR] Voter %s failed: %s", model_name, exc)
-                return "ERROR", str(exc)
+                import pathlib
+                kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+                if kb_path.exists():
+                    lessons = []
+                    _kb_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+                    with open(kb_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            try:
+                                item = json.loads(line)
+                                ts_str = item.get("timestamp", "")
+                                if ts_str:
+                                    try:
+                                        item_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                        if item_ts < _kb_cutoff:
+                                            continue
+                                    except ValueError:
+                                        pass
+                                if item.get("strategy") == _strategy and item.get("symbol") == asset:
+                                    entry = item.get("knowledge_entry")
+                                    if entry:
+                                        lessons.append(entry)
+                            except json.JSONDecodeError:
+                                pass
+                    if lessons:
+                        lessons_text = "\n".join(f"- {l}" for l in lessons[-3:])
+                        recent_lessons = f"\nRecent Lessons (JSONL KB):\n{lessons_text}\n"
+                        recent_lessons += "CRITICAL: If the current context matches these failure patterns, you MUST REJECT this signal."
+            except Exception as kb_err:
+                logger.debug("[ORCHESTRATOR] JSONL KB read failed: %s", kb_err)
+
+        # Build deterministic risk sign-off string (no LLM cost)
+        risk_sign_off = "drawdown=unknown, kill_switch=unknown"
+        try:
+            from risk.kill_switch import global_kill_switch
+            ks = global_kill_switch.get_status()
+            ks_state = "active" if ks.get("halted") else "clear"
+            dd = ks.get("drawdown_pct", 0.0)
+            risk_sign_off = f"drawdown={dd:.2f}%, kill_switch={ks_state}"
+        except Exception as _rs_exc:
+            logger.debug("[ORCHESTRATOR] Risk sign-off fetch failed: %s", _rs_exc)
 
         try:
-            gemini_decision, gemini_rationale = "ERROR", "Gemini unavailable"
-            secondary_decision, secondary_rationale = "ERROR", "Secondary model unavailable"
-
-            # Run both voters concurrently — total latency = max(gemini, secondary)
-            gemini_result, secondary_result = await asyncio.gather(
-                _call_voter(self.signal_model or self.model,
-                            GEMINI_2_5_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
-                _call_voter(self.secondary_voter or self.model,
-                            GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
+            trader_result = await self._run_dialectical_debate(
+                signal_event, recent_lessons, risk_sign_off
             )
-            gemini_decision, gemini_rationale = gemini_result
-            secondary_decision, secondary_rationale = secondary_result
-
-            # Primary-decisive: Gemini is authoritative; secondary vote is advisory only.
-            if gemini_decision == "APPROVED":
-                final_decision  = "APPROVED"
-                final_rationale = f"Primary approved | Secondary: {secondary_decision} ({secondary_rationale[:80]})"
-                if secondary_decision != "APPROVED":
-                    logger.info("[ORCHESTRATOR] Secondary dissent on %s (advisory only): %s", asset, secondary_rationale[:80])
-            else:
-                final_decision  = "REJECTED"
-                final_rationale = f"Primary rejected: {gemini_rationale} | Secondary: {secondary_decision}"
-
-            logger.info("[ORCHESTRATOR] Signal %s %s → ensemble: %s | %s",
-                        asset, signal_ts, final_decision, final_rationale[:120])
-
+            final_decision  = trader_result.decision
+            final_rationale = trader_result.rationale
+            cited           = "; ".join(trader_result.cited_evidence[:3])
+            logger.info("[ORCHESTRATOR] Debate %s %s → %s | evidence: %s",
+                        asset, signal_ts, final_decision, cited)
             return {
-                "llm_decision": final_decision,
-                "rationale":    final_rationale,
-                "signal_event": signal_event,
+                "llm_decision":   final_decision,
+                "rationale":      final_rationale,
+                "cited_evidence": trader_result.cited_evidence,
+                "signal_event":   signal_event,
             }
-
         except Exception as exc:
-            logger.error("[ORCHESTRATOR] process_signal ensemble failed: %s", exc)
+            logger.error("[ORCHESTRATOR] process_signal debate failed: %s", exc)
             return {
                 "llm_decision": "ERROR",
                 "rationale":    str(exc),
                 "signal_event": signal_event,
             }
+
+    # ------------------------------------------------------------------
+    # Dialectical Debate Pipeline
+    # ------------------------------------------------------------------
+
+    async def _run_dialectical_debate(
+        self,
+        signal_event: dict,
+        recent_lessons: str,
+        risk_sign_off: str,
+    ) -> TraderDecision:
+        """
+        Three-call structured debate replacing the legacy dual-voter ensemble.
+
+        Call 1 (debate tier, temp=0): Dual researcher — bull + bear in one call.
+        Call 2 (debate tier, temp=0): Analyst synthesizer — weighs both cases.
+        Call 3 (signal tier, temp=0): Trader — binary APPROVED/REJECTED decision.
+
+        Each call feeds the next; the provenance chain flows forward through
+        bull_evidence → key_evidence → cited_evidence, ensuring every string
+        in the final decision is traceable to numeric fields in the signal.
+        """
+        from agents.factory import gemini_ainvoke
+        from config import GEMINI_FREE_MODEL
+
+        _safe_reject = lambda reason, evidence=(): TraderDecision(
+            decision="REJECTED",
+            rationale=reason,
+            cited_evidence=list(evidence),
+        )
+
+        # ── Risk short-circuit: skip all LLM calls if kill-switch is active ──
+        if "kill_switch: active" in risk_sign_off:
+            return _safe_reject("Kill-switch active — no LLM spend.", ["kill_switch: active"])
+
+        # ── Compact signal context for the debate prompt ──
+        ctx = {
+            "symbol":           signal_event.get("asset", signal_event.get("symbol", "?")),
+            "action":           signal_event.get("action", "BUY"),
+            "strategy":         signal_event.get("bot", "unknown"),
+            "confidence":       round(signal_event.get("confidence", 0.0), 4),
+            "xgboost_prob":     round(float(signal_event.get("xgboost_prob", 0.5)), 4),
+            "edge":             round(float(signal_event.get("edge", 0.0)), 4),
+            "ema_50":           round(float(signal_event.get("ema_50", 0) or 0), 2),
+            "ema_200":          round(float(signal_event.get("ema_200", 0) or 0), 2),
+            "rsi_14":           round(float(signal_event.get("rsi_14", 0) or 0), 2),
+            "vol_ratio":        round(float(signal_event.get("volume_surge_ratio", 1.0) or 1.0), 2),
+        }
+        ctx_json = json.dumps(ctx)
+
+        # ── Call 1: Dual Research (DebateResult) ──────────────────────────
+        debate_model = swarm_factory.build_model("debate")
+        if debate_model is None:
+            return _safe_reject("Debate model unavailable (budget exhausted or key missing).")
+
+        _debate_system = (
+            "You are a dual-perspective quantitative researcher. "
+            "For the given trade signal, produce one bull argument and one bear argument. "
+            "Cite only specific numeric values that appear verbatim in the JSON input — do not invent data. "
+            "bull_evidence and bear_evidence must be short strings like 'xgboost_prob=0.72' or 'kb: false reversal pattern'."
+        )
+        _debate_user = (
+            f"Signal: {ctx_json}\n"
+            f"Risk context: {risk_sign_off}\n"
+            f"KB lessons: {recent_lessons or 'none'}"
+        )
+        try:
+            debate_structured = debate_model.with_structured_output(DebateResult)
+            debate_result: DebateResult = await gemini_ainvoke(
+                debate_structured,
+                [SystemMessage(content=_debate_system), HumanMessage(content=_debate_user)],
+                tier="debate",
+            )
+        except (NotImplementedError, TypeError) as exc:
+            logger.warning("[DEBATE] with_structured_output unsupported: %s — rejecting conservatively", exc)
+            return _safe_reject(f"Structured output unavailable: {exc}")
+        except Exception as exc:
+            logger.error("[DEBATE] Call 1 failed: %s", exc)
+            return _safe_reject(str(exc))
+
+        if debate_result is None:
+            logger.warning("[DEBATE] Call 1 returned None (rate limit or model error) — rejecting")
+            return _safe_reject("Debate model returned None")
+
+        logger.debug("[DEBATE] bull=%s | bear=%s", debate_result.bull_case[:80], debate_result.bear_case[:80])
+
+        # ── Call 2: Analyst Synthesis (AnalystSynthesis) ──────────────────
+        synthesis_model = swarm_factory.build_model("debate")
+        if synthesis_model is None:
+            return _safe_reject("Synthesis model unavailable (budget exhausted).")
+
+        _synth_system = (
+            "You are a senior quantitative analyst. "
+            "Weigh the bull and bear cases below and produce a structured synthesis. "
+            "key_evidence must only contain strings already present in bull_evidence or bear_evidence. "
+            "Do not introduce new data."
+        )
+        _synth_user = (
+            json.dumps(debate_result.model_dump())
+            + f"\n\nRisk sign-off: {risk_sign_off}"
+        )
+        try:
+            synth_structured = synthesis_model.with_structured_output(AnalystSynthesis)
+            synthesis_result: AnalystSynthesis = await gemini_ainvoke(
+                synth_structured,
+                [SystemMessage(content=_synth_system), HumanMessage(content=_synth_user)],
+                tier="debate",
+            )
+        except (NotImplementedError, TypeError) as exc:
+            logger.warning("[DEBATE] Synthesis structured output unsupported: %s", exc)
+            return _safe_reject(f"Synthesis unavailable: {exc}")
+        except Exception as exc:
+            logger.error("[DEBATE] Call 2 failed: %s", exc)
+            return _safe_reject(str(exc))
+
+        if synthesis_result is None:
+            logger.warning("[DEBATE] Call 2 returned None — rejecting")
+            return _safe_reject("Synthesis model returned None")
+
+        logger.debug("[DEBATE] conviction=%s | key_evidence=%s",
+                     synthesis_result.net_conviction, synthesis_result.key_evidence)
+
+        # ── Call 3: Trader Decision (TraderDecision) ───────────────────────
+        trader_model = swarm_factory.build_model("signal")
+        if trader_model is None:
+            return _safe_reject("Trader model unavailable (budget exhausted).")
+
+        _trader_system = (
+            "You are the final decision trader. "
+            "Given the analyst synthesis below, emit APPROVED or REJECTED. "
+            "cited_evidence must only contain strings from synthesis.key_evidence or synthesis.risk_flags — no new data."
+        )
+        _trader_user = json.dumps(synthesis_result.model_dump())
+        try:
+            trader_structured = trader_model.with_structured_output(TraderDecision)
+            trader_result: TraderDecision = await gemini_ainvoke(
+                trader_structured,
+                [SystemMessage(content=_trader_system), HumanMessage(content=_trader_user)],
+                tier="signal",
+            )
+        except (NotImplementedError, TypeError) as exc:
+            logger.warning("[DEBATE] Trader structured output unsupported: %s", exc)
+            return _safe_reject(f"Trader unavailable: {exc}")
+        except Exception as exc:
+            logger.error("[DEBATE] Call 3 failed: %s", exc)
+            return _safe_reject(str(exc))
+
+        if trader_result is None:
+            logger.warning("[DEBATE] Call 3 returned None — rejecting")
+            return _safe_reject("Trader model returned None")
+
+        logger.debug("[DEBATE] cited_chain: %s", trader_result.cited_evidence)
+        return trader_result
 
     # ------------------------------------------------------------------
     # Command Parsing

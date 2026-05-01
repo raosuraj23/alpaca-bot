@@ -43,6 +43,7 @@ from routers.bots import router as bots_router
 from routers.analytics import router as analytics_router
 from routers.agents import router as agents_router
 from routers.trading import router as trading_router
+from routers.reset_router import router as reset_router
 import importlib.util
 from pathlib import Path
 
@@ -59,6 +60,7 @@ app.include_router(bots_router)
 app.include_router(analytics_router)
 app.include_router(agents_router)
 app.include_router(trading_router)
+app.include_router(reset_router)
 app.include_router(stream_router)
 
 # ==========================================
@@ -231,6 +233,20 @@ async def _write_closed_trade(
     except Exception as e:
         logger.warning("[CLOSED TRADE] Failed to persist: %s", e)
         return
+
+    # Embed into vector store for RAG-based lesson retrieval (non-blocking)
+    try:
+        from memory.vector_store import embed_trade as _embed_trade
+        _embed_trade({
+            "symbol": symbol, "strategy": bot_id, "action": "SELL",
+            "net_pnl": realized_pnl, "win": win,
+            "avg_entry_price": entry_price, "avg_exit_price": exit_price,
+            "confidence": entry_confidence or 0.0,
+            "asset_class": asset_class,
+            "exit_time": exit_time.isoformat() if hasattr(exit_time, "isoformat") else str(exit_time),
+        })
+    except Exception as _ve:
+        logger.debug("[CLOSED TRADE] Vector store embed failed: %s", _ve)
 
     global _xgb_trade_counter
     _xgb_trade_counter += 1
