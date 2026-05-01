@@ -34,6 +34,22 @@ CRYPTO_SYMBOLS_BASE = {"BTC/USD", "ETH/USD", "SOL/USD"}  # always included; scan
 
 logger = logging.getLogger(__name__)
 
+# Canonical strategy IDs allowed per asset class in fallback (seed-symbol) routing.
+# Add bot IDs here when new strategies are introduced; update OPTIONS_ELIGIBLE_SYMBOLS
+# when a symbol gains sufficient options liquidity.
+ASSET_CLASS_STRATEGY_MAP: dict[str, list[str]] = {
+    "CRYPTO":  ["momentum-alpha", "statarb-gamma", "hft-sniper"],
+    "EQUITY":  ["equity-momentum", "equity-rsi", "equity-pairs"],
+    "OPTIONS": ["covered-call", "protective-put"],
+}
+
+# Large-cap equities with liquid options markets. Only these symbols receive
+# options strategies in fallback routing.
+OPTIONS_ELIGIBLE_SYMBOLS: frozenset[str] = frozenset({
+    "AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "META", "NVDA",
+    "NFLX", "AMD", "QQQ", "SPY", "GS", "JPM", "BAC", "INTC",
+})
+
 
 class StrategyEngine:
     def __init__(self, ws_subscribe_callback: Optional[Callable[[list[str]], None]] = None):
@@ -355,6 +371,20 @@ class StrategyEngine:
         logger.info("[ENGINE] Bot %s RESUMED", bot_id)
         return True
 
+    def halt_all_equity_bots(self) -> None:
+        """Halt all equity/options bots. Crypto bots (asset_class='CRYPTO') keep running."""
+        for bot in self.bots.values():
+            if getattr(bot, "asset_class", "EQUITY") != "CRYPTO":
+                bot.status = "HALTED"
+        logger.info("[ENGINE] All equity bots halted (market closed)")
+
+    def resume_all_equity_bots(self) -> None:
+        """Resume all equity/options bots. Crypto bots are unaffected."""
+        for bot in self.bots.values():
+            if getattr(bot, "asset_class", "EQUITY") != "CRYPTO":
+                bot.status = "ACTIVE"
+        logger.info("[ENGINE] All equity bots resumed (market open)")
+
     def adjust_allocation(self, bot_id: str, new_pct: float) -> bool:
         """Updates allocation percentage for a bot."""
         bot = self.bots.get(bot_id)
@@ -410,18 +440,16 @@ class StrategyEngine:
                 if bid in self.bots and self.bots[bid].status == "ACTIVE"
             ]
         else:
-            # 3. Asset-class fallback for seed symbols
+            # 3. Asset-class fallback for seed symbols — use canonical map only
             is_crypto = symbol in self.active_crypto_symbols
             is_equity = symbol in self.active_equity_symbols
-            active_bots = []
-            for bot in self.bots.values():
-                if bot.status != "ACTIVE":
-                    continue
-                asset_class = getattr(bot, "asset_class", "CRYPTO")
-                if is_crypto and asset_class == "CRYPTO":
-                    active_bots.append(bot)
-                elif is_equity and asset_class in ("EQUITY", "OPTIONS"):
-                    active_bots.append(bot)
+            allowed_ids = set(ASSET_CLASS_STRATEGY_MAP.get("CRYPTO" if is_crypto else "EQUITY", []))
+            if is_equity and symbol in OPTIONS_ELIGIBLE_SYMBOLS:
+                allowed_ids |= set(ASSET_CLASS_STRATEGY_MAP["OPTIONS"])
+            active_bots = [
+                bot for bot_id, bot in self.bots.items()
+                if bot_id in allowed_ids and bot.status == "ACTIVE"
+            ]
 
         if not active_bots:
             return []
@@ -435,7 +463,8 @@ class StrategyEngine:
                 logger.error("[ENGINE] %s crashed on tick: %s", bot.name, signal)
                 continue
             if signal:
-                logger.info("[ENGINE] %s -> %s %s", bot.name, signal["action"], symbol)
+                signal["allocation_pct"] = bot.allocation / 100.0
+                logger.info("[ENGINE] %s -> %s %s (alloc=%.0f%%)", bot.name, signal["action"], symbol, bot.allocation)
                 valid_signals.append(signal)
 
         return valid_signals

@@ -4,19 +4,17 @@ import { API_BASE } from '@/lib/api';
 import * as React from 'react';
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { ValueTicker } from '@/components/ui/value-ticker';
+import { isCryptoSymbol } from '@/lib/utils';
+import type { WatchlistTA } from '@/lib/types';
 import { Sparkles } from 'lucide-react';
 
-interface ScanResult {
-  symbol:    string;
-  score:     number;
-  signal:    'BUY' | 'SELL' | 'NEUTRAL';
-  verdict:   string;
-  price:     number;
-  rsi:       number | null;
-  timestamp: string;
-}
+const ASSET_TEXT: Record<string, string> = {
+  EQUITY:  'text-[var(--neon-green)]',
+  OPTIONS: 'text-[var(--agent-learning)]',
+  CRYPTO:  'text-[var(--kraken-light)]',
+};
 
 function RsiBar({ rsi }: { rsi: number | null }) {
   if (rsi == null) return null;
@@ -35,7 +33,7 @@ function RsiBar({ rsi }: { rsi: number | null }) {
 export function SidebarWatchlist() {
   const { watchlist, activeSymbol, setActiveSymbol, assetClass } = useTradingStore();
   const setAssetClass = useTradingStore(s => (s as any).setAssetClass as (ac: 'EQUITY' | 'OPTIONS' | 'CRYPTO') => void);
-  const scanResults = useTradingStore(s => s.scannerResults) as ScanResult[];
+  const scanResults = useTradingStore(s => s.scannerResults) as WatchlistTA[];
   const [scanning, setScanning] = React.useState(false);
   const [scanError, setScanError] = React.useState(false);
   const [expanded, setExpanded] = React.useState<string | null>(null);
@@ -47,13 +45,13 @@ export function SidebarWatchlist() {
       const res = await fetch(`${API_BASE}/api/watchlist/scan`, { method: 'POST' });
       const data = await res.json();
       if (Array.isArray(data?.results)) {
-        const results = data.results as ScanResult[];
+        const results = data.results as WatchlistTA[];
         useTradingStore.setState({ scannerResults: results });
         const currentWl = useTradingStore.getState().watchlist;
         const existing = new Set(currentWl.map(t => t.symbol));
         const newEntries = results
           .filter(r => !existing.has(r.symbol))
-          .map(r => ({ symbol: r.symbol, price: r.price, change24h: 0, volume: 0 }));
+          .map(r => ({ symbol: r.symbol, price: r.price ?? 0, change24h: 0, volume: 0, asset_class: r.asset_class }));
         if (newEntries.length > 0) {
           useTradingStore.setState({ watchlist: [...currentWl, ...newEntries] });
         }
@@ -65,16 +63,25 @@ export function SidebarWatchlist() {
     }
   };
 
-  const visibleTickers = watchlist.filter(w => {
-    if (assetClass === 'CRYPTO')  return w.symbol.includes('USD');
-    if (assetClass === 'EQUITY')  return !w.symbol.includes('USD');
-    return true;
-  });
+  const visibleTickers = React.useMemo(() =>
+    watchlist.filter(w => {
+      if (assetClass === 'CRYPTO')  return isCryptoSymbol(w.symbol);
+      if (assetClass === 'OPTIONS') return w.asset_class === 'OPTIONS';
+      // EQUITY: non-crypto symbols that are not explicitly tagged OPTIONS
+      return !isCryptoSymbol(w.symbol) && w.asset_class !== 'OPTIONS';
+    }),
+    [watchlist, assetClass],
+  );
 
-  // Symbols in scan results but NOT already in the watchlist
-  const scanSymbols = new Set(scanResults.map(r => r.symbol));
-  const watchlistSymbols = new Set(visibleTickers.map(t => t.symbol));
-  const haiquePicks = scanResults.filter(r => !watchlistSymbols.has(r.symbol));
+  const scanSymbols = React.useMemo(() => new Set(scanResults.map(r => r.symbol)), [scanResults]);
+  const visibleScanResults = React.useMemo(() =>
+    scanResults.filter(r => {
+      if (assetClass === 'CRYPTO')  return isCryptoSymbol(r.symbol);
+      if (assetClass === 'OPTIONS') return r.asset_class === 'OPTIONS';
+      return !isCryptoSymbol(r.symbol) && r.asset_class !== 'OPTIONS';
+    }),
+    [scanResults, assetClass],
+  );
 
   return (
     <Card className="h-full flex flex-col min-w-[240px]">
@@ -97,7 +104,7 @@ export function SidebarWatchlist() {
             <button
               key={ac}
               onClick={() => setAssetClass(ac)}
-              className={`flex-1 py-0.5 text-xs font-bold rounded-sm tracking-wider transition-colors ${assetClass === ac ? 'bg-[var(--panel-muted)] text-[var(--kraken-light)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-white'}`}
+              className={`flex-1 py-0.5 text-xs font-bold rounded-sm tracking-wider transition-colors ${assetClass === ac ? `bg-[var(--panel-muted)] ${ASSET_TEXT[ac]} shadow-sm` : 'text-[var(--muted-foreground)] hover:text-white'}`}
             >
               {ac}
             </button>
@@ -107,15 +114,15 @@ export function SidebarWatchlist() {
 
       <CardContent className="flex-1 overflow-y-auto p-0 flex flex-col">
 
-        {/* ── Haiku Picks (scanner results) at the top ── */}
-        {scanResults.length > 0 && (
+        {/* ── AI Analyst Picks (scanner results) at the top ── */}
+        {visibleScanResults.length > 0 && (
           <div className="shrink-0">
             <div className="px-3 py-1.5 flex items-center gap-1.5 bg-[var(--kraken-purple)]/8 border-b border-[var(--border)]">
               <Sparkles className="w-3 h-3 text-[var(--kraken-light)]" />
-              <span className="text-xs font-mono uppercase tracking-wider text-[var(--kraken-light)]">Haiku Picks</span>
-              <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40">{scanResults.length}</span>
+              <span className="text-xs font-mono uppercase tracking-wider text-[var(--kraken-light)]">AI Analyst Picks</span>
+              <span className="ml-auto text-xs font-mono text-[var(--muted-foreground)] opacity-40">{visibleScanResults.length}</span>
             </div>
-            {scanResults.map(r => {
+            {visibleScanResults.map(r => {
               const isActive = activeSymbol === r.symbol;
               const isOpen   = expanded === r.symbol;
               return (
@@ -139,7 +146,7 @@ export function SidebarWatchlist() {
                           </Badge>
                         )}
                       </div>
-                      <RsiBar rsi={r.rsi} />
+                      <RsiBar rsi={r.rsi ?? null} />
                     </div>
                     <div className="flex flex-col items-end shrink-0 ml-2">
                       <span className={`text-xs font-mono tabular-nums font-bold ${r.score >= 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}`}>
@@ -148,8 +155,32 @@ export function SidebarWatchlist() {
                     </div>
                   </div>
                   {isOpen && (
-                    <div className="px-3 pb-2 text-xs text-[var(--muted-foreground)] leading-snug bg-[var(--background)]/40 border-t border-[var(--border)]/30">
-                      {r.verdict}
+                    <div className="px-3 pb-2 text-xs text-[var(--muted-foreground)] leading-snug bg-[var(--background)]/40 border-t border-[var(--border)]/30 space-y-1">
+                      <p className="pt-1">{r.verdict}</p>
+                      <div className="flex gap-3 font-mono tabular-nums opacity-70">
+                        {r.ema_spread != null && (
+                          <span title="EMA spread: (ema20 - price) / price">
+                            <span className="opacity-50">EMA </span>
+                            <span className={r.ema_spread > 0 ? 'text-[var(--neon-green)]' : 'text-[var(--neon-red)]'}>
+                              {(r.ema_spread * 100).toFixed(2)}%
+                            </span>
+                          </span>
+                        )}
+                        {r.vol_surge != null && (
+                          <span title="Volume surge vs 20-bar avg">
+                            <span className="opacity-50">Vol </span>
+                            <span className={r.vol_surge >= 1.5 ? 'text-[var(--neon-green)]' : ''}>{r.vol_surge.toFixed(1)}x</span>
+                          </span>
+                        )}
+                        {r.band_pct != null && (
+                          <span title="Bollinger Band position (0=lower, 1=upper)">
+                            <span className="opacity-50">BB </span>
+                            <span className={r.band_pct < 0.25 ? 'text-[var(--neon-green)]' : r.band_pct > 0.75 ? 'text-[var(--neon-red)]' : ''}>
+                              {(r.band_pct * 100).toFixed(0)}%
+                            </span>
+                          </span>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -207,7 +238,7 @@ export function SidebarWatchlist() {
         {scanResults.length === 0 && !scanning && !scanError && (
           <div className="flex-1 flex items-end pb-4 px-3">
             <span className="text-xs text-[var(--muted-foreground)] opacity-40 font-mono">
-              Press SCAN for Haiku analysis
+              Press SCAN for AI analysis
             </span>
           </div>
         )}

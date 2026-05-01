@@ -10,9 +10,9 @@ Multi-agent quantitative trading system. Next.js frontend + Python/FastAPI multi
 
 | Document | Purpose |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | Agent boundaries, Next.js app router rules, orchestrator system |
+| [AGENTS.md](AGENTS.md) | Agent boundaries, Next.js app router rules, full agent roster + backend file map |
 | [docs/DESIGN.md](docs/DESIGN.md) | UI/UX design system, color tokens, component patterns |
-| [docs/execution-plan.md](docs/execution-plan.md) | Multi-phase backend rollout & phase status |
+| [docs/execution-plan.md](docs/execution-plan.md) | 5-phase backend roadmap with completion status |
 | [.claude/rules/frontend-standards.md](.claude/rules/frontend-standards.md) | Frontend rules: styling, hydration, data fetching, rendering |
 | [.claude/rules/backend-standards.md](.claude/rules/backend-standards.md) | Backend rules: agents, models, trading universe |
 | [.claude/rules/process-rules.md](.claude/rules/process-rules.md) | Types, mock data, testing, phase completion logging |

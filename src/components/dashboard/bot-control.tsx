@@ -5,7 +5,7 @@ import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { collapseRepeats } from '@/lib/utils';
 import { ChevronDown, Square, Play, TrendingUp, TrendingDown, Zap } from 'lucide-react';
 

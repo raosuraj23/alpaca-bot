@@ -32,10 +32,11 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone, timedelta
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from config import (
-    CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT,
-    GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT,
+    GEMINI_3_FLASH_MODEL, GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_2_5_FLASH_LITE_MODEL,
+    GEMINI_COST_IN, GEMINI_COST_OUT
 )
 
 from agents.factory import swarm_factory
@@ -69,22 +70,23 @@ HISTORY_WINDOW = 6   # = 3 full turns
 # (matches quant.signals.MIN_BARS)
 _SIGNAL_MIN_BARS = 201
 
+# User message keywords that trigger a live Alpaca positions+account fetch
+_LIVE_FETCH_KEYWORDS: frozenset[str] = frozenset({
+    "position", "positions", "holding", "holdings", "balance",
+    "equity", "account", "sell", "buy", "liquidate", "close", "order",
+})
+
 
 class OrchestratorEngine:
     def __init__(self):
         # chat tier — Claude Haiku with prompt caching for command parsing (300t)
         self.model = swarm_factory.build_model(model_level="chat")
-        # signal tier — Gemini 2.5 Flash primary voter (50t)
+        # signal tier — Gemini 2.5 Flash Lite primary voter (150t)
         self.signal_model = swarm_factory.build_model(model_level="signal")
-        # second voter — Claude Haiku independent signal approval (100t)
-        self.haiku_voter = swarm_factory.build_model(model_level="chat", max_tokens=100)
+        # second voter — Gemini 3.1 Flash Lite independent signal approval (150t)
+        self.secondary_voter = swarm_factory.build_model(model_level="fast", max_tokens=150)
         raw_prompt = swarm_factory.get_system_prompt("orchestrator-agent")
-        # Cache the system prompt at Anthropic's ephemeral tier — avoids paying
-        # full input token cost (~2k tokens) on every invocation.
-        self.system_prompt = SystemMessage(
-            content=raw_prompt.content,
-            additional_kwargs={"cache_control": {"type": "ephemeral"}},
-        )
+        self.system_prompt = SystemMessage(content=raw_prompt.content)
         self._history: list = []   # rolling in-memory conversation buffer
 
     # ------------------------------------------------------------------
@@ -99,16 +101,16 @@ class OrchestratorEngine:
             )
 
         self._history.append(HumanMessage(content=user_text))
-        messages = [self.system_prompt] + self._history[-HISTORY_WINDOW:]
+        ctx = await self._build_context_message(user_text)
+        messages = [self.system_prompt, ctx] + self._history[-HISTORY_WINDOW:]
 
         try:
+            # --- Round 1: initial LLM response + command dispatch ---
             response = await self.model.ainvoke(messages)
             reply = response.content
-            self._history.append(AIMessage(content=reply))
-            await _log_llm_cost(response, CLAUDE_HAIKU_MODEL,
-                                "orchestrator_chat", HAIKU_COST_IN, HAIKU_COST_OUT)
+            await _log_llm_cost(response, GEMINI_3_1_FLASH_LITE_MODEL,
+                                "orchestrator_chat", GEMINI_COST_IN, GEMINI_COST_OUT)
 
-            # Parse and execute any embedded commands; collect results
             commands = self._extract_commands(reply)
             results = []
             for cmd in commands:
@@ -116,11 +118,47 @@ class OrchestratorEngine:
                 if result:
                     results.append(result)
 
-            # Append execution results to the chat reply so the UI shows them
+            # --- Round 2: feed tool results back so LLM can act on them ---
             if results:
-                result_lines = "\n".join(f"→ {r}" for r in results)
-                reply = reply + f"\n\n**Execution Results:**\n{result_lines}"
+                result_text = "\n".join(f"→ {r}" for r in results)
+                followup_messages = (
+                    [self.system_prompt, ctx]
+                    + self._history[-HISTORY_WINDOW:]
+                    + [
+                        AIMessage(content=reply),
+                        HumanMessage(
+                            content=(
+                                f"[TOOL RESULTS]\n{result_text}\n\n"
+                                "Based on the above results, complete your response to the user. "
+                                "Follow the Trade Confirmation Protocol if applicable."
+                            )
+                        ),
+                    ]
+                )
+                followup_response = await self.model.ainvoke(followup_messages)
+                await _log_llm_cost(
+                    followup_response, GEMINI_3_1_FLASH_LITE_MODEL,
+                    "orchestrator_chat_followup", GEMINI_COST_IN, GEMINI_COST_OUT,
+                )
+                followup_reply = followup_response.content
 
+                followup_commands = self._extract_commands(followup_reply)
+                followup_results = []
+                for cmd in followup_commands:
+                    r = self._dispatch_command(cmd)
+                    if r:
+                        followup_results.append(r)
+
+                final_reply = followup_reply
+                if followup_results:
+                    lines = "\n".join(f"→ {r}" for r in followup_results)
+                    final_reply += f"\n\n**Execution Results:**\n{lines}"
+
+                self._history.append(AIMessage(content=final_reply))
+                return final_reply
+
+            # No command results — return round-1 reply as-is
+            self._history.append(AIMessage(content=reply))
             return reply
 
         except Exception as e:
@@ -131,6 +169,62 @@ class OrchestratorEngine:
         """Resets the conversation context window."""
         self._history = []
         logger.info("[ORCHESTRATOR] Conversation history cleared.")
+
+    async def _build_context_message(self, user_text: str) -> SystemMessage:
+        """Build a grounded context block injected before LLM inference.
+
+        Always includes cached bot/risk state. Fetches live Alpaca positions
+        and account only when user_text contains a trigger keyword.
+        """
+        from strategy.engine import master_engine
+        from agents.risk_agent import risk_agent
+        from agents.execution_agent import _get_trading_client
+
+        lines: list[str] = ["[LIVE CONTEXT — use this as ground truth, do not invent data]"]
+
+        try:
+            bot_states = master_engine.get_bot_states()
+            bot_summary = " | ".join(
+                f"{b['id']} {b['status']} {b['allocationPct']:.0f}%"
+                for b in bot_states[:8]
+            )
+            lines.append(f"Bot states: {bot_summary}")
+        except Exception:
+            lines.append("Bot states: unavailable")
+
+        try:
+            risk = risk_agent.get_risk_status()
+            lines.append(
+                f"Risk: kill_switch={risk.get('kill_switch_active', 'unknown')}  "
+                f"drawdown={risk.get('daily_drawdown_pct', 0):.2%}"
+            )
+        except Exception:
+            lines.append("Risk: unavailable")
+
+        lower = user_text.lower()
+        if any(kw in lower for kw in _LIVE_FETCH_KEYWORDS):
+            try:
+                tc = _get_trading_client()
+                if tc:
+                    positions = tc.get_all_positions()
+                    account = tc.get_account()
+                    pos_parts = [
+                        f"{p.symbol} qty={p.qty} price=${float(p.current_price or 0):.2f} "
+                        f"unreal_pl={float(p.unrealized_pl or 0):+.2f}"
+                        for p in positions
+                    ] or ["none"]
+                    lines.append(f"Positions (live): {' | '.join(pos_parts)}")
+                    lines.append(
+                        f"Account equity: ${float(account.equity):,.2f}  "
+                        f"buying_power: ${float(account.buying_power):,.2f}"
+                    )
+                else:
+                    lines.append("[Alpaca unavailable — do not fabricate position data]")
+            except Exception as exc:
+                logger.warning("[ORCHESTRATOR] Live fetch failed: %s", exc)
+                lines.append("[Alpaca unavailable — do not fabricate position data]")
+
+        return SystemMessage(content="\n".join(lines))
 
     # ------------------------------------------------------------------
     # Quant Signal Handoff — LLM Supervisor Node
@@ -158,7 +252,7 @@ class OrchestratorEngine:
                 "signal_event": dict,   # original signal passed through
             }
         """
-        if not self.signal_model and not self.haiku_voter and not self.model:
+        if not self.signal_model and not self.secondary_voter and not self.model:
             logger.warning("[ORCHESTRATOR] LLM offline — auto-approving quant signal for %s",
                            signal_event.get("asset"))
             return {
@@ -191,49 +285,120 @@ class OrchestratorEngine:
             logger.debug("[ORCHESTRATOR] XGBoost gate skipped: %s", _xgb_exc)
         # --- End XGBoost gate ---
 
+        # Normalise TA fields — strategies store them either at top-level or in meta{}
+        _meta = signal_event.get("meta") or {}
+        if not signal_event.get("ema_50") and _meta.get("ema_short"):
+            signal_event["ema_50"] = _meta["ema_short"]
+        if not signal_event.get("ema_200") and _meta.get("ema_long"):
+            signal_event["ema_200"] = _meta["ema_long"]
+
         asset      = signal_event.get("asset", "UNKNOWN")
         signal_ts  = signal_event.get("timestamp", "")
-        ema50      = signal_event.get("ema_50", 0)
-        ema200     = signal_event.get("ema_200", 0)
-        rsi_val    = signal_event.get("rsi_14", 0)
-        vsr        = signal_event.get("volume_surge_ratio", 0)
+        ema50      = signal_event.get("ema_50") or 0
+        ema200     = signal_event.get("ema_200") or 0
+        rsi_val    = signal_event.get("rsi_14") or 0
+        vsr        = signal_event.get("volume_surge_ratio") or 0
         cond       = signal_event.get("conditions", {})
 
+        def _fmt(v: float) -> str:
+            return f"{v:.2f}" if v else "N/A"
+
+        # Fetch recent lessons for this asset and strategy from the knowledge base
+        recent_lessons = ""
+        try:
+            import pathlib
+            kb_path = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "failure_log.jsonl"
+            if kb_path.exists():
+                strategy = signal_event.get('bot', 'unknown')
+                lessons = []
+                _kb_cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+                with open(kb_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            item = json.loads(line)
+                            ts_str = item.get("timestamp", "")
+                            if ts_str:
+                                try:
+                                    item_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                    if item_ts < _kb_cutoff:
+                                        continue
+                                except ValueError:
+                                    pass
+                            if item.get("strategy") == strategy and item.get("symbol") == asset:
+                                entry = item.get("knowledge_entry")
+                                if entry:
+                                    lessons.append(entry)
+                        except json.JSONDecodeError:
+                            pass
+                if lessons:
+                    lessons_text = "\n".join(f"- {l}" for l in lessons[-3:])
+                    recent_lessons = f"\nRecent Lessons (Historical Failures for this setup):\n{lessons_text}\n"
+                    recent_lessons += "CRITICAL: If the current context matches these failure patterns, you MUST REJECT this signal."
+        except Exception as kb_err:
+            logger.debug("[ORCHESTRATOR] KB read failed: %s", kb_err)
+
         supervisor_prompt = (
-            f"The deterministic TA engine has identified a high-probability BUY setup on {asset}.\n\n"
-            f"Quant Signal Summary:\n"
-            f"  • Timestamp: {signal_ts}\n"
-            f"  • Golden Cross (EMA-50 crossed above EMA-200): {cond.get('golden_cross')} "
-            f"    (EMA-50={ema50:.2f}, EMA-200={ema200:.2f})\n"
-            f"  • RSI-14 in momentum zone (40–60): {cond.get('rsi_gate')} (RSI={rsi_val:.1f})\n"
-            f"  • Volume surge > 1.5× 20-bar SMA: {cond.get('volume_surge')} (ratio={vsr:.2f}×)\n\n"
-            f"Your task as LLM Supervisor:\n"
-            f"1. Comment briefly on the current macro/sentiment context for {asset} "
-            f"   based on your training knowledge (no live data access needed — use general market awareness).\n"
-            f"2. Decide: APPROVED (proceed to execution) or REJECTED (suppress this signal).\n"
-            f"3. Output your decision as a JSON block:\n"
-            f"   ```json\n"
-            f"   {{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
-            f"   ```\n\n"
-            f"Be brief. The math is already confirmed — your role is sentiment/context validation only."
+            f"IMPORTANT: Output ONLY the JSON code block below. "
+            f"No markdown headers, no preamble, no analysis text — nothing before or after the block.\n\n"
+            f"Asset: {asset}\n"
+            f"Signal timestamp: {signal_ts}\n"
+            f"Strategy: {signal_event.get('bot', 'unknown')}\n"
+            f"Conditions: golden_cross={cond.get('golden_cross')}, "
+            f"rsi_gate={cond.get('rsi_gate')}, volume_surge={cond.get('volume_surge')}\n"
+            f"EMA-50={_fmt(ema50)}, EMA-200={_fmt(ema200)}, RSI={_fmt(rsi_val)}, vol_ratio={_fmt(vsr)}×\n"
+            f"Note: N/A indicators are not tracked by this strategy — treat them as neutral.\n\n"
+            f"Your role: sentiment/context validation only (the TA math is already confirmed).\n"
+            f"Decision: APPROVED if macro context supports the move, REJECTED if it does not.\n"
+            f"{recent_lessons}\n\n"
+            f"Respond with ONLY this block — nothing before or after it:\n"
+            f"```json\n"
+            f"{{\"llm_decision\": \"APPROVED\", \"rationale\": \"one sentence\"}}\n"
+            f"```"
         )
 
         def _parse_voter_reply(reply: str) -> tuple[str, str]:
             """Extract decision and rationale from a voter's response."""
             decision  = "ERROR"
             rationale = "Could not parse LLM response."
-            pattern   = r"```json\s*(\{.*?\})\s*```"
-            for match in re.finditer(pattern, reply, re.DOTALL):
-                try:
-                    parsed    = json.loads(match.group(1))
-                    decision  = parsed.get("llm_decision", "ERROR").upper()
-                    rationale = parsed.get("rationale", rationale)
+
+            # Strategy 1: JSON inside a ```json ... ``` or ```json ... <eof> fence
+            for fence_pat in (r"```json\s*(\{.*?\})\s*(?:```|$)", r"```\s*(\{.*?\})\s*(?:```|$)"):
+                for match in re.finditer(fence_pat, reply, re.DOTALL):
+                    try:
+                        parsed = json.loads(match.group(1))
+                        if "llm_decision" in parsed:
+                            decision  = parsed["llm_decision"].upper()
+                            rationale = parsed.get("rationale", rationale)
+                            break
+                    except json.JSONDecodeError:
+                        pass
+                if decision in ("APPROVED", "REJECTED"):
                     break
-                except json.JSONDecodeError:
-                    pass
+
+            # Strategy 2: any bare JSON object with llm_decision (no fence required)
             if decision not in ("APPROVED", "REJECTED"):
-                decision  = "REJECTED"
-                rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
+                for match in re.finditer(r"\{[^{}]*\}", reply, re.DOTALL):
+                    try:
+                        parsed = json.loads(match.group(0))
+                        if "llm_decision" in parsed:
+                            decision  = parsed["llm_decision"].upper()
+                            rationale = parsed.get("rationale", rationale)
+                            break
+                    except json.JSONDecodeError:
+                        pass
+
+            # Strategy 3: keyword scan when no JSON found at all
+            if decision not in ("APPROVED", "REJECTED"):
+                upper = reply.upper()
+                if "APPROVED" in upper and "REJECTED" not in upper:
+                    decision  = "APPROVED"
+                    rationale = "[keyword fallback] " + reply[:200].strip()
+                elif "REJECTED" in upper:
+                    decision  = "REJECTED"
+                    rationale = "[keyword fallback] " + reply[:200].strip()
+                else:
+                    decision  = "REJECTED"
+                    rationale = f"Unrecognised response — defaulting REJECTED. Raw: {reply[:120]}"
             return decision, rationale
 
         async def _call_voter(model, model_name: str, price_in: float, price_out: float):
@@ -245,7 +410,7 @@ class OrchestratorEngine:
                     [self.system_prompt, HumanMessage(content=supervisor_prompt)]
                 )
                 await _log_llm_cost(response, model_name,
-                                    "orchestrator_signal_vote", price_in, price_out)
+                                    "Validation", price_in, price_out)
                 return _parse_voter_reply(response.content)
             except Exception as exc:
                 logger.error("[ORCHESTRATOR] Voter %s failed: %s", model_name, exc)
@@ -253,34 +418,27 @@ class OrchestratorEngine:
 
         try:
             gemini_decision, gemini_rationale = "ERROR", "Gemini unavailable"
-            haiku_decision,  haiku_rationale  = "ERROR", "Haiku unavailable"
+            secondary_decision, secondary_rationale = "ERROR", "Secondary model unavailable"
 
-            # Run both voters concurrently — total latency = max(gemini, haiku), not sum
-            gemini_result, haiku_result = await asyncio.gather(
+            # Run both voters concurrently — total latency = max(gemini, secondary)
+            gemini_result, secondary_result = await asyncio.gather(
                 _call_voter(self.signal_model or self.model,
-                            GEMINI_FLASH_MODEL, GEMINI_FLASH_COST_IN, GEMINI_FLASH_COST_OUT),
-                _call_voter(self.haiku_voter or self.model,
-                            CLAUDE_HAIKU_MODEL, HAIKU_COST_IN, HAIKU_COST_OUT),
+                            GEMINI_2_5_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
+                _call_voter(self.secondary_voter or self.model,
+                            GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_COST_IN, GEMINI_COST_OUT),
             )
             gemini_decision, gemini_rationale = gemini_result
-            haiku_decision,  haiku_rationale  = haiku_result
+            secondary_decision, secondary_rationale = secondary_result
 
-            # AND logic: both must APPROVE; disagreement → REJECT
-            if gemini_decision == "APPROVED" and haiku_decision == "APPROVED":
+            # Primary-decisive: Gemini is authoritative; secondary vote is advisory only.
+            if gemini_decision == "APPROVED":
                 final_decision  = "APPROVED"
-                final_rationale = f"Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
+                final_rationale = f"Primary approved | Secondary: {secondary_decision} ({secondary_rationale[:80]})"
+                if secondary_decision != "APPROVED":
+                    logger.info("[ORCHESTRATOR] Secondary dissent on %s (advisory only): %s", asset, secondary_rationale[:80])
             else:
-                final_decision = "REJECTED"
-                if gemini_decision != haiku_decision:
-                    final_rationale = (
-                        f"[VOTER DISAGREEMENT] Gemini={gemini_decision} ({gemini_rationale}) | "
-                        f"Haiku={haiku_decision} ({haiku_rationale})"
-                    )
-                    logger.warning("[ORCHESTRATOR] Voter disagreement on %s: %s", asset, final_rationale)
-                else:
-                    final_rationale = (
-                        f"Both rejected — Gemini: {gemini_rationale} | Haiku: {haiku_rationale}"
-                    )
+                final_decision  = "REJECTED"
+                final_rationale = f"Primary rejected: {gemini_rationale} | Secondary: {secondary_decision}"
 
             logger.info("[ORCHESTRATOR] Signal %s %s → ensemble: %s | %s",
                         asset, signal_ts, final_decision, final_rationale[:120])
@@ -443,7 +601,6 @@ class OrchestratorEngine:
         # Fetch equity early so we can parse percentage quantities
         equity = 0.0
         try:
-            from agents.execution_agent import _get_trading_client
             tc = _get_trading_client()
             if tc:
                 equity = float(tc.get_account().equity)
@@ -459,10 +616,22 @@ class OrchestratorEngine:
         # Get last known tick price for slippage calculation
         price = master_engine.get_last_price(symbol) or 0.0
 
+        # For SELL orders, fall back to Alpaca position's current_price when cache is cold
+        if price <= 0.0 and side == "SELL" and tc:
+            try:
+                norm = symbol.replace("/", "")
+                for p in tc.get_all_positions():
+                    if p.symbol.replace("/", "") == norm:
+                        price = float(p.current_price or 0.0)
+                        break
+            except Exception:
+                pass
+
         synthetic_signal = {
             "action":     side,
             "symbol":     symbol,
             "price":      price,
+            "qty":        qty,   # lets risk_agent SELL fast-path read the user-specified qty
             "confidence": 1.0,   # Manual orders always pass the confidence gate
             "bot":        "orchestrator",
             "meta":       {"reason": reason, "source": "manual"},
@@ -479,8 +648,9 @@ class OrchestratorEngine:
 
         exec_result = execution_agent.execute(approved, signal_price=price)
         if not exec_result:
-            logger.error("[ORCHESTRATOR] PLACE_ORDER execution failed — %s %s qty=%s", side, symbol, qty)
-            return {"error": "Execution failed — check trading_client and API keys."}
+            reason = getattr(execution_agent, "last_error", None) or "unknown error — check server logs"
+            logger.error("[ORCHESTRATOR] PLACE_ORDER execution failed — %s %s qty=%s: %s", side, symbol, qty, reason)
+            return {"error": f"Execution failed: {reason}"}
 
         logger.info(
             "[ORCHESTRATOR] PLACE_ORDER filled — order_id=%s %s %s qty=%.6f fill=%.2f slip=%.4f",

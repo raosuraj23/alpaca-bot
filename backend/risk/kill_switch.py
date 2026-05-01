@@ -4,7 +4,7 @@ Kill Switch — Global Risk Circuit Breaker
 Enforces the following hard risk rules across all trading activity:
 
   1. Max Daily Drawdown: if portfolio drops ≥ 2% from start-of-day equity,
-     ALL signal transmission is blocked immediately.
+     equity signal transmission is blocked (crypto continues — 24/7 market).
   2. Min Signal Confidence: signals below 0.30 confidence are rejected.
   3. Manual Override: operator can halt/resume via orchestrator commands.
   4. Cumulative MDD Gate: if peak-to-trough drawdown exceeds 8% across all
@@ -22,6 +22,7 @@ Guardrails:
 
 import logging
 from datetime import datetime, timezone
+from config import settings as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +39,16 @@ class KillSwitch:
     ):
         self.max_daily_drawdown_pct      = max_daily_drawdown_pct
         self.max_cumulative_drawdown_pct = max_cumulative_drawdown_pct
-        self.triggered         = False
+        self.triggered         = False          # global flag — set by manual halt or cumulative MDD
+        self.triggered_equity  = False          # set by equity daily drawdown only
+        self.triggered_crypto  = False          # reserved for future per-class crypto drawdown gate
         self.triggered_reason  = None
         self.start_of_day_equity: float | None = None
         self._day_anchor: int | None = None   # UTC day number of last SOD reset
         self._drawdown_pct: float = 0.0
         self._peak_equity: float = 0.0        # Running all-time high for cumulative MDD
         self._cumulative_mdd_pct: float = 0.0
+        self._trigger_time: datetime | None = None  # When drawdown halt fired
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -69,6 +73,10 @@ class KillSwitch:
                 logger.info("[KILL SWITCH] Drawdown halt auto-cleared for new trading day")
                 self.triggered = False
                 self.triggered_reason = None
+            # Always clear equity daily drawdown on day rollover regardless of reason
+            if self.triggered_equity:
+                logger.info("[KILL SWITCH] Equity drawdown halt auto-cleared for new trading day")
+                self.triggered_equity = False
 
     # ------------------------------------------------------------------
     # Portfolio-Level Gate
@@ -89,7 +97,18 @@ class KillSwitch:
         else:
             self._maybe_reset_day(current_equity)
 
+        # Intraday recovery check for equity drawdown halt
+        if self.triggered_equity and self._trigger_time is not None:
+            elapsed = (datetime.now(timezone.utc) - self._trigger_time).total_seconds()
+            sod_r = self.start_of_day_equity
+            if (elapsed <= _cfg.recovery_window_secs and sod_r and sod_r > 0
+                    and abs(current_equity - sod_r) / sod_r * 100 <= _cfg.recovery_threshold_pct):
+                logger.info("[KILL SWITCH] Intraday recovery detected — resuming equity trading")
+                self.triggered_equity = False
+                self._trigger_time = None
+
         if self.triggered:
+            # Global flag: manual halt or cumulative MDD — blocks everything
             return False
 
         sod = self.start_of_day_equity
@@ -101,9 +120,10 @@ class KillSwitch:
 
         if drawdown >= self.max_daily_drawdown_pct:
             reason = f"Daily drawdown {drawdown:.3f}% ≥ {self.max_daily_drawdown_pct}% limit"
-            logger.critical("[KILL SWITCH] TRIGGERED — %s", reason)
-            self.triggered = True
+            logger.critical("[KILL SWITCH] EQUITY HALT TRIGGERED — %s", reason)
+            self.triggered_equity = True
             self.triggered_reason = reason
+            self._trigger_time = datetime.now(timezone.utc)
             return False
 
         return True
@@ -149,9 +169,19 @@ class KillSwitch:
         """
         Per-signal gate. Called before every order submission.
         Returns True if the signal may proceed to the execution agent.
+        Asset-class aware: equity drawdown only blocks equity signals; crypto runs 24/7.
         """
         if self.triggered:
-            logger.warning("[KILL SWITCH] Blocking signal — circuit breaker active: %s", self.triggered_reason)
+            logger.warning("[KILL SWITCH] Blocking signal — global circuit breaker active: %s", self.triggered_reason)
+            return False
+
+        symbol = signal.get("symbol", "")
+        is_crypto = "/" in symbol
+        if not is_crypto and self.triggered_equity:
+            logger.warning("[KILL SWITCH] Blocking equity signal — equity drawdown halt active: %s", self.triggered_reason)
+            return False
+        if is_crypto and self.triggered_crypto:
+            logger.warning("[KILL SWITCH] Blocking crypto signal — crypto halt active: %s", self.triggered_reason)
             return False
 
         confidence = signal.get("confidence", 0.0)
@@ -173,13 +203,19 @@ class KillSwitch:
         self.triggered_reason = f"MANUAL: {reason}"
 
     def manual_resume(self):
-        """Clears a manual halt. Does NOT override automatic drawdown triggers."""
+        """Clears a manual halt and any active equity drawdown halt."""
+        cleared = False
         if self.triggered and self.triggered_reason and self.triggered_reason.startswith("MANUAL"):
             logger.info("[KILL SWITCH] Manual halt cleared — trading resumed")
             self.triggered = False
             self.triggered_reason = None
-        else:
-            logger.warning("[KILL SWITCH] resume() called but halt was automatic (drawdown) — not cleared")
+            cleared = True
+        if self.triggered_equity:
+            logger.info("[KILL SWITCH] Equity drawdown halt cleared by operator resume")
+            self.triggered_equity = False
+            cleared = True
+        if not cleared:
+            logger.warning("[KILL SWITCH] resume() called but no clearable halt was active")
 
     # ------------------------------------------------------------------
     # Status Reporting (feeds /api/risk/status)
@@ -188,6 +224,8 @@ class KillSwitch:
     def get_status(self) -> dict:
         return {
             "triggered":                  self.triggered,
+            "triggered_equity":           self.triggered_equity,
+            "triggered_crypto":           self.triggered_crypto,
             "reason":                     self.triggered_reason,
             "drawdown_pct":               round(self._drawdown_pct, 4),
             "max_drawdown_pct":           self.max_daily_drawdown_pct,

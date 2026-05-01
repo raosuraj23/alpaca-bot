@@ -6,12 +6,15 @@ import {
   ReferenceLine, Cell,
 } from 'recharts';
 
+import type { AssetClass } from '@/lib/types';
+
 export interface AgentStat {
   agent: string;
   avg_confidence: number;
   win_rate: number;
   trade_count: number;
   total_pnl?: number;
+  asset_class?: AssetClass;
 }
 
 interface SignalConfidenceChartProps {

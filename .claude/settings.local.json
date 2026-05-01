@@ -9,5 +9,9 @@
       "Bash(xargs cat:*)",
       "Bash(cat d:/Projects/alpaca-bot/venv/Lib/site-packages/pandas*/METADATA)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "context7"
+  ],
+  "enableAllProjectMcpServers": true
 }

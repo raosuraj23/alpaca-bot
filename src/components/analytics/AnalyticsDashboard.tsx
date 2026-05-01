@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { API_BASE } from '@/lib/api';
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import {
   ShieldAlert, TrendingUp, TrendingDown, BarChart3,
   BrainCircuit, Zap, Activity,

@@ -12,9 +12,16 @@ import {
 } from '@tanstack/react-table';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Filter, Download, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { Filter, Download, RefreshCw, TrendingUp, TrendingDown, DatabaseZap, Activity } from 'lucide-react';
+import { EmptyState } from "@/components/ui/empty-state";
+import { useTradingStore } from '@/store';
 import { parseUtc } from '@/lib/utils';
+
+const ASSET_COLORS: Record<string, string> = {
+  CRYPTO:  'border-[var(--kraken-light)] text-[var(--kraken-light)]',
+  EQUITY:  'border-[var(--neon-green)] text-[var(--neon-green)]',
+  OPTIONS: 'border-[var(--agent-learning)] text-[var(--agent-learning)]',
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,7 +36,9 @@ interface ClosedTrade {
   qty:         number | null;
   entry_time:  string | null;
   exit_time:   string | null;
-  confidence:  number;
+  confidence:  number | null;
+  asset_class?: import('@/lib/types').AssetClass;
+  win?:        boolean;
   open?:       boolean;
 }
 
@@ -104,6 +113,11 @@ function TicketIdCell({ fullId, short }: { fullId: string; short: string }) {
 // TradeLedger Component
 // ---------------------------------------------------------------------------
 
+function SortIcon({ col }: { col: any }) {
+  const s = col.getIsSorted();
+  return s === 'asc' ? <span className="text-[var(--kraken-light)]">▲</span> : s === 'desc' ? <span className="text-[var(--kraken-light)]">▼</span> : col.getCanSort() ? <span className="opacity-20">⇅</span> : null;
+}
+
 export function TradeLedger() {
   const ledgerTrades = useTradingStore(s => s.ledgerTrades);
   const fetchLedger  = useTradingStore(s => s.fetchLedger);
@@ -113,6 +127,9 @@ export function TradeLedger() {
   const [accountData, setAccountData]   = React.useState<AccountData | null>(null);
   const [lastRefresh, setLastRefresh]   = React.useState<Date | null>(null);
   const [refreshing, setRefreshing]     = React.useState(false);
+  const [pnlFetchFailed, setPnlFetchFailed] = React.useState(false);
+  const [backfilling, setBackfilling]   = React.useState(false);
+  const [backfillResult, setBackfillResult] = React.useState<{ updated: number; skipped: number; reconciled: number } | null>(null);
   const [mounted, setMounted]           = React.useState(false);
   const [filterSide, setFilterSide]     = React.useState<'ALL' | 'BUY' | 'SELL'>('ALL');
   const [filterOutcome, setFilterOutcome] = React.useState<'ALL' | 'WIN' | 'LOSS'>('ALL');
@@ -124,8 +141,9 @@ export function TradeLedger() {
   const loadRealizedPnl = React.useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/analytics/realized-pnl`, { signal: AbortSignal.timeout(10000) });
-      if (res.ok) { setRealizedData(await res.json()); setLastRefresh(new Date()); }
-    } catch { /* silent */ }
+      if (res.ok) { setRealizedData(await res.json()); setLastRefresh(new Date()); setPnlFetchFailed(false); }
+      else setPnlFetchFailed(true);
+    } catch { setPnlFetchFailed(true); }
   }, []);
 
   const loadAccountData = React.useCallback(async () => {
@@ -139,6 +157,21 @@ export function TradeLedger() {
     setRefreshing(true);
     await Promise.all([fetchLedger(), loadRealizedPnl()]);
     setRefreshing(false);
+  };
+
+  const handleBackfill = async () => {
+    setBackfilling(true);
+    setBackfillResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/backfill-fill-prices`, { method: 'POST', signal: AbortSignal.timeout(30000) });
+      if (res.ok) {
+        const data = await res.json();
+        setBackfillResult(data);
+        if (data.updated > 0 || data.reconciled > 0) await Promise.all([fetchLedger(), loadRealizedPnl()]);
+      }
+    } catch { /* silent */ } finally {
+      setBackfilling(false);
+    }
   };
 
   React.useEffect(() => { loadRealizedPnl(); const t = setInterval(loadRealizedPnl, 30_000); return () => clearInterval(t); }, [loadRealizedPnl]);
@@ -174,7 +207,16 @@ export function TradeLedger() {
     const closed = (realizedData?.trades ?? []).map(t => ({ ...t, open: false }));
     const open   = (realizedData?.open_positions ?? []).map(op => {
       const live = positions.find((p: any) => p.symbol === op.symbol);
-      return { ...op, open: true, qty: live ? Number(live.size ?? op.qty ?? null) : op.qty ?? null, exit_price: live ? Number(live.markPrice ?? live.entryPrice ?? 0) : null, unrealized_pnl: live ? Number(live.unrealizedPnl ?? 0) : null };
+      const markPx = live && Number.isFinite(live.markPrice) ? live.markPrice
+                   : live && Number.isFinite(live.entryPrice) ? live.entryPrice
+                   : null;
+      return {
+        ...op,
+        open:           true,
+        qty:            live && Number.isFinite(live.size) ? live.size : (op.qty ?? null),
+        exit_price:     markPx,
+        unrealized_pnl: live && Number.isFinite(live.unrealizedPnl) ? live.unrealizedPnl : null,
+      };
     });
     return [...closed, ...open];
   }, [realizedData, positions]);
@@ -201,7 +243,7 @@ export function TradeLedger() {
       {
         accessorKey: 'timestamp',
         header: 'Timestamp',
-        cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+        cell: ({ getValue }) => <span className="text-[var(--foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
       },
       {
         accessorKey: 'symbol',
@@ -209,8 +251,24 @@ export function TradeLedger() {
         cell: ({ getValue }) => <span className="font-bold text-[var(--foreground)]">{(getValue() as string) ?? '—'}</span>,
       },
       {
+        accessorKey: 'asset_class',
+        header: 'Asset',
+        meta: { align: 'center' },
+        cell: ({ getValue }) => {
+          const ac = (getValue() as string) ?? null;
+          if (!ac) return <span className="text-center block text-[var(--muted-foreground)] opacity-40">—</span>;
+          const color = ASSET_COLORS[ac] ?? ASSET_COLORS.EQUITY;
+          return (
+            <div className="flex justify-center">
+              <span className={`text-xs font-mono border px-1 py-px rounded-sm ${color}`}>{ac}</span>
+            </div>
+          );
+        },
+      },
+      {
         accessorKey: 'side',
         header: 'Direction',
+        meta: { align: 'center' },
         cell: ({ getValue }) => (
           <div className="flex justify-center">
             <Badge variant={(getValue() as string) === 'BUY' ? 'success' : 'destructive'} className="text-xs px-1.5 uppercase font-sans tracking-widest">
@@ -222,6 +280,7 @@ export function TradeLedger() {
       {
         accessorKey: 'bot',
         header: 'Origin Agent',
+        meta: { align: 'center' },
         cell: ({ getValue }) => (
           <div className="hidden md:flex justify-center">
             <Badge variant="outline" className="font-sans font-normal opacity-80">{(getValue() as string) ?? '—'}</Badge>
@@ -230,7 +289,8 @@ export function TradeLedger() {
       },
       {
         accessorKey: 'confidence',
-        header: 'Signal Conf.',
+        header: () => <span title="XGBoost classifier probability at order submission. ≥85% = high confidence; 70–84% = moderate; below 70% = rejected by the min-confidence gate.">Signal Conf.</span>,
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           const pct = v != null ? v * 100 : null;
@@ -244,6 +304,7 @@ export function TradeLedger() {
       {
         accessorKey: 'fill_price',
         header: 'Fill Price',
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           return <span className="text-right block font-bold text-[var(--foreground)]">{v != null ? `$${Number(v).toFixed(2)}` : '—'}</span>;
@@ -251,7 +312,8 @@ export function TradeLedger() {
       },
       {
         id: 'realized_pnl',
-        header: 'Realized PnL',
+        header: () => <span title="Profit/loss locked in when the position was closed. Matched to the corresponding BUY leg by strategy and symbol.">Realized PnL</span>,
+        meta: { align: 'right' },
         enableSorting: false,
         cell: ({ row }) => {
           const realPnl = row.original.side === 'SELL' ? (realizedPnlByLedgerId.get(row.original.id) ?? null) : null;
@@ -270,7 +332,8 @@ export function TradeLedger() {
     if (hasNonZeroSlippage) {
       cols.splice(6, 0, {
         accessorKey: 'slippage_bps',
-        header: 'Slippage',
+        header: () => <span title="Slippage in basis points (1 bps = 0.01%). Measured as (fill price − mid-quote) / mid-quote × 10000. &lt;5 bps = excellent; &gt;20 bps = high cost.">Slippage</span>,
+        meta: { align: 'right' },
         cell: ({ getValue }) => {
           const v = getValue() as number | null;
           const color = v == null ? 'text-[var(--muted-foreground)]'
@@ -300,15 +363,17 @@ export function TradeLedger() {
       ),
     },
     { accessorKey: 'strategy', header: 'Bot', cell: ({ getValue }) => <span className="text-[var(--muted-foreground)] truncate max-w-[90px] block">{getValue() as string}</span> },
-    { accessorKey: 'entry_price', header: 'Open @ price', cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">${Number(getValue()).toFixed(4)}</span> },
+    { accessorKey: 'entry_price', header: 'Open @ price', meta: { align: 'right' }, cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">${Number(getValue()).toFixed(4)}</span> },
     {
       accessorKey: 'entry_time',
       header: 'Open time',
-      cell: ({ getValue }) => <span className="text-right block text-[var(--muted-foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+      meta: { align: 'right' },
+      cell: ({ getValue }) => <span className="text-right block text-[var(--muted-foreground)]">{getValue() ? (parseUtc(getValue() as string)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
     },
     {
       accessorKey: 'exit_price',
       header: 'Close @ price',
+      meta: { align: 'right' },
       cell: ({ row }) => {
         const v = row.original.exit_price;
         return v != null
@@ -319,14 +384,16 @@ export function TradeLedger() {
     {
       accessorKey: 'exit_time',
       header: 'Close time',
+      meta: { align: 'right' },
       cell: ({ row }) => row.original.open
         ? <span className="text-right block text-[var(--neon-green)] opacity-70">live</span>
-        : <span className="text-right block text-[var(--muted-foreground)]">{row.original.exit_time ? (parseUtc(row.original.exit_time)?.toLocaleString(undefined, { hour12: false }) ?? '—') : '—'}</span>,
+        : <span className="text-right block text-[var(--muted-foreground)]">{row.original.exit_time ? (parseUtc(row.original.exit_time)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) ?? '—') : '—'}</span>,
     },
-    { accessorKey: 'qty', header: 'Qty', cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">{(getValue() as number) != null ? Number(getValue()).toFixed(6) : '—'}</span> },
+    { accessorKey: 'qty', header: 'Qty', meta: { align: 'right' }, cell: ({ getValue }) => <span className="text-right block text-[var(--foreground)]">{(getValue() as number) != null ? Number(getValue()).toFixed(6) : '—'}</span> },
     {
       accessorKey: 'pnl',
       header: 'PnL',
+      meta: { align: 'right' },
       cell: ({ row }) => {
         const pnl = row.original.open ? (row.original.unrealized_pnl ?? null) : row.original.pnl;
         const pos = pnl != null && pnl >= 0;
@@ -357,16 +424,11 @@ export function TradeLedger() {
 
   if (!mounted) return null;
 
-  const SortIcon = ({ col }: { col: any }) => {
-    const s = col.getIsSorted();
-    return s === 'asc' ? <span className="text-[var(--kraken-light)]">▲</span> : s === 'desc' ? <span className="text-[var(--kraken-light)]">▼</span> : col.getCanSort() ? <span className="opacity-20">⇅</span> : null;
-  };
-
   return (
     <Card className="h-full flex flex-col bg-[var(--panel)] overflow-hidden">
 
       {/* Ledger Toolbar */}
-      <CardHeader className="py-3 px-4 border-b border-[var(--border)] flex flex-row items-center justify-between bg-gradient-to-b from-[var(--kraken-purple)]/5 to-transparent flex-shrink-0">
+      <CardHeader className="py-3 px-4 border-b border-[var(--border)] flex flex-row items-center justify-between bg-[var(--panel)] flex-shrink-0">
         <div className="flex items-center space-x-3">
           <CardTitle className="text-sm font-bold tracking-wide">Master Execution Ledger</CardTitle>
           <Badge variant="outline" className="px-2">{ledgerTrades.length} RECORDS</Badge>
@@ -386,11 +448,19 @@ export function TradeLedger() {
           <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value as any)} className="md:hidden bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm text-xs font-mono text-[var(--foreground)] px-1.5 py-1 outline-none">
             {(['ALL', 'WIN', 'LOSS'] as const).map(o => <option key={o} value={o}>{o}</option>)}
           </select>
-          {lastRefresh && <span className="hidden lg:block text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">{lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+          {lastRefresh && <span className={`hidden lg:block text-xs font-mono tabular-nums ${pnlFetchFailed ? 'text-[var(--warning)]' : 'text-[var(--muted-foreground)] opacity-40'}`}>{pnlFetchFailed ? 'stale' : lastRefresh.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}</span>}
+          <button
+            onClick={handleBackfill}
+            disabled={backfilling}
+            title={backfillResult ? `Fixed ${backfillResult.updated} prices · reconciled ${backfillResult.reconciled} trades · skipped ${backfillResult.skipped}` : 'Backfill: fix $0 fill prices + reconcile stale open trades from Alpaca'}
+            className={`p-1.5 border rounded-sm transition-colors disabled:opacity-40 ${backfillResult?.updated || backfillResult?.reconciled ? 'border-[var(--neon-green)] text-[var(--neon-green)] bg-[var(--neon-green)]/10' : 'bg-[var(--panel-muted)] border-[var(--border)] text-[var(--warning)] hover:bg-[var(--background)]'}`}
+          >
+            <DatabaseZap className={`w-3.5 h-3.5 ${backfilling ? 'animate-pulse' : ''}`} />
+          </button>
           <button onClick={handleRefresh} disabled={refreshing} className="p-1.5 bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm hover:bg-[var(--background)] transition-colors text-[var(--muted-foreground)] disabled:opacity-40">
             <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
           </button>
-          <button className="p-1.5 bg-[var(--kraken-purple)] text-white rounded-sm hover:bg-[var(--kraken-light)] transition-colors ml-1 shadow-[0_0_10px_rgba(139,92,246,0.3)]"><Filter className="w-4 h-4" /></button>
+          <button className="p-1.5 bg-[var(--kraken-purple)] text-white rounded-sm hover:bg-[var(--kraken-light)] transition-colors ml-1"><Filter className="w-4 h-4" /></button>
           <button className="p-1.5 bg-[var(--panel-muted)] border border-[var(--border)] rounded-sm hover:bg-[var(--background)] transition-colors text-[var(--muted-foreground)]"><Download className="w-4 h-4" /></button>
         </div>
       </CardHeader>
@@ -419,8 +489,8 @@ export function TradeLedger() {
             {ledgerTable.getHeaderGroups().map(hg => (
               <tr key={hg.id}>
                 {hg.headers.map((header, i) => (
-                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4 text-right text-[var(--kraken-light)]' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
-                    <span className="inline-flex items-center gap-1">{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
+                  <th key={header.id} className={`font-semibold p-3 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${({ right: 'text-right', center: 'text-center' } as Record<string, string>)[(header.column.columnDef.meta as { align?: string })?.align ?? ''] ?? ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
+                    <span className={`inline-flex items-center gap-1 ${({ right: 'justify-end', center: 'justify-center' } as Record<string, string>)[(header.column.columnDef.meta as { align?: string })?.align ?? ''] ?? ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
                   </th>
                 ))}
               </tr>
@@ -450,15 +520,15 @@ export function TradeLedger() {
         </div>
         <div className="overflow-auto max-h-[280px]">
           {roundTripRows.length === 0 ? (
-            <div className="flex items-center justify-center py-8 text-xs font-mono text-[var(--muted-foreground)] opacity-40 uppercase tracking-widest">No trade history yet</div>
+            <EmptyState icon={<Activity className="w-6 h-6" />} message="No Trade History" subtext="Closed trades will appear here" />
           ) : (
             <table className="w-full text-xs tabular-nums font-mono whitespace-nowrap min-w-[700px]">
               <thead className="sticky top-0 bg-[var(--panel-muted)] text-[var(--muted-foreground)] border-b border-[var(--border)]">
                 {historyTable.getHeaderGroups().map(hg => (
                   <tr key={hg.id}>
                     {hg.headers.map((header, i) => (
-                      <th key={header.id} className={`text-left font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4 text-right' : ''} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
-                        <span className="inline-flex items-center gap-1">{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
+                      <th key={header.id} className={`font-medium p-2 ${i === 0 ? 'pl-4' : ''} ${i === hg.headers.length - 1 ? 'pr-4' : ''} ${(header.column.columnDef.meta as any)?.align === 'right' ? 'text-right' : 'text-left'} select-none ${header.column.getCanSort() ? 'cursor-pointer hover:text-[var(--foreground)] transition-colors' : ''}`} onClick={header.column.getToggleSortingHandler()}>
+                        <span className={`inline-flex items-center gap-1 ${(header.column.columnDef.meta as any)?.align === 'right' ? 'justify-end' : ''}`}>{flexRender(header.column.columnDef.header, header.getContext())}<SortIcon col={header.column} /></span>
                       </th>
                     ))}
                   </tr>

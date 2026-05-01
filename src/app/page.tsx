@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from 'react';
-import { useTradingEngine, useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingEngine, useTradingStore } from '@/store';
 import { Activity, LayoutDashboard, LineChart, Cpu, History, BrainCircuit, BookOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -49,7 +49,12 @@ function SystemClock() {
 }
 
 function WsStatusDot() {
+  const [mounted, setMounted] = React.useState(false);
   const wsStatus = useTradingStore(s => s.wsStatus);
+
+  React.useEffect(() => { setMounted(true); }, []);
+  if (!mounted) return null;
+
   if (wsStatus === 'connected') {
     return (
       <div className="flex items-center gap-1.5">

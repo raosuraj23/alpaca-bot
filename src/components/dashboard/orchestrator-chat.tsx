@@ -86,8 +86,8 @@ export function OrchestratorChat() {
             transition={{ duration: 0.2 }}
             className="fixed bottom-20 right-6 z-50 w-[380px] h-[500px]"
           >
-            <Card className="h-full flex flex-col shadow-2xl shadow-[var(--kraken-purple)]/20 border-[var(--kraken-purple)]/40 overflow-hidden backdrop-blur-xl bg-[var(--panel)]/95">
-              <CardHeader className="py-3 px-4 border-b border-[var(--border)] flex flex-row items-center justify-between bg-gradient-to-r from-[var(--kraken-purple)]/20 to-transparent">
+            <Card className="h-full flex flex-col shadow-2xl shadow-[var(--kraken-purple)]/20 border-[var(--kraken-purple)]/40 overflow-hidden bg-[var(--panel)]">
+              <CardHeader className="py-3 px-4 border-b border-[var(--border)] flex flex-row items-center justify-between bg-[var(--panel)]">
                 <div className="flex items-center space-x-2">
                   <Bot className="w-5 h-5 text-[var(--kraken-light)]" />
                   <CardTitle className="text-sm font-bold text-[var(--foreground)] tracking-wide">Orchestrator</CardTitle>
@@ -152,8 +152,6 @@ export function OrchestratorChat() {
       </AnimatePresence>
 
       <motion.button
-        whileHover={{ scale: 1.05 }}
-        whileTap={{ scale: 0.95 }}
         onClick={() => setIsOpen(!isOpen)}
         className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-[var(--kraken-purple)] rounded-sm flex items-center justify-center shadow-lg shadow-[var(--kraken-purple)]/40 hover:bg-[var(--kraken-light)] transition-colors border border-white/10"
       >

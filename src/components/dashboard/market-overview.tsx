@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { ValueTicker } from '@/components/ui/value-ticker';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import type { IChartApi, Time } from 'lightweight-charts';

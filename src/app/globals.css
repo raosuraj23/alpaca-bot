@@ -11,8 +11,6 @@
   --color-kraken-purple: var(--kraken-purple);
   --color-kraken-light: var(--kraken-light);
   
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-mono);
 }
 
 :root {
@@ -35,7 +33,8 @@
   --agent-calculate: hsl(220, 70%, 65%);
   --agent-scanner: hsl(190, 70%, 60%);
   --agent-learning: hsl(40, 80%, 60%);
-  --agent-execute: hsl(190, 70%, 60%);
+  --agent-execute: hsl(14, 82%, 62%);
+  --agent-research: hsl(168, 65%, 55%);
 
   /* Extended Accents */
   --neon-blue: hsl(200, 80%, 65%);

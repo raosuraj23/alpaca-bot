@@ -3,10 +3,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
-from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage
-from config import CLAUDE_HAIKU_MODEL, CLAUDE_SONNET_MODEL, CLAUDE_OPUS_MODEL, GEMINI_FLASH_MODEL
+from config import GEMINI_3_FLASH_MODEL, GEMINI_3_1_FLASH_LITE_MODEL, GEMINI_2_5_FLASH_LITE_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ class GeminiDailyBudget:
     PRIORITY_TIERS = {"research"}  # reserved when budget is low
 
     def __init__(self):
-        self._limit: int = int(os.getenv("GEMINI_DAILY_LIMIT", "18"))
+        self._limit: int = int(os.getenv("GEMINI_DAILY_LIMIT", "450"))
         self._count: int = 0
         self._hard_exhausted: bool = False   # set by mark_daily_exhausted()
         self._day_anchor: int = self._today()
@@ -112,129 +111,7 @@ class GeminiDailyBudget:
         return self._hard_exhausted
 
 
-# ---------------------------------------------------------------------------
-# Resilient model wrapper — exception-based routing on ResourceExhausted
-# ---------------------------------------------------------------------------
 
-def _is_daily_quota_error(exc: Exception) -> bool:
-    """True when the Google API signals the DAILY RPD limit (not a per-minute RPM spike)."""
-    s = str(exc)
-    return "GenerateRequestsPerDay" in s or "generate_content_free_tier_requests" in s
-
-
-def _is_quota_error(exc: Exception) -> bool:
-    """True for any Gemini 429 / ResourceExhausted error."""
-    name = type(exc).__name__
-    s = str(exc)
-    return (
-        "ResourceExhausted" in name
-        or "429" in s
-        or "quota" in s.lower()
-        or "rate_limit" in s.lower()
-    )
-
-
-class _ResilientStructuredChain:
-    """
-    Wraps a structured-output chain (from model.with_structured_output()) so that
-    ResourceExhausted errors from Gemini fall over to the Claude equivalent.
-    """
-
-    def __init__(self, gemini_chain, claude_chain, tier: str):
-        self._gemini = gemini_chain
-        self._claude = claude_chain
-        self._tier = tier
-
-    async def ainvoke(self, messages, **kwargs):
-        try:
-            return await self._gemini.ainvoke(messages, **kwargs)
-        except Exception as exc:
-            if _is_quota_error(exc):
-                if _is_daily_quota_error(exc):
-                    _gemini_budget.mark_daily_exhausted()
-                else:
-                    _gemini_budget.mark_rpm_hit(self._tier)
-                if self._claude:
-                    logger.info("[FACTORY] Structured chain fallback to Claude for '%s'", self._tier)
-                    return await self._claude.ainvoke(messages, **kwargs)
-            raise
-
-    def invoke(self, messages, **kwargs):
-        try:
-            return self._gemini.invoke(messages, **kwargs)
-        except Exception as exc:
-            if _is_quota_error(exc):
-                if _is_daily_quota_error(exc):
-                    _gemini_budget.mark_daily_exhausted()
-                else:
-                    _gemini_budget.mark_rpm_hit(self._tier)
-                if self._claude:
-                    logger.info("[FACTORY] Structured chain fallback to Claude for '%s'", self._tier)
-                    return self._claude.invoke(messages, **kwargs)
-            raise
-
-
-class ResilientGeminiModel:
-    """
-    Drop-in wrapper around ChatGoogleGenerativeAI that automatically falls over to
-    a Claude Haiku backup when Gemini raises ResourceExhausted.
-
-    - GenerateRequestsPerDay error → calls _gemini_budget.mark_daily_exhausted(),
-      which locks out all Gemini calls until UTC midnight (no more retry loops).
-    - Per-minute RPM error → single-call fallback only; Gemini remains available
-      for subsequent calls.
-
-    Implements the LangChain Runnable interface surface used by all agents:
-      invoke(), ainvoke(), with_structured_output()
-    """
-
-    def __init__(self, gemini_model, claude_fallback, tier: str):
-        self._gemini = gemini_model
-        self._claude = claude_fallback
-        self._tier = tier
-
-    def _handle_quota(self, exc: Exception) -> None:
-        if _is_daily_quota_error(exc):
-            _gemini_budget.mark_daily_exhausted()
-        else:
-            _gemini_budget.mark_rpm_hit(self._tier)
-
-    def invoke(self, messages, **kwargs):
-        try:
-            return self._gemini.invoke(messages, **kwargs)
-        except Exception as exc:
-            if _is_quota_error(exc):
-                self._handle_quota(exc)
-                if self._claude:
-                    logger.info("[FACTORY] invoke() fallback to Claude for '%s'", self._tier)
-                    return self._claude.invoke(messages, **kwargs)
-            raise
-
-    async def ainvoke(self, messages, **kwargs):
-        try:
-            return await self._gemini.ainvoke(messages, **kwargs)
-        except Exception as exc:
-            if _is_quota_error(exc):
-                self._handle_quota(exc)
-                if self._claude:
-                    logger.info("[FACTORY] ainvoke() fallback to Claude for '%s'", self._tier)
-                    return await self._claude.ainvoke(messages, **kwargs)
-            raise
-
-    def with_structured_output(self, schema):
-        try:
-            gemini_chain = self._gemini.with_structured_output(schema)
-        except (NotImplementedError, TypeError):
-            gemini_chain = None
-        claude_chain = None
-        if self._claude:
-            try:
-                claude_chain = self._claude.with_structured_output(schema)
-            except (NotImplementedError, TypeError):
-                pass
-        if gemini_chain is None:
-            return claude_chain  # Gemini doesn't support structured output for this config
-        return _ResilientStructuredChain(gemini_chain, claude_chain, self._tier)
 
 
 _gemini_budget = GeminiDailyBudget()
@@ -273,111 +150,55 @@ class SwarmFactory:
         print(f"[LLM SWARM] Factory Initialized with {len(self.personas)} personas.")
 
     def build_model(self, model_level: str = "standard", max_tokens: int | None = None):
-        """Returns the LLM best suited for the task at the lowest cost.
+        """Returns the Gemini model best suited for the task.
 
-        Principle: minimum capable model + strict token budget.
-        Both providers are used simultaneously — each tier maps to the
-        model that fits the task, not a primary/fallback chain.
-
-        Tiers:
-          research  — gemini-2.5-flash  / haiku fallback  (1500t, 30-min deep analysis)
-          discovery — gemini-2.5-flash  / haiku fallback  (800t,  symbol ranked selection)
-          fast      — gemini-2.5-flash  / haiku fallback  (150t,  verdicts, learnings)
-          chat      — claude-haiku      / flash fallback  (300t,  command parsing + caching)
-          signal    — gemini-2.5-flash  / haiku fallback  (50t,   binary APPROVED/REJECTED)
-          director  — claude-haiku      / flash fallback  (400t,  Pydantic structured output)
-          smart     — claude-opus-4-6   / gemini-2.5-flash (legacy, uncapped)
-          standard  — claude-sonnet-4-6 / gemini-2.5-flash (legacy, uncapped)
+        All tiers use gemini-3.1-flash-lite-preview (500 RPD free, higher limit than 2.5-flash).
+        When the daily free-tier budget runs out, build_model() returns None
+        and callers gracefully degrade (template fallback / skip).
         """
-        claude_key = os.getenv("ANTHROPIC_API_KEY")
         gemini_key = os.getenv("GEMINI_API_KEY")
-        _valid_claude = bool(claude_key and claude_key not in ("", "your_anthropic_key_here"))
         _valid_gemini_key = bool(gemini_key and gemini_key not in ("", "your_gemini_key_here"))
 
         def _gemini_permitted() -> bool:
             """True only if the key is configured AND the daily budget permits this tier."""
             return _valid_gemini_key and _gemini_budget.request(model_level)
 
-        def _haiku(temp: float, budget: int) -> ChatAnthropic | None:
-            if not _valid_claude:
-                return None
-            return ChatAnthropic(
-                model=CLAUDE_HAIKU_MODEL,
-                temperature=temp,
-                max_tokens=budget,
-                anthropic_api_key=claude_key,
-            )
+        if not _gemini_permitted():
+            return None
 
-        def _resilient_flash(temp: float, budget: int) -> ResilientGeminiModel | None:
-            """
-            Returns a ResilientGeminiModel that calls Gemini and automatically falls
-            over to Claude Haiku when ResourceExhausted is raised. Returns None if
-            neither key is available.
-            """
-            if not _gemini_permitted():
-                return None  # budget depleted — caller falls through to bare Haiku
-            gemini = ChatGoogleGenerativeAI(
-                model=GEMINI_FLASH_MODEL,
-                temperature=temp,
-                max_output_tokens=budget,
-                google_api_key=gemini_key,
-            )
-            claude_fb = _haiku(temp, budget)
-            return ResilientGeminiModel(gemini, claude_fb, model_level)
+        # Paid fallback — reserved for deep reasoning tasks only
+        if model_level in ("smart", "research"):
+            from config import GEMINI_FALLBACK_MODEL
+            model_name = GEMINI_FALLBACK_MODEL
+            temp   = 0.0
+            budget = max_tokens or (4096 if model_level == "smart" else 1500)
+        else:
+            # Free tier — all other tiers
+            from config import GEMINI_FREE_MODEL
+            model_name = GEMINI_FREE_MODEL
+            temp   = 0.1
+            if model_level == "signal":
+                temp   = 0.0
+                budget = max_tokens or 150
+            elif model_level == "discovery":
+                temp   = 0.0
+                budget = max_tokens or 800
+            elif model_level == "chat":
+                budget = max_tokens or 300
+            elif model_level == "director":
+                budget = max_tokens or 400
+            elif model_level == "fast":
+                budget = max_tokens or 150
+            else:
+                budget = max_tokens or 2048
 
-        # ── research ─────────────────────────────────────────────────────────
-        if model_level == "research":
-            budget = max_tokens or 1500
-            return _resilient_flash(0, budget) or _haiku(0, budget)
-
-        # ── discovery ────────────────────────────────────────────────────────
-        if model_level == "discovery":
-            budget = max_tokens or 800
-            return _resilient_flash(0, budget) or _haiku(0, budget)
-
-        # ── fast ─────────────────────────────────────────────────────────────
-        if model_level == "fast":
-            budget = max_tokens or 150
-            return _resilient_flash(0.1, budget) or _haiku(0.1, budget)
-
-        # ── chat ─────────────────────────────────────────────────────────────
-        # Claude Haiku primary — no Gemini wrapper needed
-        if model_level == "chat":
-            budget = max_tokens or 300
-            return _haiku(0.1, budget) or _resilient_flash(0.1, budget)
-
-        # ── signal ───────────────────────────────────────────────────────────
-        if model_level == "signal":
-            budget = max_tokens or 50
-            return _resilient_flash(0, budget) or _haiku(0, budget)
-
-        # ── director ─────────────────────────────────────────────────────────
-        # Claude Haiku primary — no Gemini wrapper needed
-        if model_level == "director":
-            budget = max_tokens or 400
-            return _haiku(0.1, budget) or _resilient_flash(0.1, budget)
-
-        # ── smart (legacy) ───────────────────────────────────────────────────
-        if model_level == "smart":
-            if _valid_claude:
-                return ChatAnthropic(
-                    model=CLAUDE_OPUS_MODEL,
-                    temperature=0,
-                    anthropic_api_key=claude_key,
-                )
-            return _resilient_flash(0, 4096) or None
-
-        # ── standard (legacy) ────────────────────────────────────────────────
-        if model_level == "standard":
-            if _valid_claude:
-                return ChatAnthropic(
-                    model=CLAUDE_SONNET_MODEL,
-                    temperature=0.1,
-                    anthropic_api_key=claude_key,
-                )
-            return _resilient_flash(0.1, 2048) or None
-
-        return None
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=temp,
+            max_output_tokens=budget,
+            google_api_key=gemini_key,
+            max_retries=3,
+        )
 
     def get_system_prompt(self, agent_name: str) -> SystemMessage:
         """Returns the fully constructed SystemMessage for a given agent persona."""

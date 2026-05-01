@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile *)",
+      "Bash(curl -s http://localhost:*)",
+      "Bash(curl http://localhost:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -Command \"$input = $env:CLAUDE_TOOL_INPUT; if ($input -match '\\\"file_path\\\".*\\.(ts|tsx)') { cd d:\\Projects\\alpaca-bot; npx tsc --noEmit 2>&1 | Select-Object -First 20 }\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -Command \"$input = $env:CLAUDE_TOOL_INPUT; if ($input -match '\\\"file_path\\\".*\\\\.env[^.]') { Write-Error 'Blocked: direct edits to .env files are prohibited. Use .env.example instead.'; exit 1 }\""
+          }
+        ]
+      }
+    ]
+  }
+}

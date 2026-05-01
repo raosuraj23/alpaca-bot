@@ -36,7 +36,7 @@ function stripCommandBlocks(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown components for Haiku commentary
+// Markdown components for AI commentary
 // ---------------------------------------------------------------------------
 
 const MD_COMPONENTS = {
@@ -126,7 +126,7 @@ function NewsRow({ item }: { item: NewsItem }) {
     : null;
 
   return (
-    <div className="py-2 border-b border-[var(--border)]/40 last:border-b-0 group">
+    <div className="py-2 border-b border-[var(--border)]/30 last:border-b-0 group">
       <div className="flex items-start gap-2">
         <SentimentDot sentiment={item.sentiment ?? null} />
         <div className="flex-1 min-w-0">
@@ -164,8 +164,8 @@ function NewsRow({ item }: { item: NewsItem }) {
 // ---------------------------------------------------------------------------
 
 const URGENCY_COLOR: Record<string, string> = {
-  HIGH:   'var(--neon-red, #ff4d4d)',
-  MEDIUM: 'var(--neon-amber, #f59e0b)',
+  HIGH:   'var(--neon-red)',
+  MEDIUM: 'var(--warning)',
   LOW:    'var(--neon-green)',
 };
 
@@ -180,7 +180,7 @@ const TYPE_LABEL: Record<string, string> = {
 function ActionItemCard({ item }: { item: ActionItem }) {
   const urgencyColor = URGENCY_COLOR[item.urgency] ?? 'var(--muted-foreground)';
   return (
-    <div className="py-2.5 border-b border-[var(--border)]/40 last:border-b-0">
+    <div className="py-2.5 border-b border-[var(--border)]/30 last:border-b-0">
       <div className="flex items-start gap-2">
         <span
           className="inline-block w-1.5 h-1.5 rounded-sm shrink-0 mt-1"
@@ -199,6 +199,7 @@ function ActionItemCard({ item }: { item: ActionItem }) {
             <span
               className="text-xs font-mono tabular-nums ml-auto"
               style={{ color: urgencyColor, opacity: 0.7 }}
+              title="HIGH = immediate action required; MEDIUM = monitor closely; LOW = informational."
             >
               {item.urgency}
             </span>
@@ -216,7 +217,7 @@ function ActionItemCard({ item }: { item: ActionItem }) {
 }
 
 // ---------------------------------------------------------------------------
-// AiInsights — News Feed + Haiku Commentary + Portfolio Action Items
+// AiInsights — News Feed + AI Commentary + Portfolio Action Items
 // ---------------------------------------------------------------------------
 
 export function AiInsights() {
@@ -308,14 +309,6 @@ export function AiInsights() {
     return () => clearInterval(interval);
   }, [fetchActionItems]);
 
-  const ageMinutes = commentary
-    ? Math.floor((Date.now() / 1000 - commentary.generated_at) / 60)
-    : null;
-
-  const actionsAgeMinutes = actionsTs > 0
-    ? Math.floor((Date.now() / 1000 - actionsTs) / 60)
-    : null;
-
   const handleRefresh = () => {
     if (activeSection === 'news') fetchNews();
     else if (activeSection === 'commentary') fetchCommentary(true);
@@ -328,6 +321,14 @@ export function AiInsights() {
     actionsLoading;
 
   if (!mounted) return null;
+
+  const ageMinutes = commentary
+    ? Math.floor((Date.now() / 1000 - commentary.generated_at) / 60)
+    : null;
+
+  const actionsAgeMinutes = actionsTs > 0
+    ? Math.floor((Date.now() / 1000 - actionsTs) / 60)
+    : null;
 
   return (
     <Card className="flex flex-col h-full">
@@ -351,7 +352,7 @@ export function AiInsights() {
                 : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
             }`}
           >
-            <BrainCircuit className="w-3 h-3" /> Haiku
+            <BrainCircuit className="w-3 h-3" /> AI
           </button>
           <button
             onClick={() => setActiveSection('actions')}
@@ -364,7 +365,7 @@ export function AiInsights() {
             <Zap className="w-3 h-3" /> Actions
             {actionItems.length > 0 && (
               <span
-                className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-sm text-[10px] font-mono tabular-nums font-bold"
+                className="inline-flex items-center justify-center w-4 h-4 rounded-sm text-xs font-mono tabular-nums font-bold"
                 style={{ background: 'var(--kraken-purple)', color: 'var(--background)' }}
               >
                 {actionItems.length}
@@ -424,7 +425,7 @@ export function AiInsights() {
             ) : commentary?.text ? (
               <div>
                 <div className="flex items-center gap-2 mb-3">
-                  <Badge variant="purple" className="text-xs">Claude Haiku</Badge>
+                  <Badge variant="purple" className="text-xs">AI Analyst</Badge>
                   {commentary.generated_at > 0 && (
                     <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">
                       {new Date(commentary.generated_at * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}
@@ -439,7 +440,7 @@ export function AiInsights() {
                 </ReactMarkdown>
               </div>
             ) : (
-              <EmptyState icon={<BrainCircuit />} message="Click refresh to generate Haiku market commentary" />
+              <EmptyState icon={<BrainCircuit />} message="Click refresh to generate AI market commentary" />
             )}
           </div>
         )}
@@ -451,11 +452,11 @@ export function AiInsights() {
                 Analyzing portfolio...
               </div>
             ) : actionItems.length === 0 ? (
-              <EmptyState icon={<Zap />} message="No action items — Haiku analyst is watching the portfolio." />
+              <EmptyState icon={<Zap />} message="No action items — AI analyst is watching the portfolio." />
             ) : (
               <div>
                 <div className="flex items-center gap-2 mb-3">
-                  <Badge variant="purple" className="text-xs">Claude Haiku</Badge>
+                  <Badge variant="purple" className="text-xs">AI Analyst</Badge>
                   {actionsTs > 0 && (
                     <span className="text-xs font-mono tabular-nums text-[var(--muted-foreground)] opacity-40">
                       {new Date(actionsTs * 1000).toLocaleString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}

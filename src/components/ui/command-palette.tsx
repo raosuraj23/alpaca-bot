@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from 'react';
-import { useTradingStore } from '@/hooks/useTradingStream';
+import { useTradingStore } from '@/store';
 import { Search } from 'lucide-react';
 
 export function CommandPalette() {

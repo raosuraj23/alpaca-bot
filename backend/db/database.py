@@ -1,4 +1,3 @@
-import os
 import logging
 from sqlalchemy import text
 from sqlalchemy.dialects import sqlite as sqlite_dialect
@@ -17,7 +16,8 @@ _AsyncSessionLocal = None
 def _get_engine():
     global _engine
     if _engine is None:
-        raw = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///alpaca_quant.db")
+        from config import settings
+        raw = settings.database_url
         # Auto-fix plain sqlite:// to async dialect
         if raw.startswith("sqlite://") and "aiosqlite" not in raw:
             raw = raw.replace("sqlite://", "sqlite+aiosqlite://", 1)

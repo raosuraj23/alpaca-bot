@@ -35,6 +35,10 @@ export function collapseRepeats(logs: string[]): { message: string; count: numbe
   return out;
 }
 
+export function isCryptoSymbol(symbol: string): boolean {
+  return symbol.includes('/');
+}
+
 export function parseUtc(ts: string | number | null | undefined): Date | null {
   if (ts == null || ts === '') return null;
   if (typeof ts === 'number') return new Date(ts);

@@ -29,6 +29,7 @@ _MODEL_DIR  = pathlib.Path(__file__).parent.parent / "models"
 _MODEL_PATH = _MODEL_DIR / "xgboost_signal.pkl"
 
 MIN_TRAINING_SAMPLES = 50
+COLD_START_MIN_MKT_PROB = 0.65  # require directional conviction before XGBoost is trained
 
 
 class XGBoostSignalClassifier:
@@ -88,13 +89,27 @@ class XGBoostSignalClassifier:
                 mispricing_z = round(edge / sigma, 4)
 
         if not self._trained:
+            if market_implied_prob < COLD_START_MIN_MKT_PROB:
+                return {
+                    "approved": False,
+                    "xgboost_prob": xgb_prob,
+                    "market_implied_prob": round(market_implied_prob, 4),
+                    "edge": edge,
+                    "mispricing_z_score": mispricing_z,
+                    "cold_start": True,
+                    "reason": (
+                        f"cold_start: market_implied_prob={market_implied_prob:.3f} "
+                        f"< {COLD_START_MIN_MKT_PROB:.2f} — insufficient directional conviction"
+                    ),
+                }
             return {
                 "approved": True,
                 "xgboost_prob": xgb_prob,
                 "market_implied_prob": round(market_implied_prob, 4),
                 "edge": edge,
                 "mispricing_z_score": mispricing_z,
-                "reason": "cold start — XGBoost not yet trained, passing signal through",
+                "cold_start": True,
+                "reason": "cold_start — directional conviction gate passed, accumulating training data",
             }
 
         min_conf = settings.xgboost_min_confidence
